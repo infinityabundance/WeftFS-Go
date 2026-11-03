@@ -129,6 +129,33 @@ Revisions recorded for this work:
   including the new context/causal/capability/handoff tests; `go vet ./...`
   and `CGO_ENABLED=0 go build ./...` pass in the Go court.
 
+### F3 Context mounts, time roots, and ambiguity (`store`, `fusefs`, `cmd`) — implemented
+
+- `mount --context NAME|weft://...` resolves the Context Root with the mount
+  capability and root principal, then serves its ordered result set as the
+  read-only mount root. Entry names are the existing escaped
+  `basename--<8+ hex ObjectId>` scheme; one helper feeds readdir and lookup.
+  The constant `.weft` exact-id surface remains; all mutations are `EROFS`.
+- `mount --at RFC3339|unix-ns` selects the newest commit at or before the time
+  in the base lineage (`Store.CommitAtOrBefore`). No match is `NotFound`; it
+  never substitutes a state. `--context` + `--at` is rejected.
+- Read-only opens take no writer lock. The test suite mounts three different
+  roots concurrently and then opens a writer successfully; the pinned mount
+  does not observe the later commit.
+- `RequireOne` re-evaluates unpaged and includes every competing ObjectId in
+  the `Ambiguous` message. `context materialize --require-one` fails before
+  creating any output path.
+- Replay: Go extracts a Rust-produced bundle with `tar`/`zstd`, opens the
+  store, runs `verify --full`, resolves/materializes every Context Root, and
+  runs `scripts/replay/verify_manifest.go` (stdlib only) to compare every store
+  entry and output hash with `manifest.json`. No Rust runs at Go replay time.
+- Evidence: `go test -race ./...` passes in the FUSE court, including
+  `TestContextMountListsAllResultsAndReadsExactBytes`,
+  `TestCapabilityScopedMountIsReadOnlyAndDeniesUnlistedRoots`,
+  `TestAtSelectsLatestCommitAndBeforeFirstFails`,
+  `TestThreeSimultaneousMountsServeDifferentRoots`, and
+  `TestRequireOneAmbiguityListsEveryCompetingObjectID`.
+
 ### FUSE frontend (`fusefs`, `go-fuse/v2`) — implemented, with documented gaps
 
 - Node operations: lookup, getattr, readdir/readdirplus (go-fuse derives plus
@@ -441,3 +468,7 @@ Cross-language GC handoff (Rust binary is a test oracle only):
    `go mod tidy` needs `go.mod`/`go.sum` to be writable by the container. The
    committed `go.sum` is complete; `go build`/`go test` run without modifying
    it.
+10. **No acceleration in F3.** Context mounts and time travel are correctness
+    paths only. There is no io_uring, EKBLOOM, or equivalent; none is claimed.
+11. **Replay bundles are whole-store and unsigned.** No partitioned subset,
+    remote fetch, or signature exists. `tar`/`zstd` are required tools.
