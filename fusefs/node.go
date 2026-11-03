@@ -554,6 +554,10 @@ type fileHandle struct {
 	readOnlyView  bool
 	pinnedObject  bool
 	pinnedContent bool
+	tmpfile       bool
+	// lockOwners are the FUSE lock owners observed on this handle. They are
+	// released when the handle is released (see locks.go for the limitation).
+	lockOwners map[uint64]struct{}
 }
 
 var _ = (fs.FileReader)((*fileHandle)(nil))
@@ -693,6 +697,10 @@ func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 	h.srv.mu.Lock()
 	defer h.srv.mu.Unlock()
+	for owner := range h.lockOwners {
+		h.srv.locks.releaseOwner(owner)
+	}
+	h.lockOwners = nil
 	if h.pinnedContent {
 		h.srv.store.UnpinContent(h.content)
 		h.pinnedContent = false
@@ -1181,24 +1189,381 @@ func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errn
 	return uint32(total), 0
 }
 
-// ---- locking (unsupported) ----------------------------------------------
+// ---- locking -------------------------------------------------------------
 
 var _ = (fs.NodeGetlker)((*node)(nil))
 var _ = (fs.NodeSetlker)((*node)(nil))
 var _ = (fs.NodeSetlkwer)((*node)(nil))
 
-// Getlk/Setlk/Setlkw answer ENOSYS so the kernel falls back to local locking.
-// v1 has no cross-process lock manager; claiming otherwise would be false.
+// Getlk reports a conflicting lock from another owner, or F_UNLCK. Virtual
+// views never hold locks. The manager covers both POSIX byte ranges and flock
+// because the kernel forwards both when EnableLocks is set.
 func (n *node) Getlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, out *fuse.FileLock) syscall.Errno {
-	return syscall.ENOSYS
+	if n.isVirtual() {
+		out.Typ = syscall.F_UNLCK
+		return 0
+	}
+	n.srv.mu.Lock()
+	record, err := n.recordLocked()
+	if err != nil {
+		n.srv.mu.Unlock()
+		return errno(err)
+	}
+	if record.Kind != model.KindFile {
+		n.srv.mu.Unlock()
+		return syscall.EINVAL
+	}
+	if !auth.ACLAllows(record, principalOf(ctx)) {
+		n.srv.mu.Unlock()
+		return syscall.EACCES
+	}
+	id := n.id
+	n.srv.mu.Unlock()
+	return n.srv.locks.get(id, owner, lk, flags, out)
 }
 
 func (n *node) Setlk(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return syscall.ENOSYS
+	return n.setLock(ctx, f, owner, lk, flags, false)
 }
 
 func (n *node) Setlkw(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32) syscall.Errno {
-	return syscall.ENOSYS
+	return n.setLock(ctx, f, owner, lk, flags, true)
+}
+
+func (n *node) setLock(ctx context.Context, f fs.FileHandle, owner uint64, lk *fuse.FileLock, flags uint32, wait bool) syscall.Errno {
+	if lk.Typ == syscall.F_UNLCK {
+		// Unlocking is always permitted, including after a link disappears.
+		return n.srv.locks.set(ctx, n.id, owner, lk, flags, false)
+	}
+	n.srv.mu.Lock()
+	if n.isVirtual() {
+		n.srv.mu.Unlock()
+		return syscall.EROFS
+	}
+	record, err := n.recordLocked()
+	if err != nil {
+		n.srv.mu.Unlock()
+		return errno(err)
+	}
+	if record.Kind != model.KindFile {
+		n.srv.mu.Unlock()
+		return syscall.EINVAL
+	}
+	principal := principalOf(ctx)
+	if !auth.ACLAllows(record, principal) {
+		n.srv.mu.Unlock()
+		return syscall.EACCES
+	}
+	if lk.Typ == syscall.F_WRLCK {
+		if n.srv.readOnly {
+			n.srv.mu.Unlock()
+			return syscall.EROFS
+		}
+		if auth.EffectiveMode(record, principal)&0o2 == 0 {
+			n.srv.mu.Unlock()
+			return syscall.EACCES
+		}
+	}
+	if handle, ok := f.(*fileHandle); ok && handle != nil {
+		if handle.lockOwners == nil {
+			handle.lockOwners = make(map[uint64]struct{})
+		}
+		handle.lockOwners[owner] = struct{}{}
+	}
+	id := n.id
+	n.srv.mu.Unlock()
+	return n.srv.locks.set(ctx, id, owner, lk, flags, wait)
+}
+
+// OnForget runs when the root inode is dropped at unmount. It stops the
+// collector and drops every in-memory lock; nothing is persisted.
+var _ = (fs.NodeOnForgetter)((*node)(nil))
+
+func (n *node) OnForget() {
+	if n.kind == kindContextRoot || (n.kind == kindObject && n.id == model.RootID) {
+		n.srv.StopBackgroundGC()
+		n.srv.locks.clear()
+	}
+}
+
+// ---- mknod, tmpfile, fallocate, copy_file_range, lseek -------------------
+
+const (
+	fallocKeepSize  = 0x01
+	fallocPunchHole = 0x02
+	fallocCollapse  = 0x08
+	fallocZeroRange = 0x10
+	fallocInsert    = 0x20
+
+	seekSet = 0
+	seekCur = 1
+	seekEnd = 2
+)
+
+var _ = (fs.NodeMknoder)((*node)(nil))
+
+// Mknod creates a regular file. v1 has no FIFO, socket, or device object kind,
+// so those types are refused with EPERM rather than silently degraded to a
+// regular file. The rejection is deliberate and tested.
+func (n *node) Mknod(ctx context.Context, name string, mode uint32, dev uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	if n.kind != kindObject {
+		return nil, syscall.EROFS
+	}
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	if n.srv.readOnly {
+		return nil, syscall.EROFS
+	}
+	if mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFREG) {
+		return nil, syscall.EPERM
+	}
+	if err := model.ValidateNameBytes([]byte(name)); err != nil {
+		return nil, errno(err)
+	}
+	principal := principalOf(ctx)
+	id, err := n.srv.store.CreateFile(n.id, []byte(name), nil, uint64(mode&0o7777), uint64(principal.UID), uint64(principal.GID), nil)
+	if err != nil {
+		return nil, errno(err)
+	}
+	record, ok := n.srv.viewState().Objects[id]
+	if !ok {
+		return nil, syscall.ENOENT
+	}
+	child := n.srv.newNode(kindObject, id, "")
+	fillAttr(&out.Attr, record, n.srv.viewState().NLink(id), n.srv.inodes.objectIno(id))
+	return n.NewInode(ctx, child, child.stable()), 0
+}
+
+var _ = (fs.NodeTmpfiler)((*node)(nil))
+
+// Tmpfile creates an unnamed regular file (O_TMPFILE) with no directory entry.
+// The object is pinned for the handle; linking it through /proc/self/fd adds
+// the entry, and closing it unlinked removes the record in one commit.
+func (n *node) Tmpfile(ctx context.Context, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	if n.kind != kindObject {
+		return nil, nil, 0, syscall.EROFS
+	}
+	if flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) {
+		return nil, nil, 0, syscall.EINVAL
+	}
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	if n.srv.readOnly {
+		return nil, nil, 0, syscall.EROFS
+	}
+	principal := principalOf(ctx)
+	id, err := n.srv.store.CreateUnlinkedFile(nil, uint64(mode&0o7777), uint64(principal.UID), uint64(principal.GID), nil)
+	if err != nil {
+		return nil, nil, 0, errno(err)
+	}
+	record, ok := n.srv.viewState().Objects[id]
+	if !ok {
+		return nil, nil, 0, syscall.ENOENT
+	}
+	if _, err := n.srv.store.PinObject(id); err != nil {
+		return nil, nil, 0, errno(err)
+	}
+	child := n.srv.newNode(kindObject, id, "")
+	fillAttr(&out.Attr, record, n.srv.viewState().NLink(id), n.srv.inodes.objectIno(id))
+	handle := &fileHandle{
+		srv: n.srv, id: id, content: record.Content, size: record.Size,
+		append: flags&uint32(syscall.O_APPEND) != 0, pinnedObject: true, tmpfile: true,
+	}
+	return n.NewInode(ctx, child, child.stable()), handle, 0, 0
+}
+
+var _ = (fs.NodeAllocater)((*node)(nil))
+
+// Allocate implements fallocate. v1 files are dense, so PUNCH_HOLE and
+// ZERO_RANGE zero the range instead of reclaiming physical extents. That is a
+// real data-semantics implementation, not a space-reclamation claim. Mode 0
+// extends with zeros without touching existing bytes. COLLAPSE_RANGE and
+// INSERT_RANGE rewrite content exactly. Unknown combinations are EOPNOTSUPP.
+func (n *node) Allocate(ctx context.Context, f fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	if n.kind != kindObject {
+		return syscall.EROFS
+	}
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	if n.srv.readOnly {
+		return syscall.EROFS
+	}
+	record, err := n.recordLocked()
+	if err != nil {
+		return errno(err)
+	}
+	if record.Kind != model.KindFile {
+		return syscall.EINVAL
+	}
+	if !auth.CanWrite(record, principalOf(ctx)) {
+		return syscall.EACCES
+	}
+	if size == 0 {
+		return syscall.EINVAL
+	}
+	end := off + size
+	if end < off || off > store.MaxFileBytes || end > store.MaxFileBytes {
+		return syscall.EFBIG
+	}
+	known := uint32(fallocKeepSize | fallocPunchHole | fallocCollapse | fallocZeroRange | fallocInsert)
+	if mode&^known != 0 {
+		return syscall.EOPNOTSUPP
+	}
+	var operation error
+	switch {
+	case mode&fallocCollapse != 0:
+		if mode != fallocCollapse {
+			return syscall.EINVAL
+		}
+		_, operation = n.srv.store.CollapseRange(n.id, off, size)
+	case mode&fallocInsert != 0:
+		if mode != fallocInsert {
+			return syscall.EINVAL
+		}
+		_, operation = n.srv.store.InsertRange(n.id, off, size)
+	case mode&fallocPunchHole != 0:
+		if mode&fallocKeepSize == 0 {
+			return syscall.EINVAL
+		}
+		if mode&^(fallocPunchHole|fallocKeepSize) != 0 {
+			return syscall.EOPNOTSUPP
+		}
+		_, operation = n.srv.store.ZeroRange(n.id, off, size, false)
+	case mode&fallocZeroRange != 0:
+		if mode&^(fallocZeroRange|fallocKeepSize) != 0 {
+			return syscall.EOPNOTSUPP
+		}
+		_, operation = n.srv.store.ZeroRange(n.id, off, size, mode&fallocKeepSize == 0)
+	default:
+		if mode&^uint32(fallocKeepSize) != 0 {
+			return syscall.EOPNOTSUPP
+		}
+		if mode&fallocKeepSize == 0 && end > record.Size {
+			_, operation = n.srv.store.Truncate(n.id, end)
+		}
+	}
+	if operation != nil {
+		return errno(operation)
+	}
+	return 0
+}
+
+var _ = (fs.NodeCopyFileRanger)((*node)(nil))
+
+// CopyFileRange copies within the daemon. Both ends must be regular file
+// objects; the destination must be writable. A short copy at EOF or at the
+// 256 MiB v1 bound is returned as the copied length, matching read(2)-style
+// short-copy semantics rather than inventing a failure.
+func (n *node) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, offIn uint64, out *fs.Inode, fhOut fs.FileHandle, offOut uint64, length uint64, flags uint64) (uint32, syscall.Errno) {
+	if flags != 0 {
+		return 0, syscall.EINVAL
+	}
+	if length == 0 {
+		return 0, 0
+	}
+	outNode, ok := out.Operations().(*node)
+	if !ok || outNode.kind != kindObject {
+		return 0, syscall.EROFS
+	}
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	state := n.srv.viewState()
+	sourceID := n.id
+	var sourceContent model.Hash32
+	var sourceSize uint64
+	if handle, ok := fhIn.(*fileHandle); ok && handle != nil {
+		sourceID = handle.id
+		sourceContent, sourceSize = handle.currentLocked()
+	} else {
+		record, err := n.recordLocked()
+		if err != nil {
+			return 0, errno(err)
+		}
+		if record.Kind != model.KindFile {
+			return 0, syscall.EINVAL
+		}
+		sourceContent, sourceSize = record.Content, record.Size
+	}
+	if record, ok := state.Objects[sourceID]; ok {
+		if !auth.ACLAllows(record, principalOf(ctx)) {
+			return 0, syscall.EACCES
+		}
+	}
+	destination, err := outNode.recordLocked()
+	if err != nil {
+		return 0, errno(err)
+	}
+	if destination.Kind != model.KindFile {
+		return 0, syscall.EINVAL
+	}
+	if n.srv.readOnly {
+		return 0, syscall.EROFS
+	}
+	if !auth.CanWrite(destination, principalOf(ctx)) {
+		return 0, syscall.EACCES
+	}
+	if offOut > store.MaxFileBytes {
+		return 0, syscall.EFBIG
+	}
+	if length > store.MaxFileBytes-offOut {
+		length = store.MaxFileBytes - offOut
+	}
+	if offIn >= sourceSize {
+		return 0, 0
+	}
+	if length > sourceSize-offIn {
+		length = sourceSize - offIn
+	}
+	if length > uint64(^uint32(0)) {
+		length = uint64(^uint32(0))
+	}
+	data, err := n.srv.store.ReadContent(sourceContent, offIn, length)
+	if err != nil {
+		return 0, errno(err)
+	}
+	if _, err := n.srv.store.WriteFile(outNode.id, offOut, data); err != nil {
+		return 0, errno(err)
+	}
+	return uint32(len(data)), 0
+}
+
+var _ = (fs.NodeLseeker)((*node)(nil))
+
+// Lseek reports dense-file holes: data exists from 0 to size, and the only
+// hole is the virtual EOF hole at size. SEEK_SET is answered directly;
+// SEEK_CUR/SEEK_END are normally handled by the kernel and answer ENOSYS if
+// forwarded because the daemon holds no file position.
+func (n *node) Lseek(ctx context.Context, f fs.FileHandle, off uint64, whence uint32) (uint64, syscall.Errno) {
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	if n.isVirtual() {
+		return 0, syscall.EINVAL
+	}
+	record, err := n.recordLocked()
+	if err != nil {
+		return 0, errno(err)
+	}
+	if record.Kind != model.KindFile {
+		return 0, syscall.EINVAL
+	}
+	switch whence {
+	case seekSet:
+		return off, 0
+	case 3: // SEEK_DATA
+		if off >= record.Size {
+			return 0, syscall.ENXIO
+		}
+		return off, 0
+	case 4: // SEEK_HOLE
+		if off > record.Size {
+			return 0, syscall.ENXIO
+		}
+		return record.Size, 0
+	case seekCur, seekEnd:
+		return 0, syscall.ENOSYS
+	default:
+		return 0, syscall.EINVAL
+	}
 }
 
 // ---- directory open ------------------------------------------------------

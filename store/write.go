@@ -229,6 +229,215 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	return version, nil
 }
 
+// commitFileBuffer replaces a file object's whole content in one commit. It
+// preserves the object's identity mode and version parent. The caller holds
+// the single-writer serialization.
+func (s *Store) commitFileBuffer(id model.Hash32, old model.ObjectRecord, buffer []byte) (model.Hash32, error) {
+	if uint64(len(buffer)) > MaxFileBytes {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+	}
+	manifestID, _, size, err := s.storeFileContent(buffer)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	identityMode, causalHash, err := model.IdentityFromAttrs(old)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	mtime := s.nowNS()
+	version, err := model.DeriveVersionIDWithIdentity(id, manifestID, size, mtime, hashPtr(old.Version), identityMode, causalHash)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	record := old.Clone()
+	record.Version = version
+	record.MtimeNS = mtime
+	record.Content = manifestID
+	record.Size = size
+	ops := []model.Op{
+		model.PutObjectOp{Record: record},
+		model.SetTipOp{Object: id, Version: version},
+	}
+	if _, err := s.commitOps(ops, false); err != nil {
+		return model.Hash32{}, err
+	}
+	return version, nil
+}
+
+// ZeroRange writes zeros into [offset, offset+length). When extend is true the
+// file grows to cover the range; otherwise bytes past EOF are ignored. Files
+// are dense in v1, so this defines content but does not reclaim physical
+// chunks (see the FUSE fallocate documentation).
+func (s *Store) ZeroRange(id model.Hash32, offset, length uint64, extend bool) (model.Hash32, error) {
+	if err := s.requireWritable(); err != nil {
+		return model.Hash32{}, err
+	}
+	if length == 0 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "zero range length must be nonzero")
+	}
+	end := offset + length
+	if end < offset {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "zero range overflows")
+	}
+	old, ok := s.state.Objects[id]
+	if !ok {
+		return model.Hash32{}, werr.Newf(werr.NotFound, "no such object")
+	}
+	if old.Kind != model.KindFile {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "zero range requires a file object")
+	}
+	if extend && end > MaxFileBytes {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+	}
+	high := offset
+	if end > high {
+		high = end
+	}
+	newSize := old.Size
+	if extend && high > newSize {
+		newSize = high
+	}
+	zeroEnd := high
+	if zeroEnd > newSize {
+		zeroEnd = newSize
+	}
+	if zeroEnd <= offset {
+		return old.Version, nil
+	}
+	current, err := s.ReadObject(id)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if uint64(len(current)) != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while zeroing")
+	}
+	buffer := make([]byte, int(newSize))
+	copy(buffer, current)
+	clear(buffer[int(offset):int(zeroEnd)])
+	return s.commitFileBuffer(id, old, buffer)
+}
+
+// CollapseRange removes [offset, offset+length) and shifts later bytes left.
+func (s *Store) CollapseRange(id model.Hash32, offset, length uint64) (model.Hash32, error) {
+	if err := s.requireWritable(); err != nil {
+		return model.Hash32{}, err
+	}
+	if length == 0 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "collapse length must be nonzero")
+	}
+	old, ok := s.state.Objects[id]
+	if !ok {
+		return model.Hash32{}, werr.Newf(werr.NotFound, "no such object")
+	}
+	if old.Kind != model.KindFile {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "collapse requires a file object")
+	}
+	if offset > old.Size || length > old.Size-offset {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "collapse range lies past EOF")
+	}
+	current, err := s.ReadObject(id)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if uint64(len(current)) != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while collapsing")
+	}
+	buffer := make([]byte, int(old.Size-length))
+	copy(buffer, current[:int(offset)])
+	copy(buffer[int(offset):], current[int(offset+length):])
+	return s.commitFileBuffer(id, old, buffer)
+}
+
+// InsertRange inserts length zero bytes at offset and shifts later bytes right.
+func (s *Store) InsertRange(id model.Hash32, offset, length uint64) (model.Hash32, error) {
+	if err := s.requireWritable(); err != nil {
+		return model.Hash32{}, err
+	}
+	if length == 0 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "insert length must be nonzero")
+	}
+	old, ok := s.state.Objects[id]
+	if !ok {
+		return model.Hash32{}, werr.Newf(werr.NotFound, "no such object")
+	}
+	if old.Kind != model.KindFile {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "insert requires a file object")
+	}
+	if offset > old.Size {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "insert offset lies past EOF")
+	}
+	newSize := old.Size + length
+	if newSize < old.Size || newSize > MaxFileBytes {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+	}
+	current, err := s.ReadObject(id)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if uint64(len(current)) != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while inserting")
+	}
+	buffer := make([]byte, int(newSize))
+	copy(buffer, current[:int(offset)])
+	copy(buffer[int(offset+length):], current[int(offset):])
+	return s.commitFileBuffer(id, old, buffer)
+}
+
+// CreateUnlinkedFile creates a regular file object with no directory entry
+// (O_TMPFILE). The caller must pin it before concurrent GC can observe it; the
+// FUSE frontend does so in the same critical section. If it is never linked,
+// the pin's release removes the record in one commit.
+func (s *Store) CreateUnlinkedFile(data []byte, mode, uid, gid uint64, attrs map[string]wcb.Value) (model.Hash32, error) {
+	seed, err := randomSeed()
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	return s.CreateUnlinkedFileSeeded(data, mode, uid, gid, attrs, seed)
+}
+
+// CreateUnlinkedFileSeeded is CreateUnlinkedFile with an explicit ObjectId seed.
+func (s *Store) CreateUnlinkedFileSeeded(data []byte, mode, uid, gid uint64, attrs map[string]wcb.Value, seed []byte) (model.Hash32, error) {
+	if err := s.requireWritable(); err != nil {
+		return model.Hash32{}, err
+	}
+	if err := checkMode(mode); err != nil {
+		return model.Hash32{}, err
+	}
+	if uint64(len(data)) > MaxFileBytes {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+	}
+	manifestID, _, size, err := s.storeFileContent(data)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	objectID := model.ObjectIDFromSeed(seed)
+	if _, exists := s.state.Objects[objectID]; exists {
+		return model.Hash32{}, werr.Newf(werr.Exists, "object id already exists")
+	}
+	preparedAttrs, _, _, _, err := s.prepareCausal(attrs, nil)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	mtime := s.nowNS()
+	version, err := model.DeriveVersionID(objectID, manifestID, size, mtime, nil)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	record := model.ObjectRecord{
+		ID: objectID, Kind: model.KindFile, Mode: mode, UID: uid, GID: gid,
+		MtimeNS: mtime, Version: version, Content: manifestID, Size: size,
+		Attrs: preparedAttrs,
+	}
+	ops := []model.Op{
+		model.PutObjectOp{Record: record},
+		model.SetTipOp{Object: objectID, Version: version},
+	}
+	if _, err := s.commitOps(ops, false); err != nil {
+		return model.Hash32{}, err
+	}
+	return objectID, nil
+}
+
 // Unlink removes a directory entry. When the last entry for an object
 // disappears the object record is deleted in the same commit, unless an open
 // handle pins it.

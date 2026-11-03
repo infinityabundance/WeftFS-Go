@@ -438,11 +438,13 @@ Cross-language GC handoff (Rust binary is a test oracle only):
 
 ## 3. Known limitations and honest gaps
 
-1. **No online/background GC.** Collection is an explicit `store.GC`/`weftfs
-   gc` pass under the exclusive writer lock. There is no persisted mark record:
-   every run recomputes roots, so an interrupted sweep is recovered by
-   re-running. Readers do not participate; safety rests on the writer lock and
-   immutable blobs.
+1. **Normal GC is explicit; the online collector is opt-in.** Collection is
+   `store.GC`/`GCBounded`/`GCWatch` or `weftfs gc` under the exclusive writer
+   lock. `mount --gc-watch` runs the same bounded pass under the FUSE server
+   mutex; it is disabled by default. There is no persisted mark record: every
+   run recomputes roots, so an interrupted sweep is recovered by re-running.
+   A separate long-lived reader pinned to a pre-snapshot commit is not a GC
+   root; use snapshots (which are roots) or the grace window.
 2. **Same-inode concurrent direct read/write is not claimed.** The parent
    project records a kernel EIO issue for that pattern in
    `docs/fuse-status.md`. This implementation tests concurrent traffic on
@@ -452,9 +454,15 @@ Cross-language GC handoff (Rust binary is a test oracle only):
    change a name between readdir and lookup on a live mount. Snapshot mounts
    are immutable and always agree. The Rust frontend freezes the listing at
    `opendir`; this is a fidelity difference for live mounts only.
-4. **Locking, mknod, tmpfile, fallocate, copy_file_range, lseek holes** are not
-   implemented. Locking answers `ENOSYS` (kernel local locks); the others use
-   the kernel-visible unsupported response.
+4. **Verb limits are documented, not hidden.** `ioctl` is not implemented
+   (go-fuse answers `ENOTTY`). `mknod` accepts regular files only; FIFO,
+   socket, and device nodes are `EPERM` because v1 has no such object kind.
+   `COLLAPSE_RANGE`/`INSERT_RANGE` are implemented in the store and directly
+   tested, but the 7.3.1 FUSE kernel boundary rejects them before sending
+   `FUSE_FALLOCATE`; the mount test records that precise refusal. `PUNCH_HOLE`
+   and `ZERO_RANGE` define content but do not reclaim physical chunks (dense
+   v1 files). Locks are advisory, in-memory, and per-mount-process; they do
+   not coordinate independent daemons or hosts.
 5. **atime/ctime** are not stored; getattr mirrors mtime. `setattr` applies
    mode/uid/gid/mtime/size only.
 6. **`write` is whole-file rematerialisation** in v1 (`WEFT-MODEL.md` §3), so a
@@ -489,3 +497,148 @@ is exercised as a writer and reader in both F5 FUSE courts:
 Receipts: `bench/receipts/posix-torture-20261103T213317Z.json` and
 `bench/receipts/crash-torture-20261103T213446Z.json`. The crash court is a
 process-fault proxy, not physical power loss.
+
+---
+
+## F8 — FUSE verb closure and online GC (2026-11-03)
+
+Base revision WeftFS-Go `73a671930b504fd2913887f703d5efa02d591bd8` (parent
+`49a3bad899a376fb6da89e6f1cd6e2eaf201c19e`); WeftCodec-Go is the path-replaced
+module at `ce2cff9283c2ccb841ee27ea5415ef3cb4691c6a`. The final revision is the
+`staging` commit carrying this file; no result below depends on a later tree.
+
+### 1. FUSE verbs implemented in this pass
+
+- `getlk`/`setlk`/`setlkw`: an in-memory advisory manager for POSIX byte ranges
+  (including partial unlock/split and cross-owner conflict) and flock
+  (whole-file, separate namespace) with `EnableLocks` so the kernel forwards
+  both. `Setlkw` waits on a per-object broadcast channel and returns `EINTR`
+  when the FUSE request is cancelled. Owners observed on a handle are released
+  when that handle is released. Read-only/snapshot mounts permit read locks and
+  refuse write locks with `EROFS`; virtual views never hold locks.
+- `mknod`: regular files (`S_IFREG`) only. FIFO, socket, character, and block
+  devices are `EPERM` because v1 has no such object kind (no silent degradation
+  to a regular file). Read-only mounts return `EROFS`.
+- `tmpfile`: `O_TMPFILE` creates an unnamed file object, pins it for the handle,
+  supports write/read, links through `/proc/self/fd` with `AT_SYMLINK_FOLLOW`,
+  and removes the record in one commit when the last handle closes unlinked.
+- `fallocate`: mode 0, `KEEP_SIZE`, `PUNCH_HOLE` (requires `KEEP_SIZE`),
+  `ZERO_RANGE` (with/without `KEEP_SIZE`), `COLLAPSE_RANGE`, and `INSERT_RANGE`
+  are implemented. Mode 0 extends with zeros without touching existing bytes.
+  Dense v1 files mean `PUNCH_HOLE`/`ZERO_RANGE` zero content but do not reclaim
+  physical chunks; this is stated rather than claimed as space reclamation.
+  Unknown modes are `EOPNOTSUPP`; zero length is `EINVAL`; ranges past the
+  256 MiB v1 bound are `EFBIG`.
+- `copy_file_range`: daemon-side copy for regular objects, `flags != 0` is
+  `EINVAL`, source ACL and destination write authorization are checked,
+  read-only/snapshot destinations are `EROFS`, and a short copy at EOF or at
+  the 256 MiB bound returns the copied length.
+- `lseek`: `SEEK_DATA` returns the offset for a dense file and `ENXIO` at/after
+  EOF; `SEEK_HOLE` returns the file size (the only hole) and `ENXIO` past EOF;
+  `SEEK_SET` is answered directly; `SEEK_CUR`/`SEEK_END` answer `ENOSYS` if the
+  kernel ever forwards them.
+- `ioctl` was not needed and remains unimplemented; go-fuse answers `ENOTTY`.
+
+### 2. Online/background GC
+
+`store.GCBounded(apply, maxDeletes)` performs one mark-and-sweep pass and
+deletes at most `maxDeletes` candidates. Marking is still O(reachable); the
+sweep is the bounded unit. Cancellation is checked during marking, snapshot and
+checkpoint expansion, directory scans, and between deletions; a cancelled pass
+leaves only already-deleted unreachable blobs, never a partial reachable set.
+
+`store.GCWatch(ctx, interval, maxDeletes, onPass)` is the standalone/CLI
+collector. It requires the exclusive writer lock, applies each pass, honors
+`GCGraceSecs`, and returns `nil` on cancellation. `weftfs gc --apply --watch`
+requires the explicit `--apply` (the collector is disabled by default).
+
+`fusefs.Server.StartBackgroundGC` is the in-mount collector. `mount --gc-watch`
+sets `GCBackground`, `GCIntervalSecs`, and `GCWatchMaxDeletes` on the store; a
+writable live mount starts it after `fs.Mount`, and every pass takes the same
+`srv.mu` as all FUSE requests. It is not started for read-only, snapshot,
+context, `--at`, or capability mounts. `StopBackgroundGC` is idempotent and is
+also called from the root inode's `OnForget` during unmount, so no pass can
+touch the store after close.
+
+Safe use: the writer lock serializes writers; snapshots, checkpoints, current
+state, and in-process object/content pins are roots. A separate reader pinned
+to a historical commit that is not a snapshot is not a root, so use snapshots
+or the grace window for long-lived historical readers.
+
+### 3. Exact court commands and observed results
+
+```text
+scripts/docker-court.sh go "cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./..."
+  -> clean: gofmt listed no files; go vet and CGO-disabled build completed 0.
+
+scripts/docker-court.sh fuse "cd /work/WeftFS-Go && go test -race -count=1 -v ./..."
+  -> 74 passed, 2 skipped, 0 failed.
+     fusefs 6.503 s, store 1.893 s.
+     Skips are the pre-existing child-process guards TestCrashChildProcess and
+     TestGCRejectedTailChild (they require an explicit helper environment).
+     New passes: TestMknodRegularFilesOnly, TestTmpfileWriteLinkAndRelease,
+     TestFallocateModesOnDenseFiles, TestCopyFileRangeServerSide,
+     TestLseekDataAndHole, TestByteRangeAndFlockLocks,
+     TestBackgroundGCDuringReadsAndWrites,
+     TestBackgroundGCPreservesSnapshotAndOpenHandle,
+     TestGCBoundedRespectsDeletionBudgetAndConverges,
+     TestGCWatchCancellationAndPassBudget, TestGCWatchRequiresWriterLock,
+     TestGCWatchPreservesPinnedContentAndSnapshot,
+     TestGCBoundedInterruptedPassConverges,
+     TestCollapseInsertAndZeroRangeStoreLevel,
+     TestGCHandoffGoBackgroundWatchRustVerifies.
+
+CLI watch smoke (Go court, no host execution):
+  weftfs --store DIR init
+  weftfs --store DIR create /gone.txt --text garbage-background-watch
+  weftfs --store DIR unlink /gone.txt
+  timeout --preserve-status -s TERM 1 weftfs --store DIR gc --apply --watch \
+    --interval 100ms --max-deletes 1 --grace-secs 0
+  -> pass deleted_files=1 remaining_files=1; pass deleted_files=1
+     remaining_files=0; later passes deleted_files=0; SIGTERM exit 0.
+  weftfs --store DIR gc --dry-run --grace-secs 0 -> unreachable_files=0
+  weftfs --store DIR verify --full -> ok=true, full=true, generation=3
+
+Cross-language after GC: TestGCHandoffGoBackgroundWatchRustVerifies creates a
+Rust store with a snapshot and unreachable blob, runs the Go watch loop to
+deletion, then requires Rust verify --full, Rust cat of the live file, and a
+Rust --snapshot mount read of the pinned snapshot bytes. Existing gates A-D
+(Rust→Go, Go→Rust, alternating generations, SIGKILL tail) still pass in the
+same suite. The Rust binary is a test oracle only; no Go production path
+invokes Rust.
+```
+
+### 4. Precise blocked or limited verbs
+
+- **COLLAPSE_RANGE / INSERT_RANGE at the mount boundary.** The daemon and store
+  implement both and `TestCollapseInsertAndZeroRangeStoreLevel` proves the
+  semantics. On the court kernel 7.3.1, `unix.Fallocate(fd, 0x08, 1, 2)`
+  returns `EOPNOTSUPP` and go-fuse debug showed **no `FUSE_FALLOCATE` frame**
+  after the preceding successful modes. The mount test therefore accepts
+  `EOPNOTSUPP` only for this boundary and fails on any other error. If a future
+  kernel forwards the mode, the existing handler path is exercised.
+- **PUNCH_HOLE without KEEP_SIZE.** The daemon returns `EINVAL` if reached; this
+  kernel returns `EOPNOTSUPP` before forwarding. The test accepts either and
+  documents both.
+- **ioctl.** No command needed it; go-fuse's default is `ENOTTY`.
+- **Lock release on close.** FUSE reveals a POSIX lock owner only on lock
+  requests, not at open. A descriptor that never acquired a lock cannot release
+  the process's locks on that file (POSIX close-any-fd semantics). Owners seen
+  on a handle are released at handle release, and explicit `F_UNLCK` always
+  works. Locks are per-daemon; independent mounts/hosts are not coordinated.
+- **Physical space.** `PUNCH_HOLE`/`ZERO_RANGE` are content semantics only on
+  dense v1 files. No `st_blocks` reclamation or sparse-extent format exists.
+- **atime/ctime** are still not stored; `mmap` writeback is not implemented.
+
+### 5. Remaining gaps
+
+1. Kernel-forwarded COLLAPSE/INSERT and a sparse/chunk-freeing `PUNCH_HOLE`
+   require a newer/changed FUSE boundary and an on-disk sparse-extent design;
+   neither is claimed.
+2. Locks do not coordinate separate daemons or hosts, and the close-any-fd
+   release limitation above remains.
+3. The online collector is opt-in; default GC is still an explicit pass.
+   Long-lived readers pinned to non-snapshot historical commits are outside the
+   root set.
+4. `ioctl`, `mmap` writeback, atime/ctime persistence, and a physical
+   power-loss court remain out of scope for this pass.

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -1314,6 +1315,9 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 	apply := fs.Bool("apply", false, "delete unreachable blobs (default: dry run)")
 	dryRun := fs.Bool("dry-run", false, "report candidates without deleting (the default)")
 	graceSecs := fs.Uint64("grace-secs", store.DefaultGCGraceSecs, "retain unmarked blobs younger than this many seconds (0 disables)")
+	watch := fs.Bool("watch", false, "run periodic background passes until SIGINT/SIGTERM (requires --apply)")
+	interval := fs.Duration("interval", time.Duration(store.DefaultGCIntervalSecs)*time.Second, "watch pass interval")
+	maxDeletes := fs.Int("max-deletes", int(store.DefaultGCWatchMaxDeletes), "maximum blobs deleted per watch pass (0 = unbounded)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -1322,6 +1326,12 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 	}
 	if *dryRun && *apply {
 		return werr.Newf(werr.InvalidArgument, "--dry-run and --apply are mutually exclusive")
+	}
+	if *watch && !*apply {
+		return werr.Newf(werr.InvalidArgument, "--watch requires --apply; the collector is disabled by default")
+	}
+	if *watch && *maxDeletes < 0 {
+		return werr.Newf(werr.InvalidArgument, "--max-deletes must be >= 0")
 	}
 	s, err := openStore(storeDir, store.ReadWrite)
 	if err != nil {
@@ -1332,6 +1342,28 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 	options.GCGraceSecs = *graceSecs
 	if err := s.SetOptions(options); err != nil {
 		return err
+	}
+	if *watch {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		encoder := json.NewEncoder(os.Stdout)
+		return s.GCWatch(ctx, *interval, *maxDeletes, func(report store.GCReport) {
+			if jsonOut {
+				_ = encoder.Encode(map[string]any{
+					"applied":           report.Applied,
+					"deleted_files":     report.DeletedFiles,
+					"deleted_bytes":     report.DeletedBytes,
+					"unreachable_files": report.UnreachableFiles,
+					"remaining_files":   report.RemainingFiles,
+					"grace_retained":    report.GraceRetained,
+					"removed_orphans":   len(report.RemovedOrphans),
+					"problems":          len(report.Problems),
+				})
+				return
+			}
+			fmt.Printf("pass applied=%v deleted_files=%d deleted_bytes=%d unreachable_files=%d remaining_files=%d grace_retained=%d\n",
+				report.Applied, report.DeletedFiles, report.DeletedBytes, report.UnreachableFiles, report.RemainingFiles, report.GraceRetained)
+		})
 	}
 	report, err := s.GC(*apply)
 	if err != nil {
@@ -1362,6 +1394,8 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 			"reachable_bytes":   report.ReachableBytes,
 			"unreachable_files": report.UnreachableFiles,
 			"unreachable_bytes": report.UnreachableBytes,
+			"remaining_files":   report.RemainingFiles,
+			"remaining_bytes":   report.RemainingBytes,
 			"deleted_files":     report.DeletedFiles,
 			"deleted_bytes":     report.DeletedBytes,
 			"retained":          report.Retained,
@@ -1379,6 +1413,8 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 	fmt.Printf("reachable_bytes=%d\n", report.ReachableBytes)
 	fmt.Printf("unreachable_files=%d\n", report.UnreachableFiles)
 	fmt.Printf("unreachable_bytes=%d\n", report.UnreachableBytes)
+	fmt.Printf("remaining_files=%d\n", report.RemainingFiles)
+	fmt.Printf("remaining_bytes=%d\n", report.RemainingBytes)
 	fmt.Printf("deleted_files=%d\n", report.DeletedFiles)
 	fmt.Printf("deleted_bytes=%d\n", report.DeletedBytes)
 	fmt.Printf("retained=%d\n", report.Retained)
@@ -1463,6 +1499,9 @@ func cmdMount(args []string, storeDir string) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users")
 	debug := fs.Bool("debug", false, "go-fuse debug logging")
 	capabilityPath := fs.String("capability", "", "capability JSON or hex file narrowing exact-id and saved-context views")
+	gcWatch := fs.Bool("gc-watch", false, "run online background GC on a writable live mount (disabled by default)")
+	gcInterval := fs.Duration("gc-interval", time.Duration(store.DefaultGCIntervalSecs)*time.Second, "background GC pass interval")
+	gcMaxDeletes := fs.Int("gc-max-deletes", int(store.DefaultGCWatchMaxDeletes), "maximum blobs deleted per background GC pass")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -1487,11 +1526,26 @@ func cmdMount(args []string, storeDir string) error {
 	if *readOnly || *snapshot != "" || *contextName != "" || *at != "" || capability != nil {
 		mode = store.ReadOnly
 	}
+	if *gcWatch && mode != store.ReadWrite {
+		return werr.Newf(werr.InvalidArgument, "--gc-watch requires a writable live mount (remove --read-only/--snapshot/--context/--at/--capability)")
+	}
+	if *gcWatch && *gcMaxDeletes <= 0 {
+		return werr.Newf(werr.InvalidArgument, "--gc-max-deletes must be >= 1")
+	}
 	s, err := store.Open(storeDir, mode)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+	if *gcWatch {
+		options := s.Options()
+		options.GCBackground = true
+		options.GCIntervalSecs = uint64(*gcInterval / time.Second)
+		options.GCWatchMaxDeletes = uint64(*gcMaxDeletes)
+		if err := s.SetOptions(options); err != nil {
+			return err
+		}
+	}
 	opts := fusefs.Options{
 		Mountpoint: *mountpoint, ReadOnly: *readOnly || capability != nil, AllowOther: *allowOther, Debug: *debug,
 		Capability: capability,
@@ -1542,10 +1596,11 @@ func cmdMount(args []string, storeDir string) error {
 		}
 		opts.Snapshot = &commit
 	}
-	server, _, err := fusefs.Mount(s, opts)
+	server, srv, err := fusefs.Mount(s, opts)
 	if err != nil {
 		return err
 	}
+	defer srv.StopBackgroundGC()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

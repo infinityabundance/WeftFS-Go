@@ -26,6 +26,8 @@ const (
 	MaxFileBytes              uint64 = 256 * 1024 * 1024
 	DefaultCheckpointInterval uint64 = 256
 	DefaultGCGraceSecs        uint64 = 3600
+	DefaultGCIntervalSecs     uint64 = 60
+	DefaultGCWatchMaxDeletes  uint64 = 256
 	MaxXattrNameBytes                = 255
 	MaxXattrValueBytes        uint64 = 65536
 	MaxXattrCount                    = 1024
@@ -48,6 +50,13 @@ type Options struct {
 	ChunkSize          uint64
 	CheckpointInterval uint64
 	GCGraceSecs        uint64
+	// GCBackground enables the FUSE frontend's periodic collector. It is
+	// disabled by default; the store still requires the exclusive writer lock.
+	GCBackground bool
+	// GCIntervalSecs and GCWatchMaxDeletes bound a background pass: one
+	// deletion budget per interval. Zero selects the v1 defaults.
+	GCIntervalSecs    uint64
+	GCWatchMaxDeletes uint64
 	// FixedTimestampNS overrides every generated mtime and commit timestamp
 	// (tests and the deterministic fixture). Nil uses the wall clock.
 	FixedTimestampNS *int64
@@ -61,6 +70,8 @@ func DefaultOptions() Options {
 		ChunkSize:          model.DefaultChunkSize,
 		CheckpointInterval: DefaultCheckpointInterval,
 		GCGraceSecs:        DefaultGCGraceSecs,
+		GCIntervalSecs:     DefaultGCIntervalSecs,
+		GCWatchMaxDeletes:  DefaultGCWatchMaxDeletes,
 	}
 }
 
@@ -154,6 +165,14 @@ func validateOptions(opts Options) error {
 	}
 	if opts.CheckpointInterval > 1_000_000 {
 		return werr.Newf(werr.InvalidArgument, "checkpoint_interval must be at most 1,000,000")
+	}
+	if opts.GCBackground {
+		if opts.GCIntervalSecs == 0 || opts.GCIntervalSecs > 86400 {
+			return werr.Newf(werr.InvalidArgument, "gc_interval_secs must be 1..=86400")
+		}
+		if opts.GCWatchMaxDeletes == 0 || opts.GCWatchMaxDeletes > 1_000_000 {
+			return werr.Newf(werr.InvalidArgument, "gc_watch_max_deletes must be 1..=1,000,000")
+		}
 	}
 	return nil
 }

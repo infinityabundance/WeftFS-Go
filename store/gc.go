@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -36,6 +37,10 @@ type GCReport struct {
 	// Retained counts marked files plus unmarked files kept by the grace gate.
 	Retained      uint64
 	GraceRetained uint64
+	// RemainingFiles/Bytes count reachable-space work left after a bounded
+	// pass. They are zero when every candidate was processed.
+	RemainingFiles uint64
+	RemainingBytes uint64
 	// RemovedOrphans lists unreferenced object records removed in a commit
 	// (left behind by a crash while an unlinked object was pinned).
 	RemovedOrphans []string
@@ -59,12 +64,79 @@ type gcCandidate struct {
 // that opening the store in ReadWrite mode already holds; a second writer is
 // refused at open time with Busy. A dry run is the default.
 func (s *Store) GC(apply bool) (GCReport, error) {
+	return s.gcPass(context.Background(), apply, 0, s.options.GCGraceSecs)
+}
+
+// GCBounded runs one mark-and-sweep pass that deletes at most maxDeletes
+// candidate files. maxDeletes <= 0 keeps the unbounded GC behavior. Marking is
+// still O(reachable); only the sweep is bounded, which is the unit a watcher
+// needs to interleave with foreground work.
+func (s *Store) GCBounded(apply bool, maxDeletes int) (GCReport, error) {
+	return s.gcPass(context.Background(), apply, maxDeletes, s.options.GCGraceSecs)
+}
+
+// GCWatch is the standalone (CLI) background collector. It requires the
+// exclusive writer lock and is the only user of this Store while it runs. Each
+// pass applies, honors the configured grace window, and deletes at most
+// maxDeletes blobs. Cancelling ctx stops the loop after the current pass or at
+// the next candidate boundary; already-deleted unreachable blobs stay deleted,
+// and the next pass recomputes roots from scratch.
+func (s *Store) GCWatch(ctx context.Context, interval time.Duration, maxDeletes int, onPass func(GCReport)) error {
+	if err := s.requireWritable(); err != nil {
+		return err
+	}
+	if s.lock == nil {
+		return werr.Newf(werr.Busy, "store writer lock is not held")
+	}
+	if interval <= 0 {
+		interval = time.Duration(DefaultGCIntervalSecs) * time.Second
+	}
+	for {
+		if err := checkCancel(ctx); err != nil {
+			return nil
+		}
+		report, err := s.gcPass(ctx, true, maxDeletes, s.options.GCGraceSecs)
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if onPass != nil {
+			onPass(report)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+func checkCancel(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSecs uint64) (GCReport, error) {
 	report := GCReport{Applied: apply}
 	if err := s.requireWritable(); err != nil {
 		return report, err
 	}
 	if s.lock == nil {
 		return report, werr.Newf(werr.Busy, "store writer lock is not held")
+	}
+	if err := checkCancel(ctx); err != nil {
+		return report, err
 	}
 
 	// An unlinked object record can survive a crash while an open handle pinned
@@ -91,7 +163,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 	markedManifests := make(map[model.Hash32]struct{})
 	markedChunks := make(map[model.Hash32]struct{})
 
-	markState(s.root, s.state, markedManifests, markedChunks, &report.Problems)
+	if err := markState(ctx, s.root, s.state, markedManifests, markedChunks, &report.Problems); err != nil {
+		return report, err
+	}
 
 	snapshotNames := make([]string, 0, len(s.state.Snapshots))
 	for name := range s.state.Snapshots {
@@ -99,6 +173,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 	}
 	sort.Strings(snapshotNames)
 	for _, name := range snapshotNames {
+		if err := checkCancel(ctx); err != nil {
+			return report, err
+		}
 		commit := s.state.Snapshots[name]
 		snapshotState, err := s.StateAt(commit)
 		if err != nil {
@@ -106,7 +183,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 				"snapshot "+name+" ("+commit.Hex()+") state is unreadable: "+err.Error())
 			continue
 		}
-		markState(s.root, snapshotState, markedManifests, markedChunks, &report.Problems)
+		if err := markState(ctx, s.root, snapshotState, markedManifests, markedChunks, &report.Problems); err != nil {
+			return report, err
+		}
 	}
 
 	// Checkpoints are immutable evidence. They are roots even when the commit
@@ -117,6 +196,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 		return report, err
 	}
 	for _, commit := range commits {
+		if err := checkCancel(ctx); err != nil {
+			return report, err
+		}
 		if commit.Commit.Checkpoint == nil {
 			continue
 		}
@@ -128,7 +210,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 				"checkpoint "+checkpoint.Hex()+" is unreadable: "+err.Error())
 			continue
 		}
-		markState(s.root, checkpointState, markedManifests, markedChunks, &report.Problems)
+		if err := markState(ctx, s.root, checkpointState, markedManifests, markedChunks, &report.Problems); err != nil {
+			return report, err
+		}
 	}
 
 	// Content pins held by open read handles are roots even after the object
@@ -139,6 +223,9 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 	}
 	sort.Slice(contentPins, func(i, j int) bool { return contentPins[i].Less(contentPins[j]) })
 	for _, content := range contentPins {
+		if err := checkCancel(ctx); err != nil {
+			return report, err
+		}
 		markedManifests[content] = struct{}{}
 		manifest, err := ReadManifest(s.root, content)
 		if err != nil {
@@ -155,14 +242,13 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 	report.MarkedChunks = uint64(len(markedChunks))
 
 	now := time.Now()
-	grace := s.options.GCGraceSecs
 	candidates := make([]gcCandidate, 0)
-	manifestCandidates, err := collectUnmarked(s.root, "manifests", markedManifests, now, grace, &report)
+	manifestCandidates, err := collectUnmarked(ctx, s.root, "manifests", markedManifests, now, graceSecs, &report)
 	if err != nil {
 		return report, err
 	}
 	candidates = append(candidates, manifestCandidates...)
-	objectCandidates, err := collectUnmarked(s.root, "objects", markedChunks, now, grace, &report)
+	objectCandidates, err := collectUnmarked(ctx, s.root, "objects", markedChunks, now, graceSecs, &report)
 	if err != nil {
 		return report, err
 	}
@@ -176,14 +262,29 @@ func (s *Store) GC(apply bool) (GCReport, error) {
 	}
 
 	if apply {
+		deleted := 0
+		var deletedBytes uint64
 		for _, candidate := range candidates {
+			if maxDeletes > 0 && deleted >= maxDeletes {
+				break
+			}
+			if err := checkCancel(ctx); err != nil {
+				return report, err
+			}
 			if err := os.Remove(candidate.path); err != nil {
 				return report, werr.Wrap(werr.Io, err, "cannot delete %s", candidate.path)
 			}
 			report.Deleted = append(report.Deleted, candidate.rel)
 			report.DeletedFiles++
 			report.DeletedBytes += candidate.size
+			deleted++
+			deletedBytes += candidate.size
 		}
+		report.RemainingFiles = report.UnreachableFiles - report.DeletedFiles
+		report.RemainingBytes = report.UnreachableBytes - deletedBytes
+	} else {
+		report.RemainingFiles = report.UnreachableFiles
+		report.RemainingBytes = report.UnreachableBytes
 	}
 	return report, nil
 }
@@ -222,8 +323,11 @@ func (s *Store) orphanObjectIDs() []model.Hash32 {
 
 // markState marks the manifest and chunks of every file object in a state.
 // Non-file objects carry a content digest that is not a manifest.
-func markState(root string, state *model.State, manifests, chunks map[model.Hash32]struct{}, problems *[]string) {
+func markState(ctx context.Context, root string, state *model.State, manifests, chunks map[model.Hash32]struct{}, problems *[]string) error {
 	for _, id := range model.SortHashKeys(state.Objects) {
+		if err := checkCancel(ctx); err != nil {
+			return err
+		}
 		record := state.Objects[id]
 		// A causal closure record is content-addressed under the manifest
 		// domain and is retained while the object that names it is retained.
@@ -246,13 +350,14 @@ func markState(root string, state *model.State, manifests, chunks map[model.Hash
 			chunks[chunk.Hash] = struct{}{}
 		}
 	}
+	return nil
 }
 
 // collectUnmarked walks exactly <root>/<kind>/<shard>/<hash>. It never follows
 // symlinks, only considers regular files, and applies the Rust grace rule: with
 // grace_secs > 0 an unmarked file whose age is below the window is retained
 // (a future mtime counts as age zero).
-func collectUnmarked(root, kindDir string, marked map[model.Hash32]struct{}, now time.Time, graceSecs uint64, report *GCReport) ([]gcCandidate, error) {
+func collectUnmarked(ctx context.Context, root, kindDir string, marked map[model.Hash32]struct{}, now time.Time, graceSecs uint64, report *GCReport) ([]gcCandidate, error) {
 	dir := filepath.Join(root, kindDir)
 	shards, err := os.ReadDir(dir)
 	if err != nil {
@@ -263,6 +368,9 @@ func collectUnmarked(root, kindDir string, marked map[model.Hash32]struct{}, now
 	}
 	out := make([]gcCandidate, 0)
 	for _, shard := range shards {
+		if err := checkCancel(ctx); err != nil {
+			return nil, err
+		}
 		shardPath := filepath.Join(dir, shard.Name())
 		shardInfo, err := os.Lstat(shardPath)
 		if err != nil {
@@ -276,6 +384,9 @@ func collectUnmarked(root, kindDir string, marked map[model.Hash32]struct{}, now
 			return nil, werr.Wrap(werr.Io, err, "cannot read %s", shardPath)
 		}
 		for _, file := range files {
+			if err := checkCancel(ctx); err != nil {
+				return nil, err
+			}
 			name := file.Name()
 			path := filepath.Join(shardPath, name)
 			info, err := os.Lstat(path)

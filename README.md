@@ -30,27 +30,42 @@ Implemented and exercised in the Docker FUSE court:
   symlink/setattr/xattr, relations, snapshots, checkpoints, exclusive `flock`
   writer locking, read-only opens without a lock, open-handle pins, and
   `fsync` on file/directory/root plus superblock slot `gen % 2`.
-- **Mark-and-sweep GC** (`store.GC`, CLI `gc`): Rust-compatible roots (current
-  state, snapshot states, all checkpoint manifests including valid unpublished
-  tails, content pins), orphan-record cleanup on apply, `gc_grace_secs` age
-  gate, dry run by default, checked non-symlink regular-file sweep under
-  `objects/` and `manifests/`, and file/byte counts for reachable,
-  unreachable, and deleted sets. Cross-language handoff gates cover Rust→Go,
-  Go→Rust, alternating generations, and SIGKILL-during-commit recovery.
+- **Mark-and-sweep GC** (`store.GC`, `store.GCBounded`, `store.GCWatch`,
+  CLI `gc`): Rust-compatible roots (current state, snapshot states, all
+  checkpoint manifests including valid unpublished tails, content pins),
+  orphan-record cleanup on apply, `gc_grace_secs` age gate, dry run by default,
+  checked non-symlink regular-file sweep under `objects/` and `manifests/`, and
+  file/byte counts for reachable, unreachable, deleted, and remaining sets.
+  `gc --apply --watch` runs bounded, cancellable passes under the exclusive
+  writer lock; `mount --gc-watch` enables the same collector inside a writable
+  live mount, serialized with every FUSE request. Both are opt-in. Cross-
+  language handoff gates cover Rust→Go, Go→Rust, alternating generations, and
+  SIGKILL-during-commit recovery.
 - **Go FUSE frontend** (`fusefs`, `github.com/hanwen/go-fuse/v2`): mount,
   lookup/getattr/readdir(+)/open/create/read/write/flush/fsync/release/mkdir/
   rmdir/unlink/rename/link/symlink/readlink/setattr/statfs/xattrs/access,
-  read-only and snapshot mounts, `/.weft/id/<64hex>` exact-object view, and
-  saved-context views with deterministic escaped display names.
+  `mknod` (regular files; FIFO/socket/device rejected with `EPERM`), `tmpfile`
+  (O_TMPFILE, linkable through `/proc/self/fd`), `fallocate` modes 0,
+  `KEEP_SIZE`, `PUNCH_HOLE`, and `ZERO_RANGE` (dense zero-fill; no physical
+  space-reclamation claim), `copy_file_range` (daemon-side, short copy at EOF),
+  `lseek` `SEEK_DATA`/`SEEK_HOLE` (dense file; only the EOF hole), and in-memory
+  `getlk`/`setlk`/`setlkw` for POSIX byte ranges and flock (kernel forwarding
+  enabled with `EnableLocks`). Read-only and snapshot mounts refuse mutations;
+  read locks remain available. Read-only and snapshot mounts, `/.weft/id/<64hex>`
+  exact-object view, and saved-context views with deterministic escaped display
+  names are unchanged.
 - **CLI** (`weftfs`): `init`, `info`, `create`, `write`, `cat`, `ls`, `stat`,
   `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, `readlink`,
-  `setattr`, `xattr`, `relation`, `query`, `snapshot`, `verify`, `gc`,
-  `checkpoint`, `pin`, `mount`.
+  `setattr`, `xattr`, `relation`, `query`, `snapshot`, `verify`, `gc`
+  (including `--watch`), `checkpoint`, `pin`, `mount` (including `--gc-watch`).
 
-Not implemented (see [NOTES.md](NOTES.md)): online/background garbage collection
-(GC is an explicit pass), cross-process
-byte-range locking (answers `ENOSYS`), `mmap` writeback, `mknod`, `fallocate`,
-`lseek` hole queries, and `atime`/`ctime` persistence. No performance claims
+Not implemented or explicitly bounded (see [NOTES.md](NOTES.md)): `ioctl`
+(go-fuse answers `ENOTTY`), `mmap` writeback, `atime`/`ctime` persistence, and
+`COLLAPSE_RANGE`/`INSERT_RANGE` through the 7.3.1 FUSE kernel boundary (it
+rejects them before `FUSE_FALLOCATE`; the store implementations and tests
+exist). Locks are advisory and per-mount-process; they do not coordinate
+independent daemons or hosts. `PUNCH_HOLE`/`ZERO_RANGE` define content but do
+not reclaim physical chunks because v1 files are dense. No performance claims
 are made.
 
 ## Layout

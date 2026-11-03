@@ -4,8 +4,11 @@
 package fusefs
 
 import (
+	"context"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -62,6 +65,17 @@ type Server struct {
 	readOnly bool
 	inodes   *inodeTable
 	root     *node
+	// locks is the in-memory advisory lock manager. It is independent of mu:
+	// a blocking Setlkw must never hold the store serialization mutex.
+	locks *lockManager
+	// Background GC state. It is started only when the store option requests
+	// it, only for a writable live mount, and every pass runs under mu.
+	gcMu     sync.Mutex
+	gcCancel context.CancelFunc
+	gcDone   chan struct{}
+	gcPasses atomic.Uint64
+	gcErrMu  sync.Mutex
+	gcErr    error
 }
 
 // inodeTable assigns stable, collision-free inode numbers per mount.
@@ -268,7 +282,7 @@ func (s *Server) viewSnapshot() model.Hash32 {
 
 // Mount mounts the store. The caller owns the store and must keep it open.
 func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
-	s := &Server{store: st, opts: opts, inodes: newInodeTable()}
+	s := &Server{store: st, opts: opts, inodes: newInodeTable(), locks: newLockManager()}
 	if opts.Context != nil {
 		if opts.Snapshot == nil {
 			snapshot := opts.Context.Snapshot
@@ -294,7 +308,10 @@ func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
 		FsName:     "weftfs",
 		Name:       "weftfs",
 		Debug:      opts.Debug,
-		Options:    []string{"default_permissions"},
+		// Forward POSIX byte-range and flock requests to the daemon. Both are
+		// implemented by lockManager; advertising only one would be wrong.
+		EnableLocks: true,
+		Options:     []string{"default_permissions"},
 	}
 	if s.readOnly {
 		mountOptions.Options = append(mountOptions.Options, "ro")
@@ -307,6 +324,18 @@ func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
 	server, err := fs.Mount(opts.Mountpoint, s.root, fsOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+	storeOptions := st.Options()
+	if storeOptions.GCBackground && !s.readOnly && st.Mode() == store.ReadWrite {
+		interval := time.Duration(storeOptions.GCIntervalSecs) * time.Second
+		if interval <= 0 {
+			interval = time.Duration(store.DefaultGCIntervalSecs) * time.Second
+		}
+		maxDeletes := int(storeOptions.GCWatchMaxDeletes)
+		if err := s.StartBackgroundGC(interval, maxDeletes); err != nil {
+			_ = server.Unmount()
+			return nil, nil, err
+		}
 	}
 	return server, s, nil
 }

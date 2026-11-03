@@ -1,11 +1,13 @@
 package store_test
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/store"
@@ -39,6 +41,104 @@ func rustReadObjectBlobs(t *testing.T, dir, path string) (model.ObjectRecord, mo
 	}
 	manifest, chunks := fileBlobs(t, dir, record)
 	return record, manifest, chunks
+}
+
+// Gate D (GC): Rust creates a snapshot and garbage; the Go background watcher
+// (bounded passes, cancellation) sweeps it; Rust verifies --full and mounts the
+// snapshot read-only. No Go production path invokes Rust.
+func TestGCHandoffGoBackgroundWatchRustVerifies(t *testing.T) {
+	bin := rustBinary(t)
+	dir := t.TempDir()
+	const snapshotContent = "snapshot-content"
+	const liveContent = "LIVE-CONTENT-123"
+
+	runRust(t, bin, "--store", dir, "init", "--checkpoint-interval", "0")
+	runRust(t, bin, "--store", dir, "create", "/keep.txt", "--text", snapshotContent)
+	runRust(t, bin, "--store", dir, "snapshot", "create", "keep")
+	runRust(t, bin, "--store", dir, "write", "/keep.txt", "--text", liveContent)
+	runRust(t, bin, "--store", dir, "create", "/gone.txt", "--text", "rust-garbage-background-watch")
+	_, goneManifest, goneChunks := rustReadObjectBlobs(t, dir, "/gone.txt")
+	runRust(t, bin, "--store", dir, "unlink", "/gone.txt")
+
+	reader, err := store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("open snapshot state: %v", err)
+	}
+	snapshotCommit, err := reader.LookupSnapshot("keep")
+	if err != nil {
+		reader.Close()
+		t.Fatalf("lookup snapshot: %v", err)
+	}
+	snapshotState, err := reader.StateAt(snapshotCommit)
+	if err != nil {
+		reader.Close()
+		t.Fatalf("snapshot state: %v", err)
+	}
+	keepID, err := resolveInState(snapshotState, "/keep.txt")
+	if err != nil {
+		reader.Close()
+		t.Fatalf("resolve keep at snapshot: %v", err)
+	}
+	snapshotManifest, snapshotChunks := fileBlobs(t, dir, snapshotState.Objects[keepID])
+	reader.Close()
+
+	writer, err := store.OpenWithOptions(dir, store.ReadWrite, gcOptions(0))
+	if err != nil {
+		t.Fatalf("open writer: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- writer.GCWatch(ctx, 10*time.Millisecond, 2, nil)
+	}()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Lstat(store.ManifestPath(dir, goneManifest)); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			writer.Close()
+			t.Fatal("Go background watcher did not delete the Rust garbage manifest")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	for _, chunk := range goneChunks {
+		if _, err := os.Lstat(store.ObjectPath(dir, chunk)); !os.IsNotExist(err) {
+			cancel()
+			<-done
+			writer.Close()
+			t.Fatalf("Go background watcher did not delete Rust chunk %s", chunk.Hex())
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		writer.Close()
+		t.Fatalf("GCWatch: %v", err)
+	}
+	if report, err := writer.Verify(true); err != nil || !report.OK {
+		writer.Close()
+		t.Fatalf("Go verify after watch: ok=%v err=%v problems=%s", report != nil && report.OK, err, formatProblems(report))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	assertExists(t, store.ManifestPath(dir, snapshotManifest), true, "Rust snapshot manifest after Go watch")
+	for _, chunk := range snapshotChunks {
+		assertExists(t, store.ObjectPath(dir, chunk), true, "Rust snapshot chunk after Go watch")
+	}
+
+	rustVerifyFull(t, bin, dir)
+	if got := rustCat(t, bin, dir, "/keep.txt"); got != liveContent {
+		t.Fatalf("Rust live read after Go watch = %q, want %q", got, liveContent)
+	}
+	mountpoint, cleanup := rustMount(t, bin, dir, "--snapshot", "keep")
+	defer cleanup()
+	if data, err := os.ReadFile(filepath.Join(mountpoint, "keep.txt")); err != nil || string(data) != snapshotContent {
+		t.Fatalf("Rust snapshot mount after Go watch = %q, %v (want %q)", string(data), err, snapshotContent)
+	}
 }
 
 // Gate A (GC): Rust creates a store with a snapshot and an unreferenced blob;
