@@ -797,6 +797,10 @@ func (s *Store) nowNS() int64 {
 	return time.Now().UnixNano()
 }
 
+// ClockNowNS returns the store clock in UTC nanoseconds. Capability expiry is
+// enforced against this clock.
+func (s *Store) ClockNowNS() int64 { return s.nowNS() }
+
 func (s *Store) requireWritable() error {
 	if s.mode != ReadWrite {
 		return werr.Newf(werr.ReadOnly, "store is opened read-only; mutation refused")

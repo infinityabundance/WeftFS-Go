@@ -91,6 +91,44 @@ Revisions recorded for this work:
   disables the age gate). Sweep paths are `Lstat`-checked: no symlink is
   followed and no non-regular file is removed.
 
+### F2 Context Roots, capabilities, causal identity (`store`, `auth`, `cmd`) — implemented
+
+- Phase `store/context.go`, model causal helpers, and `auth.Capability`.
+- Context Root persistence as a root-subject `context_root` relation carrying
+  canonical record hex plus `uri`; duplicate names are `Exists`, `--replace` is
+  one delete+add commit; capability records are persisted in the same commit.
+- Resolution recomputes `ContextRootId`, verifies the URI and pinned snapshot,
+  requires `weft-resolver-v1`, authorizes before counting, and returns ordered
+  results with root/selector/snapshot ids and closure. 0/1/n is explicit.
+- Capability enforcement for namespace/root grants, selector predicates,
+  exact-id access (including `/.weft/id`), saved-context views, and
+  materialization. Denials are `Unauthorized`/`NotFound` without counts or ids.
+  v1 makes no cryptographic or timing claim.
+- Budgets: component-wise minimum of root and capability budgets. No truncation
+  policy in v1; overrun is `LimitExceeded`. `max_bytes` bounds materialization,
+  `max_depth` is one-hop, `max_work` is deterministic.
+- Causal: `--causal` stores the four reserved attrs, computes the available
+  transitive closure with a visited set (cycles terminate), publishes the
+  closure record content-addressed, and changes `VersionId` only in
+  `causal_exact`. `bytes_only` is unchanged from v1.
+- Materialization verifies every content hash before publishing, writes to a
+  sibling temporary directory, and renames into place; mismatch leaves no
+  output. The manifest carries root/snapshot/selector ids, closure, capability
+  hash, budget, counts, and per-file hashes/sizes/ids/causal closure.
+- `verify --full` validates context records/URIs, re-resolves roots and checks
+  recorded ids, validates causal attrs and closure blobs, and re-hashes stored
+  capability records. GC retains causal closure blobs with their objects;
+  context/capability relations are ordinary metadata.
+- CLI: `context create|list|show|resolve|materialize|uri|delete`,
+  `causal show`, `uri canonicalize|show`, `--causal` on create/write, and
+  `mount --capability FILE` (capability mounts are forced read-only).
+- Cross-language: Rust→Go and Go→Rust tests cover context identity/resolution,
+  causal `VersionId` and closure, stored capabilities, and materialization.
+  Golden vectors: `conformance/context/v1/causal_versions.json`.
+- Evidence: `go test -race ./...` passes in the FUSE court (store + fusefs),
+  including the new context/causal/capability/handoff tests; `go vet ./...`
+  and `CGO_ENABLED=0 go build ./...` pass in the Go court.
+
 ### FUSE frontend (`fusefs`, `go-fuse/v2`) — implemented, with documented gaps
 
 - Node operations: lookup, getattr, readdir/readdirplus (go-fuse derives plus

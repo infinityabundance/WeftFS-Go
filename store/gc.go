@@ -7,6 +7,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/infinityabundance/WeftCodec-Go/hash"
+	"github.com/infinityabundance/WeftCodec-Go/wcb"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
@@ -223,6 +225,13 @@ func (s *Store) orphanObjectIDs() []model.Hash32 {
 func markState(root string, state *model.State, manifests, chunks map[model.Hash32]struct{}, problems *[]string) {
 	for _, id := range model.SortHashKeys(state.Objects) {
 		record := state.Objects[id]
+		// A causal closure record is content-addressed under the manifest
+		// domain and is retained while the object that names it is retained.
+		if value, ok := record.Attrs[model.AttrCausalHash]; ok && value.Kind == wcb.Bytes && len(value.Bytes) == hash.HashLen {
+			if hashValue, err := hash.FromSlice(value.Bytes); err == nil && hashValue != model.ZeroHash {
+				manifests[hashValue] = struct{}{}
+			}
+		}
 		if record.Kind != model.KindFile {
 			continue
 		}

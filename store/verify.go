@@ -6,6 +6,10 @@ import (
 	"sort"
 	"strings"
 
+	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
+	"github.com/infinityabundance/WeftCodec-Go/hash"
+	"github.com/infinityabundance/WeftCodec-Go/limits"
+	"github.com/infinityabundance/WeftFS-Go/auth"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
@@ -26,6 +30,9 @@ type VerifyReport struct {
 	CheckedObjects      uint64
 	CheckedManifests    uint64
 	CheckedChunks       uint64
+	CheckedContextRoots uint64
+	CheckedCausal       uint64
+	CheckedCapabilities uint64
 	RejectedGenerations []uint64
 	Problems            []VerifyProblem
 }
@@ -116,6 +123,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 				report.problem(string(werr.Corrupt), note)
 			}
 			s.verifyState(state, full, report)
+			s.verifyContextState(state, full, report)
 		}
 	}
 
@@ -155,6 +163,122 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 
 	report.OK = len(report.Problems) == 0
 	return report, nil
+}
+
+func (s *Store) verifyContextState(state *model.State, full bool, report *VerifyReport) {
+	lim := limits.Default()
+	root, ok := state.Objects[model.RootID]
+	if !ok {
+		report.problem(string(werr.Corrupt), "context verification: namespace root is missing")
+		return
+	}
+	principal := auth.New(root.UID, root.GID, nil)
+	now := s.nowNS()
+
+	for _, relation := range state.Relations {
+		if !isCapabilityRelation(relation) {
+			continue
+		}
+		target, ok := relationTargetText(relation)
+		if !ok {
+			report.problem(string(werr.Corrupt), "capability relation target is not text")
+			continue
+		}
+		hashValue, err := parseHashHex(target)
+		if err != nil {
+			report.problem(string(werr.Corrupt), "capability target is not a hash")
+			continue
+		}
+		scope, err := s.LoadCapabilityAt(state, hashValue)
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "capability "+hashValue.Hex()+": "+err.Error())
+			continue
+		}
+		report.CheckedCapabilities++
+		id, err := scope.ID()
+		if err != nil || id != hashValue {
+			report.problem(string(werr.Corrupt), "stored capability hash does not match its record")
+		}
+	}
+
+	contexts, err := s.ListContextRootsAt(state)
+	if err != nil {
+		report.problem(string(werr.ClassOf(err)), "context-root records: "+err.Error())
+		return
+	}
+	for _, stored := range contexts {
+		report.CheckedContextRoots++
+		id, err := stored.Root.ID()
+		if err != nil || id != stored.ContextRootID {
+			report.problem(string(werr.Corrupt), "context root `"+stored.Name+"` id does not match its record")
+			continue
+		}
+		if _, err := s.StateAt(stored.Root.Snapshot); err != nil {
+			report.problem("SnapshotMissing", "context root `"+stored.Name+"` pins an unavailable snapshot: "+err.Error())
+			continue
+		}
+		if !full {
+			if stored.Root.CapabilityHash != nil {
+				if _, err := s.LoadCapabilityAt(state, *stored.Root.CapabilityHash); err == nil {
+					report.CheckedCapabilities++
+				}
+			}
+			continue
+		}
+		var capability *auth.Capability
+		if stored.Root.CapabilityHash != nil {
+			scope, err := s.LoadCapabilityAt(state, *stored.Root.CapabilityHash)
+			if err != nil {
+				report.problem("CapabilityMissing", "context root `"+stored.Name+"` binds an unavailable capability: "+err.Error())
+				continue
+			}
+			capability, err = auth.NewCapability(scope)
+			if err != nil {
+				report.problem(string(werr.ClassOf(err)), "context root `"+stored.Name+"`: "+err.Error())
+				continue
+			}
+		}
+		resolved, err := s.ResolveContextAt(state, stored.Name, capability, principal, lim, now)
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "context root `"+stored.Name+"` resolution failed: "+err.Error())
+			continue
+		}
+		if resolved.Resolution.SelectorID != stored.Root.SelectorID ||
+			resolved.Resolution.SnapshotID != stored.Root.Snapshot ||
+			resolved.Stored.ContextRootID != stored.ContextRootID {
+			report.problem(string(werr.Corrupt), "context root `"+stored.Name+"` resolution does not reproduce its recorded ids")
+		}
+	}
+
+	for _, id := range model.SortHashKeys(state.Objects) {
+		record := state.Objects[id]
+		closure, err := model.ObjectCausalClosure(record)
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "object "+id.Hex()+" causal attrs: "+err.Error())
+			continue
+		}
+		if closure == nil {
+			continue
+		}
+		report.CheckedCausal++
+		if !full {
+			continue
+		}
+		causalHash, err := closure.ID()
+		if err != nil {
+			report.problem(string(werr.Corrupt), "object "+id.Hex()+" causal hash: "+err.Error())
+			continue
+		}
+		bytesValue, err := ReadBlobVerified(s.root, BlobManifest, causalHash, hash.DomainCausal)
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "object "+id.Hex()+" causal closure blob: "+err.Error())
+			continue
+		}
+		storedClosure, err := weftcontext.CausalClosureFromCanonicalBytes(bytesValue, lim)
+		if err != nil || !storedClosure.Equal(closure) {
+			report.problem(string(werr.Corrupt), "object "+id.Hex()+" causal closure blob disagrees with its attrs")
+		}
+	}
 }
 
 func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport) {

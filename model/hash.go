@@ -49,13 +49,24 @@ const (
 	DefaultChunkSize = 65536
 )
 
-// Reserved attribute keys and predicates (WEFT-MODEL.md §2.5).
+// Reserved attribute keys and predicates (WEFT-MODEL.md §2.5, §9.3; F2).
 const (
 	AttrSymlinkTarget = "weft.symlink.target"
 	AttrACLRead       = "weft.acl.read"
 	SavedContextPred  = "saved_context"
 	SavedContextAttr  = "selector_hex"
 	XattrPrefix       = "xattr."
+
+	AttrCausalParents = "weft.causal.parents"
+	AttrCausalClosure = "weft.causal.closure"
+	AttrCausalHash    = "weft.causal.hash"
+	AttrIdentityMode  = "weft.identity.mode"
+
+	ContextRootPredicate  = "context_root"
+	ContextRootRecordAttr = "context.record"
+	ContextRootURIAttr    = "uri"
+	CapabilityPredicate   = "capability"
+	CapabilityRecordAttr  = "capability.record"
 )
 
 // ObjectIDFromSeed returns H("weft/object/v1", seed).

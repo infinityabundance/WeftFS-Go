@@ -4,6 +4,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 
+	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
 	"github.com/infinityabundance/WeftCodec-Go/selector"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
@@ -50,6 +52,7 @@ func usage() {
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
+  context causal uri
 `)
 }
 
@@ -151,6 +154,12 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdPin(args, storeDir, jsonOut)
 	case "mount":
 		return cmdMount(args, storeDir)
+	case "context":
+		return cmdContext(args, storeDir, jsonOut)
+	case "causal":
+		return cmdCausal(args, storeDir, jsonOut)
+	case "uri":
+		return cmdURI(args, storeDir, jsonOut)
 	default:
 		return werr.Newf(werr.InvalidArgument, "unknown command `%s`", command)
 	}
@@ -327,6 +336,7 @@ func cmdCreate(args []string, storeDir string) error {
 	uid := fs.Uint64("uid", uint64(os.Getuid()), "owner uid")
 	gid := fs.Uint64("gid", uint64(os.Getgid()), "owner gid")
 	seed := fs.String("seed", "", "explicit ObjectId seed")
+	causal := fs.String("causal", "", "comma-separated causal parent ids")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -356,7 +366,20 @@ func cmdCreate(args []string, storeDir string) error {
 		return err
 	}
 	var id model.Hash32
-	if *seed != "" {
+	causalIDs, err := parseCausalEntries(*causal)
+	if err != nil {
+		return err
+	}
+	if len(causalIDs) != 0 {
+		if *seed == "" {
+			seedBytes := make([]byte, 32)
+			if _, err := rand.Read(seedBytes); err != nil {
+				return werr.Wrap(werr.Io, err, "cannot read CSPRNG")
+			}
+			*seed = string(seedBytes)
+		}
+		id, err = s.CreateFileSeededCausal(parent, name, data, perm, *uid, *gid, nil, []byte(*seed), causalIDs)
+	} else if *seed != "" {
 		id, err = s.CreateFileSeeded(parent, name, data, perm, *uid, *gid, nil, []byte(*seed))
 	} else {
 		id, err = s.CreateFile(parent, name, data, perm, *uid, *gid, nil)
@@ -373,6 +396,7 @@ func cmdWrite(args []string, storeDir string) error {
 	offset := fs.Uint64("offset", 0, "byte offset")
 	text := fs.String("text", "", "bytes to write")
 	file := fs.String("file", "", "read bytes from a file")
+	causal := fs.String("causal", "", "comma-separated causal parent ids")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -397,7 +421,11 @@ func cmdWrite(args []string, storeDir string) error {
 	} else {
 		data = []byte(*text)
 	}
-	version, err := s.WriteFile(id, *offset, data)
+	causalIDs, err := parseCausalEntries(*causal)
+	if err != nil {
+		return err
+	}
+	version, err := s.WriteFileCausal(id, *offset, data, causalIDs)
 	if err != nil {
 		return err
 	}
@@ -1431,6 +1459,7 @@ func cmdMount(args []string, storeDir string) error {
 	readOnly := fs.Bool("read-only", false, "mount the current state read-only")
 	allowOther := fs.Bool("allow-other", false, "allow other users")
 	debug := fs.Bool("debug", false, "go-fuse debug logging")
+	capabilityPath := fs.String("capability", "", "capability JSON or hex file narrowing exact-id and saved-context views")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -1440,8 +1469,16 @@ func cmdMount(args []string, storeDir string) error {
 	if err := requireStore(storeDir); err != nil {
 		return err
 	}
+	var capability *auth.Capability
+	if *capabilityPath != "" {
+		loaded, err := loadCapabilityFile(*capabilityPath)
+		if err != nil {
+			return err
+		}
+		capability = loaded
+	}
 	mode := store.ReadWrite
-	if *readOnly || *snapshot != "" {
+	if *readOnly || *snapshot != "" || capability != nil {
 		mode = store.ReadOnly
 	}
 	s, err := store.Open(storeDir, mode)
@@ -1450,7 +1487,8 @@ func cmdMount(args []string, storeDir string) error {
 	}
 	defer s.Close()
 	opts := fusefs.Options{
-		Mountpoint: *mountpoint, ReadOnly: *readOnly, AllowOther: *allowOther, Debug: *debug,
+		Mountpoint: *mountpoint, ReadOnly: *readOnly || capability != nil, AllowOther: *allowOther, Debug: *debug,
+		Capability: capability,
 	}
 	if *snapshot != "" {
 		commit, err := s.LookupSnapshot(*snapshot)
@@ -1471,4 +1509,563 @@ func cmdMount(args []string, storeDir string) error {
 	}()
 	server.Wait()
 	return nil
+}
+
+func parseHashList(text string, what string) ([]model.Hash32, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, nil
+	}
+	out := make([]model.Hash32, 0)
+	for _, entry := range strings.Split(text, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return nil, werr.Newf(werr.InvalidArgument, "%s contains an empty entry", what)
+		}
+		hashValue, err := parseHash(entry)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, hashValue)
+	}
+	return out, nil
+}
+
+func parseCausalEntries(text string) ([]model.Hash32, error) {
+	return parseHashList(text, "causal entries")
+}
+
+func parseHash(text string) (model.Hash32, error) {
+	if len(text) != 64 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "hash must be 64 lowercase hex digits")
+	}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return model.Hash32{}, werr.Newf(werr.InvalidArgument, "hash must be lowercase hexadecimal")
+		}
+	}
+	value, err := hex.DecodeString(text)
+	if err != nil || len(value) != 32 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "invalid hash")
+	}
+	var out model.Hash32
+	copy(out[:], value)
+	return out, nil
+}
+
+func readSelectorSource(spec string) (string, error) {
+	if strings.HasPrefix(spec, "@") {
+		data, err := os.ReadFile(spec[1:])
+		if err != nil {
+			return "", werr.Wrap(werr.Io, err, "cannot read selector file %s", spec[1:])
+		}
+		return string(data), nil
+	}
+	return spec, nil
+}
+
+func loadCapabilityFile(path string) (*auth.Capability, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, werr.Wrap(werr.Io, err, "cannot read capability %s", path)
+	}
+	scope, err := store.ParseCapabilityText(string(data))
+	if err != nil {
+		return nil, err
+	}
+	return auth.NewCapability(scope)
+}
+
+func budgetFromFlags(maxResults, maxBytes, maxDepth, maxWork *uint64) (*weftcontext.Budget, error) {
+	budget := &weftcontext.Budget{}
+	if *maxResults != 0 {
+		value := *maxResults
+		budget.MaxResults = &value
+	}
+	if *maxBytes != 0 {
+		value := *maxBytes
+		budget.MaxBytes = &value
+	}
+	if *maxDepth != 0 {
+		value := *maxDepth
+		budget.MaxDepth = &value
+	}
+	if *maxWork != 0 {
+		value := *maxWork
+		budget.MaxWork = &value
+	}
+	if budget.IsEmpty() {
+		return nil, nil
+	}
+	if err := budget.Validate(); err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	return budget, nil
+}
+
+func contextJSON(stored store.StoredContextRoot) (map[string]any, error) {
+	closure := make([]string, 0, len(stored.Root.Causal))
+	for _, item := range stored.Root.Causal {
+		closure = append(closure, item.Hex())
+	}
+	var capability any
+	if stored.Root.CapabilityHash != nil {
+		capability = stored.Root.CapabilityHash.Hex()
+	}
+	return map[string]any{
+		"name": stored.Name, "context_root_id": stored.ContextRootID.Hex(),
+		"uri": stored.URI, "relation_id": stored.RelationID.Hex(),
+		"namespace": stored.Root.Namespace, "selector_id": stored.Root.SelectorID.Hex(),
+		"selector_canonical_hex": hex.EncodeToString(stored.Root.SelectorBytes),
+		"snapshot_id":            stored.Root.Snapshot.Hex(), "resolver": stored.Root.Resolver,
+		"ordering": stored.Root.Ordering, "closure": closure,
+		"capability_hash": capability, "budget": stored.Root.Budget.JSON(),
+		"canonical_hex": stored.RecordHex,
+	}, nil
+}
+
+func cmdContext(args []string, storeDir string, jsonOut bool) error {
+	if len(args) == 0 {
+		return werr.Newf(werr.InvalidArgument, "context requires create|list|show|resolve|materialize|uri|delete")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("context create", flag.ContinueOnError)
+		name := fs.String("name", "", "context root name")
+		selectorText := fs.String("selector", "", "selector source text or @file")
+		snapshot := fs.String("snapshot", "", "snapshot name or commit hex")
+		causal := fs.String("causal", "", "comma-separated causal entries")
+		capabilityPath := fs.String("capability", "", "capability JSON or hex file")
+		maxResults := fs.Uint64("max-results", 0, "budget max_results")
+		maxBytes := fs.Uint64("max-bytes", 0, "budget max_bytes")
+		maxDepth := fs.Uint64("max-depth", 0, "budget max_depth")
+		maxWork := fs.Uint64("max-work", 0, "budget max_work")
+		replace := fs.Bool("replace", false, "replace an existing same-name root")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		if *name == "" || *selectorText == "" || *snapshot == "" {
+			return werr.Newf(werr.InvalidArgument, "context create requires --name, --selector, and --snapshot")
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		source, err := readSelectorSource(*selectorText)
+		if err != nil {
+			return err
+		}
+		parsed, err := selector.Parse(source)
+		if err != nil {
+			return werr.FromCodec(err)
+		}
+		snapshotID, err := s.LookupSnapshot(*snapshot)
+		if err != nil {
+			return err
+		}
+		causalIDs, err := parseCausalEntries(*causal)
+		if err != nil {
+			return err
+		}
+		var capability *auth.Capability
+		if *capabilityPath != "" {
+			capability, err = loadCapabilityFile(*capabilityPath)
+			if err != nil {
+				return err
+			}
+		}
+		budget, err := budgetFromFlags(maxResults, maxBytes, maxDepth, maxWork)
+		if err != nil {
+			return err
+		}
+		var capabilityHash *model.Hash32
+		var capabilityScope *weftcontext.CapabilityScope
+		if capability != nil {
+			value := capability.Hash
+			capabilityHash = &value
+			capabilityScope = capability.Scope
+		}
+		root, err := weftcontext.NewContextRoot(parsed, snapshotID, weftcontext.DefaultResolver, causalIDs, capabilityHash, budget)
+		if err != nil {
+			return werr.FromCodec(err)
+		}
+		if _, err := s.SaveContextRoot(*name, root, capabilityScope, *replace); err != nil {
+			return err
+		}
+		stored, err := s.LoadContextRoot(*name)
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			output, err := contextJSON(stored)
+			if err != nil {
+				return err
+			}
+			output["generation"] = s.Generation()
+			return printJSON(output)
+		}
+		fmt.Printf("context_root_id=%s\nuri=%s\nrelation_id=%s\n",
+			stored.ContextRootID.Hex(), stored.URI, stored.RelationID.Hex())
+		return nil
+	case "list":
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		contexts, err := s.ListContextRoots()
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			items := make([]map[string]any, 0, len(contexts))
+			for _, stored := range contexts {
+				item, err := contextJSON(stored)
+				if err != nil {
+					return err
+				}
+				items = append(items, item)
+			}
+			return printJSON(map[string]any{"contexts": items})
+		}
+		for _, stored := range contexts {
+			fmt.Printf("%s %s %s\n", stored.Name, stored.ContextRootID.Hex(), stored.URI)
+		}
+		return nil
+	case "show":
+		if len(args) < 2 {
+			return werr.Newf(werr.InvalidArgument, "context show requires a name or URI")
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		stored, err := s.LoadContextRoot(args[1])
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			output, err := contextJSON(stored)
+			if err != nil {
+				return err
+			}
+			return printJSON(output)
+		}
+		fmt.Printf("name=%s\ncontext_root_id=%s\nuri=%s\nselector_id=%s\nsnapshot_id=%s\nresolver=%s\nordering=%s\n",
+			stored.Name, stored.ContextRootID.Hex(), stored.URI, stored.Root.SelectorID.Hex(),
+			stored.Root.Snapshot.Hex(), stored.Root.Resolver, stored.Root.Ordering)
+		for _, item := range stored.Root.Causal {
+			fmt.Printf("closure=%s\n", item.Hex())
+		}
+		if stored.Root.CapabilityHash != nil {
+			fmt.Printf("capability_hash=%s\n", stored.Root.CapabilityHash.Hex())
+		}
+		return nil
+	case "resolve":
+		fs := flag.NewFlagSet("context resolve", flag.ContinueOnError)
+		capabilityPath := fs.String("capability", "", "capability JSON or hex file")
+		uid := fs.Uint64("uid", uint64(os.Getuid()), "principal uid")
+		gid := fs.Uint64("gid", uint64(os.Getgid()), "principal gid")
+		groups := fs.String("groups", "", "comma-separated supplementary groups")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return werr.Newf(werr.InvalidArgument, "context resolve requires one name or URI")
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		var capability *auth.Capability
+		if *capabilityPath != "" {
+			capability, err = loadCapabilityFile(*capabilityPath)
+			if err != nil {
+				return err
+			}
+		}
+		principal := auth.New(*uid, *gid, parseGroups(*groups))
+		resolved, err := s.ResolveContext(fs.Arg(0), capability, principal, limits.Default(), s.ClockNowNS())
+		if err != nil {
+			return err
+		}
+		state, err := s.StateAt(resolved.Resolution.SnapshotID)
+		if err != nil {
+			return err
+		}
+		results := make([]map[string]any, 0, len(resolved.Resolution.Results))
+		for _, result := range resolved.Resolution.Results {
+			record, ok := state.Objects[result.ObjectID]
+			item := map[string]any{
+				"object_id": result.ObjectID.Hex(), "version_id": result.VersionID.Hex(),
+				"content_id": result.ContentID.Hex(),
+			}
+			if ok {
+				item["size"] = record.Size
+				item["kind"] = string(record.Kind)
+				if path, ok := state.PathFor(result.ObjectID); ok {
+					item["path"] = string(path)
+				}
+				closure := make([]string, 0)
+				if stored, err := model.ObjectCausalClosure(record); err == nil && stored != nil {
+					for _, entry := range stored.Closure {
+						closure = append(closure, entry.Hex())
+					}
+				}
+				item["causal_closure"] = closure
+			}
+			results = append(results, item)
+		}
+		closure := make([]string, 0, len(resolved.Stored.Root.Causal))
+		for _, item := range resolved.Stored.Root.Causal {
+			closure = append(closure, item.Hex())
+		}
+		var capabilityHash any
+		if resolved.CapabilityHash != nil {
+			capabilityHash = resolved.CapabilityHash.Hex()
+		}
+		if jsonOut {
+			return printJSON(map[string]any{
+				"name": resolved.Stored.Name, "uri": resolved.Stored.URI,
+				"context_root_id": resolved.Stored.ContextRootID.Hex(),
+				"selector_id":     resolved.Resolution.SelectorID.Hex(),
+				"snapshot_id":     resolved.Resolution.SnapshotID.Hex(),
+				"matched_count":   resolved.Resolution.MatchedCount,
+				"returned":        len(resolved.Resolution.Results),
+				"truncated":       resolved.Truncated, "closure": closure,
+				"capability_hash": capabilityHash,
+				"budget":          resolved.EffectiveBudget.JSON(),
+				"work_units":      resolved.WorkUnits, "results": results,
+			})
+		}
+		for _, result := range resolved.Resolution.Results {
+			fmt.Println(result.ObjectID.Hex())
+		}
+		fmt.Printf("context_root_id=%s selector_id=%s snapshot_id=%s matched_count=%d returned=%d truncated=%v\n",
+			resolved.Stored.ContextRootID.Hex(), resolved.Resolution.SelectorID.Hex(),
+			resolved.Resolution.SnapshotID.Hex(), resolved.Resolution.MatchedCount,
+			len(resolved.Resolution.Results), resolved.Truncated)
+		return nil
+	case "materialize":
+		fs := flag.NewFlagSet("context materialize", flag.ContinueOnError)
+		out := fs.String("out", "", "output directory")
+		capabilityPath := fs.String("capability", "", "capability JSON or hex file")
+		uid := fs.Uint64("uid", uint64(os.Getuid()), "principal uid")
+		gid := fs.Uint64("gid", uint64(os.Getgid()), "principal gid")
+		groups := fs.String("groups", "", "comma-separated supplementary groups")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 1 || *out == "" {
+			return werr.Newf(werr.InvalidArgument, "context materialize requires NAME|URI and --out DIR")
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		var capability *auth.Capability
+		if *capabilityPath != "" {
+			capability, err = loadCapabilityFile(*capabilityPath)
+			if err != nil {
+				return err
+			}
+		}
+		principal := auth.New(*uid, *gid, parseGroups(*groups))
+		report, err := s.MaterializeContext(fs.Arg(0), *out, capability, principal, limits.Default(), s.ClockNowNS())
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			closure := make([]string, 0, len(report.Closure))
+			for _, item := range report.Closure {
+				closure = append(closure, item.Hex())
+			}
+			return printJSON(map[string]any{
+				"out": report.Out, "manifest": report.ManifestPath, "files": report.Files,
+				"bytes": report.Bytes, "context_root_id": report.ContextRootID.Hex(),
+				"snapshot_id": report.SnapshotID.Hex(), "selector_id": report.SelectorID.Hex(),
+				"closure": closure,
+			})
+		}
+		fmt.Printf("out=%s\nmanifest=%s\nfiles=%d\nbytes=%d\n", report.Out, report.ManifestPath, report.Files, report.Bytes)
+		return nil
+	case "uri":
+		if len(args) < 2 {
+			return werr.Newf(werr.InvalidArgument, "context uri requires a name or URI")
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		stored, err := s.LoadContextRoot(args[1])
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{"uri": stored.URI, "context_root_id": stored.ContextRootID.Hex()})
+		}
+		fmt.Println(stored.URI)
+		return nil
+	case "delete":
+		if len(args) < 2 {
+			return werr.Newf(werr.InvalidArgument, "context delete requires a name")
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		if err := s.DeleteContextRoot(args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("deleted %s\n", args[1])
+		return nil
+	default:
+		return werr.Newf(werr.InvalidArgument, "context requires create|list|show|resolve|materialize|uri|delete")
+	}
+}
+
+func findObjectByAnyID(s *store.Store, target string) (model.ObjectRecord, error) {
+	if hashValue, err := parseHash(target); err == nil {
+		if record, err := s.ObjectMeta(hashValue); err == nil {
+			return record, nil
+		}
+		for _, record := range s.CurrentState().Objects {
+			if record.Version == hashValue || record.Content == hashValue {
+				return record.Clone(), nil
+			}
+		}
+		return model.ObjectRecord{}, werr.Newf(werr.NotFound, "no object has this identity")
+	}
+	id, err := s.ResolvePath(target)
+	if err != nil {
+		return model.ObjectRecord{}, err
+	}
+	return s.ObjectMeta(id)
+}
+
+func cmdCausal(args []string, storeDir string, jsonOut bool) error {
+	if len(args) == 0 || args[0] != "show" {
+		return werr.Newf(werr.InvalidArgument, "causal requires show")
+	}
+	if len(args) < 2 {
+		return werr.Newf(werr.InvalidArgument, "causal show requires an object path or id")
+	}
+	s, err := openStore(storeDir, store.ReadOnly)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	record, err := findObjectByAnyID(s, args[1])
+	if err != nil {
+		return err
+	}
+	closure, err := model.ObjectCausalClosure(record)
+	if err != nil {
+		return err
+	}
+	mode := weftcontext.BytesOnly.String()
+	if value, ok := record.Attrs[model.AttrIdentityMode]; ok && value.Kind == wcb.Text && value.Str == weftcontext.CausalExact.String() {
+		mode = weftcontext.CausalExact.String()
+	}
+	var causalHash *model.Hash32
+	if value, ok := record.Attrs[model.AttrCausalHash]; ok && value.Kind == wcb.Bytes {
+		if parsed, err := parseHash(hex.EncodeToString(value.Bytes)); err == nil {
+			causalHash = &parsed
+		}
+	}
+	parents := make([]string, 0)
+	closureEntries := make([]string, 0)
+	if closure != nil {
+		for _, item := range closure.Parents {
+			parents = append(parents, item.Hex())
+		}
+		for _, item := range closure.Closure {
+			closureEntries = append(closureEntries, item.Hex())
+		}
+	}
+	if jsonOut {
+		var hashValue any
+		if causalHash != nil {
+			hashValue = causalHash.Hex()
+		}
+		return printJSON(map[string]any{
+			"object_id": record.ID.Hex(), "version_id": record.Version.Hex(),
+			"identity_mode": mode, "causal_hash": hashValue,
+			"parents": parents, "closure": closureEntries,
+		})
+	}
+	fmt.Printf("object_id=%s\nversion_id=%s\nidentity_mode=%s\n", record.ID.Hex(), record.Version.Hex(), mode)
+	if causalHash != nil {
+		fmt.Printf("causal_hash=%s\n", causalHash.Hex())
+	}
+	for _, item := range parents {
+		fmt.Printf("parent=%s\n", item)
+	}
+	for _, item := range closureEntries {
+		fmt.Printf("closure=%s\n", item)
+	}
+	return nil
+}
+
+func cmdURI(args []string, storeDir string, jsonOut bool) error {
+	if len(args) == 0 {
+		return werr.Newf(werr.InvalidArgument, "uri requires canonicalize|show")
+	}
+	switch args[0] {
+	case "canonicalize":
+		if len(args) < 2 {
+			return werr.Newf(werr.InvalidArgument, "uri canonicalize requires a URI")
+		}
+		parsed, err := weftcontext.ParseContextURI(args[1], limits.Default())
+		if err != nil {
+			return werr.FromCodec(err)
+		}
+		canonical, err := parsed.CanonicalURI(limits.Default())
+		if err != nil {
+			return werr.FromCodec(err)
+		}
+		if jsonOut {
+			output := map[string]any{"uri": canonical, "form": parsed.Form}
+			if parsed.Form == weftcontext.FormDescriptor {
+				root, err := parsed.ToContextRoot(limits.Default())
+				if err != nil {
+					return werr.FromCodec(err)
+				}
+				id, err := root.ID()
+				if err != nil {
+					return werr.FromCodec(err)
+				}
+				output["context_root_id"] = id.Hex()
+			}
+			return printJSON(output)
+		}
+		fmt.Println(canonical)
+		return nil
+	case "show":
+		if len(args) < 2 {
+			return werr.Newf(werr.InvalidArgument, "uri show requires a name or URI")
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		stored, err := s.LoadContextRoot(args[1])
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{"uri": stored.URI, "context_root_id": stored.ContextRootID.Hex(), "name": stored.Name})
+		}
+		fmt.Println(stored.URI)
+		return nil
+	default:
+		return werr.Newf(werr.InvalidArgument, "uri requires canonicalize|show")
+	}
 }

@@ -3,6 +3,7 @@ package model
 import (
 	"bytes"
 
+	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/hash"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
 	"github.com/infinityabundance/WeftFS-Go/werr"
@@ -149,6 +150,9 @@ func (r ObjectRecord) SymlinkTarget() ([]byte, bool) {
 
 // ValidateObjectRecord enforces the invariants of WEFT-MODEL.md §2.4.
 func ValidateObjectRecord(r ObjectRecord) error {
+	if _, err := ObjectCausalClosure(r); err != nil {
+		return err
+	}
 	if r.Mode > 0o7777 {
 		return werr.Newf(werr.Malformed, "mode must fit POSIX permission bits")
 	}
@@ -469,21 +473,156 @@ func (r RelationRecord) Clone() RelationRecord {
 	return r
 }
 
-// DeriveVersionID computes VersionId from the version record.
+// DeriveVersionID computes VersionId from the frozen bytes_only version
+// record (WEFT-MODEL.md §2.3.1).
 func DeriveVersionID(object, content Hash32, size uint64, mtimeNS int64, parent *Hash32) (Hash32, error) {
-	value := Map(map[string]wcb.Value{
+	return DeriveVersionIDWithIdentity(object, content, size, mtimeNS, parent, weftcontext.BytesOnly, nil)
+}
+
+// DeriveVersionIDWithIdentity computes VersionId under an explicit identity
+// mode (WEFT-CAUSAL.md §2). BytesOnly emits exactly the frozen v1 record;
+// CausalExact adds identity_mode and causal_hash.
+func DeriveVersionIDWithIdentity(object, content Hash32, size uint64, mtimeNS int64, parent *Hash32, mode weftcontext.IdentityMode, causalHash *Hash32) (Hash32, error) {
+	fields := map[string]wcb.Value{
 		"schema":   wcb.TextValue(VersionSchema),
 		"object":   HashValue(object),
 		"content":  HashValue(content),
 		"size":     wcb.U64Value(size),
 		"mtime_ns": wcb.TimestampValue(mtimeNS),
 		"parent":   OptHashValue(parent),
-	})
-	b, err := EncodeWCB(value)
+	}
+	switch mode {
+	case weftcontext.BytesOnly:
+		if causalHash != nil {
+			return Hash32{}, werr.Newf(werr.NonCanonical, "bytes_only version record must not carry a causal hash")
+		}
+	case weftcontext.CausalExact:
+		if causalHash == nil || *causalHash == ZeroHash {
+			return Hash32{}, werr.Newf(werr.NonCanonical, "causal_exact version record requires a nonzero causal hash")
+		}
+		fields["identity_mode"] = wcb.TextValue(weftcontext.CausalExact.String())
+		fields["causal_hash"] = HashValue(*causalHash)
+	default:
+		return Hash32{}, werr.Newf(werr.Unsupported, "unknown identity mode")
+	}
+	b, err := EncodeWCB(Map(fields))
 	if err != nil {
 		return Hash32{}, err
 	}
 	return VersionIDBytes(b), nil
+}
+
+// causalHashesFromAttr parses a reserved causal array attribute.
+func causalHashesFromAttr(value wcb.Value, what string) ([]Hash32, error) {
+	if value.Kind != wcb.Array {
+		return nil, werr.Newf(werr.Malformed, "%s must be an array of bytes32", what)
+	}
+	out := make([]Hash32, 0, len(value.Array))
+	for _, item := range value.Array {
+		if item.Kind != wcb.Bytes || len(item.Bytes) != hash.HashLen {
+			return nil, werr.Newf(werr.Malformed, "%s must contain bytes32", what)
+		}
+		h, err := hash.FromSlice(item.Bytes)
+		if err != nil {
+			return nil, werr.Newf(werr.Malformed, "%s contains an invalid hash", what)
+		}
+		if h == ZeroHash {
+			return nil, werr.Newf(werr.Malformed, "%s must not contain the zero hash", what)
+		}
+		out = append(out, h)
+	}
+	return out, nil
+}
+
+// ObjectCausalClosure extracts and validates the causal closure stored on an
+// object record. A partial or inconsistent set is Corrupt.
+func ObjectCausalClosure(record ObjectRecord) (*weftcontext.CausalClosure, error) {
+	parentsValue, hasParents := record.Attrs[AttrCausalParents]
+	closureValue, hasClosure := record.Attrs[AttrCausalClosure]
+	hashValue, hasHash := record.Attrs[AttrCausalHash]
+	modeValue, hasMode := record.Attrs[AttrIdentityMode]
+	if !hasParents && !hasClosure && !hasHash && !hasMode {
+		return nil, nil
+	}
+	if !hasParents || !hasClosure || !hasHash {
+		return nil, werr.Newf(werr.Corrupt, "partial causal attributes: parents, closure, and hash are all required")
+	}
+	parents, err := causalHashesFromAttr(parentsValue, AttrCausalParents)
+	if err != nil {
+		return nil, err
+	}
+	closure, err := causalHashesFromAttr(closureValue, AttrCausalClosure)
+	if err != nil {
+		return nil, err
+	}
+	if hashValue.Kind != wcb.Bytes || len(hashValue.Bytes) != hash.HashLen {
+		return nil, werr.Newf(werr.Corrupt, "weft.causal.hash must be bytes32")
+	}
+	recordHash, err := hash.FromSlice(hashValue.Bytes)
+	if err != nil || recordHash == ZeroHash {
+		return nil, werr.Newf(werr.Corrupt, "weft.causal.hash is invalid")
+	}
+	closureRecord, err := weftcontext.NewCausalClosure(parents, closure)
+	if err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	id, err := closureRecord.ID()
+	if err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	if id != recordHash {
+		return nil, werr.Newf(werr.Corrupt, "weft.causal.hash does not match the recorded closure")
+	}
+	if hasMode {
+		if modeValue.Kind != wcb.Text {
+			return nil, werr.Newf(werr.Corrupt, "weft.identity.mode must be text")
+		}
+		mode, err := weftcontext.ParseIdentityMode(modeValue.Str)
+		if err != nil {
+			return nil, werr.FromCodec(err)
+		}
+		if mode != weftcontext.CausalExact {
+			return nil, werr.Newf(werr.NonCanonical, "bytes_only must be the absence of weft.identity.mode")
+		}
+	}
+	return closureRecord, nil
+}
+
+// IdentityFromAttrs returns the identity mode and causal hash implied by an
+// object's reserved attrs.
+func IdentityFromAttrs(record ObjectRecord) (weftcontext.IdentityMode, *Hash32, error) {
+	closure, err := ObjectCausalClosure(record)
+	if err != nil {
+		return weftcontext.BytesOnly, nil, err
+	}
+	if closure == nil {
+		return weftcontext.BytesOnly, nil, nil
+	}
+	id, err := closure.ID()
+	if err != nil {
+		return weftcontext.BytesOnly, nil, werr.FromCodec(err)
+	}
+	return weftcontext.CausalExact, &id, nil
+}
+
+// ApplyCausalAttrs attaches canonical causal attributes to an attribute map.
+func ApplyCausalAttrs(attrs map[string]wcb.Value, closure *weftcontext.CausalClosure, mode weftcontext.IdentityMode, causalHash Hash32) {
+	parents := make([]wcb.Value, 0, len(closure.Parents))
+	for _, item := range closure.Parents {
+		parents = append(parents, wcb.BytesValue(append([]byte(nil), item[:]...)))
+	}
+	closureValues := make([]wcb.Value, 0, len(closure.Closure))
+	for _, item := range closure.Closure {
+		closureValues = append(closureValues, wcb.BytesValue(append([]byte(nil), item[:]...)))
+	}
+	attrs[AttrCausalParents] = wcb.ArrayValue(parents)
+	attrs[AttrCausalClosure] = wcb.ArrayValue(closureValues)
+	attrs[AttrCausalHash] = wcb.BytesValue(append([]byte(nil), causalHash[:]...))
+	if mode == weftcontext.CausalExact {
+		attrs[AttrIdentityMode] = wcb.TextValue(weftcontext.CausalExact.String())
+	} else {
+		delete(attrs, AttrIdentityMode)
+	}
 }
 
 // ValidateNameBytes rejects names that cannot be a single POSIX component.

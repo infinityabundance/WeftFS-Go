@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"sort"
 
+	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
 	"github.com/infinityabundance/WeftCodec-Go/selector"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
@@ -60,8 +61,91 @@ type Resolution struct {
 
 // ResolveState evaluates a selector against an explicit replayed state.
 func ResolveState(sel *selector.Selector, snapshotID model.Hash32, state *model.State, principal auth.Principal, lim limits.Limits) (*Resolution, error) {
+	return ResolveStateWithBudget(sel, snapshotID, state, principal, lim, nil, nil, nil)
+}
+
+// WorkUnits returns the deterministic v1 work unit count: objects inspected
+// plus relation edges traversed.
+func WorkUnits(sel *selector.Selector, state *model.State) uint64 {
+	work := uint64(len(state.Objects))
+	if selectorHasRelations(sel.Predicate) {
+		work += uint64(len(state.Relations))
+	}
+	return work
+}
+
+func selectorHasRelations(expr *selector.Expr) bool {
+	switch expr.Kind {
+	case selector.ExprTag, selector.ExprRelation:
+		return true
+	case selector.ExprAnd, selector.ExprOr:
+		for _, item := range expr.Items {
+			if selectorHasRelations(item) {
+				return true
+			}
+		}
+	case selector.ExprNot:
+		return selectorHasRelations(expr.Inner)
+	}
+	return false
+}
+
+func selectorPredicatesAllowed(expr *selector.Expr, capability *auth.Capability) bool {
+	switch expr.Kind {
+	case selector.ExprTag:
+		return capability.AllowsPredicate("tagged_as")
+	case selector.ExprRelation:
+		return capability.AllowsPredicate(expr.Name)
+	case selector.ExprAnd, selector.ExprOr:
+		for _, item := range expr.Items {
+			if !selectorPredicatesAllowed(item, capability) {
+				return false
+			}
+		}
+	case selector.ExprNot:
+		return selectorPredicatesAllowed(expr.Inner, capability)
+	}
+	return true
+}
+
+// ResolveStateWithBudget evaluates a selector with optional capability and
+// budget enforcement. Authorization is applied before counting; an overrun is
+// LimitExceeded, never a silently truncated success.
+func ResolveStateWithBudget(sel *selector.Selector, snapshotID model.Hash32, state *model.State, principal auth.Principal, lim limits.Limits, capability *auth.Capability, contextRootID *model.Hash32, budget *weftcontext.Budget) (*Resolution, error) {
 	if sel.Namespace != model.DefaultNamespace {
 		return nil, werr.Newf(werr.NamespaceMismatch, "selector namespace `%s` is not `%s`", sel.Namespace, model.DefaultNamespace)
+	}
+	if capability != nil {
+		namespaceAllowed := capability.AllowsNamespace(sel.Namespace)
+		if !namespaceAllowed && contextRootID != nil && capability.AllowsRoot(*contextRootID) {
+			namespaceAllowed = true
+		}
+		if !namespaceAllowed {
+			return nil, werr.Newf(werr.Unauthorized, "capability does not grant this selection")
+		}
+		if len(capability.Scope.Roots) != 0 && contextRootID != nil && !capability.AllowsRoot(*contextRootID) {
+			return nil, werr.Newf(werr.Unauthorized, "capability does not grant this context root")
+		}
+		if !selectorPredicatesAllowed(sel.Predicate, capability) {
+			return nil, werr.Newf(werr.Unauthorized, "capability does not grant every relation predicate in the selector")
+		}
+	}
+	if budget != nil {
+		if budget.MaxWork != nil {
+			work := WorkUnits(sel, state)
+			if work > *budget.MaxWork {
+				return nil, werr.LimitExceededf("resolver work %d exceeds max_work %d", work, *budget.MaxWork)
+			}
+		}
+		if budget.MaxDepth != nil {
+			depth := uint64(0)
+			if selectorHasRelations(sel.Predicate) {
+				depth = 1
+			}
+			if depth > *budget.MaxDepth {
+				return nil, werr.LimitExceededf("traversal depth %d exceeds max_depth %d", depth, *budget.MaxDepth)
+			}
+		}
 	}
 	root, ok := state.Objects[model.RootID]
 	if !ok {
@@ -111,6 +195,9 @@ func ResolveState(sel *selector.Selector, snapshotID model.Hash32, state *model.
 	end := start + limit
 	if end < start || end > total {
 		end = total
+	}
+	if budget != nil && budget.MaxResults != nil && end-start > *budget.MaxResults {
+		return nil, werr.LimitExceededf("resolution would return %d results, budget is %d", end-start, *budget.MaxResults)
 	}
 
 	results := make([]ResolvedRef, 0, end-start)

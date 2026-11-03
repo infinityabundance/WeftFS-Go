@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"sort"
 
+	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
 	"github.com/infinityabundance/WeftCodec-Go/selector"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
@@ -24,6 +25,13 @@ func (s *Store) CreateFile(parent model.Hash32, name []byte, data []byte, mode, 
 
 // CreateFileSeeded creates a regular file with an explicit ObjectId seed.
 func (s *Store) CreateFileSeeded(parent model.Hash32, name []byte, data []byte, mode, uid, gid uint64, attrs map[string]wcb.Value, seed []byte) (model.Hash32, error) {
+	return s.CreateFileSeededCausal(parent, name, data, mode, uid, gid, attrs, seed, nil)
+}
+
+// CreateFileSeededCausal creates a regular file with optional causal_exact
+// ancestry. A non-empty causal slice selects causal_exact; nil/empty keeps the
+// frozen bytes_only v1 identity.
+func (s *Store) CreateFileSeededCausal(parent model.Hash32, name []byte, data []byte, mode, uid, gid uint64, attrs map[string]wcb.Value, seed []byte, causal []model.Hash32) (model.Hash32, error) {
 	if err := s.requireWritable(); err != nil {
 		return model.Hash32{}, err
 	}
@@ -50,15 +58,24 @@ func (s *Store) CreateFileSeeded(parent model.Hash32, name []byte, data []byte, 
 	if _, exists := s.state.Objects[objectID]; exists {
 		return model.Hash32{}, werr.Newf(werr.Exists, "object id already exists")
 	}
+	preparedAttrs, identityMode, causalHash, closure, err := s.prepareCausal(attrs, causal)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if closure != nil {
+		if err := s.storeCausalClosure(closure); err != nil {
+			return model.Hash32{}, err
+		}
+	}
 	mtime := s.nowNS()
-	version, err := model.DeriveVersionID(objectID, manifestID, size, mtime, nil)
+	version, err := model.DeriveVersionIDWithIdentity(objectID, manifestID, size, mtime, nil, identityMode, causalHash)
 	if err != nil {
 		return model.Hash32{}, err
 	}
 	record := model.ObjectRecord{
 		ID: objectID, Kind: model.KindFile, Mode: mode, UID: uid, GID: gid,
 		MtimeNS: mtime, Version: version, Content: manifestID, Size: size,
-		Attrs: model.CloneAttrs(attrs),
+		Attrs: preparedAttrs,
 	}
 	entryID, err := model.DeriveEntryID(parent, name)
 	if err != nil {
@@ -78,6 +95,13 @@ func (s *Store) CreateFileSeeded(parent model.Hash32, name []byte, data []byte, 
 
 // WriteFile replaces a byte range in a file, zero-filling a gap past EOF.
 func (s *Store) WriteFile(id model.Hash32, offset uint64, data []byte) (model.Hash32, error) {
+	return s.WriteFileCausal(id, offset, data, nil)
+}
+
+// WriteFileCausal replaces a byte range with optional causal_exact ancestry.
+// An empty causal slice preserves an existing causal_exact closure (the mode is
+// sticky) and keeps bytes_only objects byte-identical to v1.
+func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, causal []model.Hash32) (model.Hash32, error) {
 	if err := s.requireWritable(); err != nil {
 		return model.Hash32{}, err
 	}
@@ -110,8 +134,29 @@ func (s *Store) WriteFile(id model.Hash32, offset uint64, data []byte) (model.Ha
 	if err != nil {
 		return model.Hash32{}, err
 	}
+	var attrs map[string]wcb.Value
+	var identityMode weftcontext.IdentityMode
+	var causalHash *model.Hash32
+	if len(causal) == 0 {
+		identityMode, causalHash, err = model.IdentityFromAttrs(old)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		attrs = model.CloneAttrs(old.Attrs)
+	} else {
+		var closure *weftcontext.CausalClosure
+		attrs, identityMode, causalHash, closure, err = s.prepareCausal(old.Attrs, causal)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		if closure != nil {
+			if err := s.storeCausalClosure(closure); err != nil {
+				return model.Hash32{}, err
+			}
+		}
+	}
 	mtime := s.nowNS()
-	version, err := model.DeriveVersionID(id, manifestID, size, mtime, hashPtr(old.Version))
+	version, err := model.DeriveVersionIDWithIdentity(id, manifestID, size, mtime, hashPtr(old.Version), identityMode, causalHash)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -120,6 +165,7 @@ func (s *Store) WriteFile(id model.Hash32, offset uint64, data []byte) (model.Ha
 	record.MtimeNS = mtime
 	record.Content = manifestID
 	record.Size = newSize
+	record.Attrs = attrs
 	ops := []model.Op{
 		model.PutObjectOp{Record: record},
 		model.SetTipOp{Object: id, Version: version},
@@ -159,8 +205,12 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	if err != nil {
 		return model.Hash32{}, err
 	}
+	identityMode, causalHash, err := model.IdentityFromAttrs(old)
+	if err != nil {
+		return model.Hash32{}, err
+	}
 	mtime := s.nowNS()
-	version, err := model.DeriveVersionID(id, manifestID, size, mtime, hashPtr(old.Version))
+	version, err := model.DeriveVersionIDWithIdentity(id, manifestID, size, mtime, hashPtr(old.Version), identityMode, causalHash)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -589,7 +639,11 @@ func (s *Store) Setattr(id model.Hash32, changes SetAttr) (model.Hash32, error) 
 	if changes.Attrs != nil {
 		record.Attrs = model.CloneAttrs(changes.Attrs)
 	}
-	version, err := model.DeriveVersionID(record.ID, record.Content, record.Size, record.MtimeNS, hashPtr(old.Version))
+	identityMode, causalHash, err := model.IdentityFromAttrs(record)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	version, err := model.DeriveVersionIDWithIdentity(record.ID, record.Content, record.Size, record.MtimeNS, hashPtr(old.Version), identityMode, causalHash)
 	if err != nil {
 		return model.Hash32{}, err
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/infinityabundance/WeftFS-Go/auth"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/store"
 )
@@ -31,6 +32,8 @@ type Options struct {
 	ReadOnly   bool
 	AllowOther bool
 	Debug      bool
+	// Capability optionally narrows exact-id and saved-context views.
+	Capability *auth.Capability
 }
 
 // Server owns the mount state and serializes access to the store. All node

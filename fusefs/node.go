@@ -198,10 +198,16 @@ func (n *node) listLocked(principal auth.Principal) ([]dirItem, error) {
 			dirItem{name: []byte("id"), ino: weftIDsIno, mode: syscall.S_IFDIR},
 		)
 	case kindWeftIDs:
+		now := n.srv.store.ClockNowNS()
 		for _, id := range model.SortHashKeys(state.Objects) {
 			record := state.Objects[id]
 			if !auth.CanRead(record, principal) {
 				continue
+			}
+			if n.srv.opts.Capability != nil {
+				if _, err := n.srv.store.ExactIDObjectAt(state, id, n.srv.opts.Capability, principal, now); err != nil {
+					continue
+				}
 			}
 			items = append(items, dirItem{
 				name: []byte(id.Hex()), ino: n.srv.inodes.idViewIno(id), mode: modeFor(record),
@@ -215,7 +221,7 @@ func (n *node) listLocked(principal auth.Principal) ([]dirItem, error) {
 		if !auth.CanRead(root, principal) {
 			return items, nil
 		}
-		contexts, err := n.srv.store.ListContextsAt(state)
+		contexts, err := n.srv.store.VisibleSavedContexts(state, n.srv.opts.Capability, principal, n.srv.store.ClockNowNS())
 		if err != nil {
 			return nil, err
 		}
@@ -236,7 +242,10 @@ func (n *node) listLocked(principal auth.Principal) ([]dirItem, error) {
 		if err != nil {
 			return nil, err
 		}
-		resolution, err := store.ResolveState(saved, n.srv.viewSnapshot(), state, principal, limits.Default())
+		resolution, err := n.srv.store.ResolveSavedContextWithCapability(
+			saved, n.srv.viewSnapshot(), state, principal, limits.Default(),
+			n.srv.opts.Capability, n.srv.store.ClockNowNS(),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -350,15 +359,15 @@ func (n *node) lookupLocked(name string, principal auth.Principal, out *fuse.Ent
 		if err != nil {
 			return nil, werr.Newf(werr.NotFound, "no such object id")
 		}
-		record, ok := state.Objects[id]
-		if !ok || !auth.CanRead(record, principal) {
+		record, err := n.srv.store.ExactIDObjectAt(state, id, n.srv.opts.Capability, principal, n.srv.store.ClockNowNS())
+		if err != nil {
 			return nil, werr.Newf(werr.NotFound, "no such object id")
 		}
 		child := n.srv.newNode(kindWeftID, id, "")
 		fillAttr(&out.Attr, record, state.NLink(id), n.srv.inodes.idViewIno(id))
 		return child, nil
 	case kindWeftContexts:
-		contexts, err := n.srv.store.ListContextsAt(state)
+		contexts, err := n.srv.store.VisibleSavedContexts(state, n.srv.opts.Capability, principal, n.srv.store.ClockNowNS())
 		if err != nil {
 			return nil, err
 		}
@@ -436,7 +445,10 @@ func (n *node) contextResultIDs(principal auth.Principal) ([]model.Hash32, error
 	if err != nil {
 		return nil, err
 	}
-	resolution, err := store.ResolveState(saved, n.srv.viewSnapshot(), state, principal, limits.Default())
+	resolution, err := n.srv.store.ResolveSavedContextWithCapability(
+		saved, n.srv.viewSnapshot(), state, principal, limits.Default(),
+		n.srv.opts.Capability, n.srv.store.ClockNowNS(),
+	)
 	if err != nil {
 		return nil, err
 	}
