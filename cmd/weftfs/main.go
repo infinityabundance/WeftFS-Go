@@ -1668,6 +1668,13 @@ func cmdContext(args []string, storeDir string, jsonOut bool) error {
 		if err != nil {
 			return err
 		}
+		if len(causalIDs) != 0 {
+			closure, err := store.ComputeCausalClosure(s.CurrentState(), causalIDs, limits.Default())
+			if err != nil {
+				return err
+			}
+			causalIDs = closure.Closure
+		}
 		var capability *auth.Capability
 		if *capabilityPath != "" {
 			capability, err = loadCapabilityFile(*capabilityPath)
