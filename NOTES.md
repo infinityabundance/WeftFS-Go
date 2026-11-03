@@ -235,6 +235,12 @@ oracle only.
 | 4. Snapshots both ways | `TestHandoffSnapshotsBidirectional` | Rust `pin /snap.txt --snapshot go-snap --json`; Rust snapshot mount read; Rust `snapshot create rust-snap`; Go reopen `LookupSnapshot`/`StateAt`/read | Rust pin snapshot/object/version/content equal Go's snapshot record; Rust mount read `v1`; Go reads `rust-snap` content `v2` |
 | 5. Checkpoints both ways | `TestHandoffCheckpointsBothWays` | Go init with `checkpoint_interval=1` → Rust `verify --full` + `cat` + `create`; Rust `checkpoint` → Go `Verify(true)` + reads | Rust replays the Go checkpoint and commits on top; Go replays the Rust checkpoint; both files exact; `ok=true` |
 
+Checkpoint acceptance is asserted, not assumed: the tests fail if either side
+emits a recovery note containing `checkpoint` (the note Rust/Go produce when a
+checkpoint is unreadable or declares the wrong generation). Gate 3 additionally
+forces a Rust checkpoint each round and asserts that Go's next open carries no
+checkpoint-ignore note.
+
 Handoff matrix per operation:
 
 | Operation | Rust → Go | Go → Rust | Evidence |

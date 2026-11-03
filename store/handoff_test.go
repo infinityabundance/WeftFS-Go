@@ -357,6 +357,12 @@ func TestHandoffAlternatingGenerations(t *testing.T) {
 			reader.Close()
 			t.Fatalf("go verify after rust round %d: ok=%v err=%v problems=%+v", round, report != nil && report.OK, err, reportProblems(report))
 		}
+		for _, note := range reader.RecoveryNotes() {
+			if strings.Contains(note, "checkpoint") {
+				reader.Close()
+				t.Fatalf("go ignored a Rust checkpoint in round %d: %s", round, note)
+			}
+		}
 		data := readObjectContent(t, reader, reader.CurrentState(), rustName)
 		if data != rustContent {
 			reader.Close()
@@ -415,6 +421,19 @@ func TestHandoffCheckpointsBothWays(t *testing.T) {
 	if got := rustCat(t, bin, dir, "/ck.txt"); got != "checkpointed" {
 		t.Fatalf("rust cat = %q", got)
 	}
+	// Rust must accept the Go checkpoint, not ignore it and replay ops.
+	info := runRust(t, bin, "--store", dir, "--json", "info")
+	var rustInfo struct {
+		RecoveryNotes []string `json:"recovery_notes"`
+	}
+	if err := json.Unmarshal([]byte(info), &rustInfo); err != nil {
+		t.Fatalf("parse rust info: %v\n%s", err, info)
+	}
+	for _, note := range rustInfo.RecoveryNotes {
+		if strings.Contains(note, "checkpoint") {
+			t.Fatalf("rust ignored the Go checkpoint: %s", note)
+		}
+	}
 	// A Rust writer replays from the Go checkpoint and commits on top.
 	runRust(t, bin, "--store", dir, "create", "/from-rust.txt", "--text", "rust-on-go-checkpoint")
 	// A Rust checkpoint is then read by Go.
@@ -431,6 +450,11 @@ func TestHandoffCheckpointsBothWays(t *testing.T) {
 	report, err := reader.Verify(true)
 	if err != nil || !report.OK {
 		t.Fatalf("go verify: ok=%v err=%v problems=%+v", report != nil && report.OK, err, reportProblems(report))
+	}
+	for _, note := range reader.RecoveryNotes() {
+		if strings.Contains(note, "checkpoint") {
+			t.Fatalf("go ignored the Rust checkpoint: %s", note)
+		}
 	}
 	state := reader.CurrentState()
 	if got := readObjectContent(t, reader, state, "/ck.txt"); got != "checkpointed" {
