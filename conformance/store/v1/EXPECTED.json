@@ -1,0 +1,148 @@
+{
+  "entries": [
+    {
+      "entry_id": "a80b1cce10e7c61e54423ab25bf7b6e12218c2236d088401f4f870a8872ad17a",
+      "path": "/data",
+      "target": "59a74318a4a42b2ddf57755adc103a47d84647f0fbbdf93543a704e898442b72"
+    },
+    {
+      "entry_id": "b3c68fdc8cd2e19dec4e41b4d0218f09d2cd900ed270b1d7f9862c927a6ec7a2",
+      "path": "/data/binary.bin",
+      "target": "d2578f5a77014c7fcc6fc27ec92e7ebd47f60156f2b634d86b3fde3bb8e0d206"
+    },
+    {
+      "entry_id": "696e90931b1feadc496e19b6114c2ae2b402a1d146892e074d41e2c54bd1d8af",
+      "path": "/docs",
+      "target": "c08a7030130eb71232296a658da4ce06f59191a9e830e5650a567b1e5209a82f"
+    },
+    {
+      "entry_id": "02429046fe3eb7df8996b11e305f97b2ccf8bae5a77c0417731977a608e4b052",
+      "path": "/docs/readme.md",
+      "target": "651cd035bea908db3fb8f9d6c6376516c93ea1f294076f5d027f29b53e71553a"
+    },
+    {
+      "entry_id": "5c2cbc384d8343ea3589c332f4e0182044f649ac15bf892232dca2d92fffb265",
+      "path": "/hello.txt",
+      "target": "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6"
+    },
+    {
+      "entry_id": "67c67fec6f6e4f58c701869fe74e8cc3810254f5d0b6c7bdd2f576b0a699b17e",
+      "path": "/hello.txt-hard",
+      "target": "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6"
+    },
+    {
+      "entry_id": "a440eacffee851c6b155fdf7a5c877a24aebce12de8301b0606248cbffa20359",
+      "path": "/link",
+      "target": "3884b9e44ef113fc380f4d5517b74544bf0280bdb0270391170be352354ab8b0"
+    }
+  ],
+  "format": "weftfs-store 1",
+  "generated_by": "weftfs (Rust) 0.1.0 P4",
+  "generation": 11,
+  "generator_revision": "61b11a802f3475ecb1723b5c54cb83f49e465f8a",
+  "objects": [
+    {
+      "content_hash": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "content_id": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "kind": "dir",
+      "object_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "path": "/",
+      "size": 0,
+      "version_id": "a3a41c28480d18af75b45009a2d7fe60f8d55d87102a9fe48587999bca8ea43c"
+    },
+    {
+      "content_hash": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "content_id": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "kind": "dir",
+      "object_id": "59a74318a4a42b2ddf57755adc103a47d84647f0fbbdf93543a704e898442b72",
+      "path": "/data",
+      "size": 0,
+      "version_id": "20719a39d73140b8dcc7a8195d97b9454c46c4fced4bace7491e0ce80e5891c9"
+    },
+    {
+      "content_hash": "d2b8bfe0c1fdef3fcd04969d01b07e100efef21d8a9cbde7c0e062cb143fa343",
+      "content_id": "00a4e7bf2ba8d1b859cd9c7f3fd02f539b0ed0bd81b09b93616c97f2a960d6fa",
+      "kind": "file",
+      "object_id": "d2578f5a77014c7fcc6fc27ec92e7ebd47f60156f2b634d86b3fde3bb8e0d206",
+      "path": "/data/binary.bin",
+      "size": 4096,
+      "version_id": "af1049f32585ab1baa3f00ea935292d270ed7f2fa320b0c7cfb58eb96fc06d55"
+    },
+    {
+      "content_hash": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "content_id": "9959c2a9c356d12342cde2d83160cc18ed0136e2e36e8f6eed89066c78a471cb",
+      "kind": "dir",
+      "object_id": "c08a7030130eb71232296a658da4ce06f59191a9e830e5650a567b1e5209a82f",
+      "path": "/docs",
+      "size": 0,
+      "version_id": "d241e56cd37bf985b3d0abf3acdd357023960d741b4fcfc4c6b7e2a8c8e77953"
+    },
+    {
+      "content_hash": "45f8aedc77fc892b4220412dcac1c27e009f64a33f79553dde73011a0265538e",
+      "content_id": "81bba5990b111f630eeaabbd71d15784a2186e365d48bd584d2fe697660139be",
+      "kind": "file",
+      "object_id": "651cd035bea908db3fb8f9d6c6376516c93ea1f294076f5d027f29b53e71553a",
+      "path": "/docs/readme.md",
+      "size": 66,
+      "version_id": "ddde32af561194f2c946d881e62536a6c80df5ead5e7ffc766f0f599fe63a8fa"
+    },
+    {
+      "content_hash": "f9c01c8f723ce046af6008ee23b5ba0d3c99931d1e5c4fe4fbb226b778fe7e70",
+      "content_id": "c0be8b5faa824eeeb5107b124c35d56e1fe589cf6c47009b732769f6dd956f01",
+      "kind": "file",
+      "object_id": "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6",
+      "path": "/hello.txt",
+      "size": 11,
+      "version_id": "5d144a1191df410a51740386dab409ca08ac584d5ebfc56472a6e7d32f869e61"
+    },
+    {
+      "content_hash": "7a5771a59c72ae9c02d3445a3181e5122f575415fc89fd43665d46226fe7bdf9",
+      "content_id": "7a5771a59c72ae9c02d3445a3181e5122f575415fc89fd43665d46226fe7bdf9",
+      "kind": "symlink",
+      "object_id": "3884b9e44ef113fc380f4d5517b74544bf0280bdb0270391170be352354ab8b0",
+      "path": "/link",
+      "size": 9,
+      "version_id": "d34e2f1c7da7962ec837240d213cda4c9dc5e59759530ee4d85542ee787f807c"
+    }
+  ],
+  "relations": [
+    "9544ade997e111fbb79c2a6b848ac9bf63e360bedb8be18ee464e636b665c8f9",
+    "b55e1c503e21c3523607b359172ea45732f48ed42ca69b8ff36f1615221243c7"
+  ],
+  "schema_version": 1,
+  "selectors": [
+    {
+      "matched_count": 3,
+      "object_ids": [
+        "651cd035bea908db3fb8f9d6c6376516c93ea1f294076f5d027f29b53e71553a",
+        "d2578f5a77014c7fcc6fc27ec92e7ebd47f60156f2b634d86b3fde3bb8e0d206",
+        "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6"
+      ],
+      "selector_id": "195e975f9203fd933f0765a1ac56729258a326b708c864a85b0e34a5f109aa70",
+      "snapshot_id": "38d1062a65723036d0a9e146ee38ccdf61820eae69aaa7c9f983aef59735619a",
+      "source": "select kind == \"file\""
+    },
+    {
+      "matched_count": 1,
+      "object_ids": [
+        "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6"
+      ],
+      "selector_id": "0ae85f55696d8bb0fa85816aa2fa6f566668d93582077a3594ac67664baf2592",
+      "snapshot_id": "38d1062a65723036d0a9e146ee38ccdf61820eae69aaa7c9f983aef59735619a",
+      "source": "select tag(\"greeting\")"
+    },
+    {
+      "matched_count": 1,
+      "object_ids": [
+        "e1295a99361e040c88a81186ad25bb6fe9f224467f24ce597f9cdfb68d0407b6"
+      ],
+      "selector_id": "414c73b775fbd53f3065f9b74825c66d8e174793ca035e4cd68c5c6c53e50d01",
+      "snapshot_id": "38d1062a65723036d0a9e146ee38ccdf61820eae69aaa7c9f983aef59735619a",
+      "source": "select relation(derived_from, obj:651cd035bea908db3fb8f9d6c6376516c93ea1f294076f5d027f29b53e71553a)"
+    }
+  ],
+  "snapshot_root": "8959c65b7b5d821063e8785ed950a67214b555210bec45f65fd576053b0e1d81",
+  "snapshots": {
+    "v1": "38d1062a65723036d0a9e146ee38ccdf61820eae69aaa7c9f983aef59735619a"
+  }
+}
