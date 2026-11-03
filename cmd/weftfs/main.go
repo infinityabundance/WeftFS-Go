@@ -58,6 +58,11 @@ func fail(err error) {
 	os.Exit(1)
 }
 
+// fixedTimestampNS is the optional fixture clock override, extracted from the
+// global --fixed-timestamp-ns flag. Store options are not persisted, so every
+// command that opens the store must apply it to keep fixtures reproducible.
+var fixedTimestampNS *int64
+
 // globals extracts --store and --json wherever they appear, leaving the
 // subcommand and its flags in source order.
 func globals(args []string) (rest []string, storeDir string, jsonOut bool, err error) {
@@ -73,6 +78,22 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			storeDir = strings.TrimPrefix(args[i], "--store=")
 		case args[i] == "--json":
 			jsonOut = true
+		case args[i] == "--fixed-timestamp-ns" || args[i] == "-fixed-timestamp-ns":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--fixed-timestamp-ns requires a value")
+			}
+			value, parseErr := strconv.ParseInt(args[i+1], 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "invalid --fixed-timestamp-ns value")
+			}
+			fixedTimestampNS = &value
+			i++
+		case strings.HasPrefix(args[i], "--fixed-timestamp-ns="):
+			value, parseErr := strconv.ParseInt(strings.TrimPrefix(args[i], "--fixed-timestamp-ns="), 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "invalid --fixed-timestamp-ns value")
+			}
+			fixedTimestampNS = &value
 		default:
 			rest = append(rest, args[i])
 		}
@@ -144,7 +165,12 @@ func openStore(storeDir string, mode store.OpenMode) (*store.Store, error) {
 	if err := requireStore(storeDir); err != nil {
 		return nil, err
 	}
-	return store.Open(storeDir, mode)
+	if fixedTimestampNS == nil {
+		return store.Open(storeDir, mode)
+	}
+	opts := store.DefaultOptions()
+	opts.FixedTimestampNS = fixedTimestampNS
+	return store.OpenWithOptions(storeDir, mode, opts)
 }
 
 func printJSON(value any) error {
@@ -161,7 +187,6 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	gid := fs.Uint64("gid", uint64(os.Getgid()), "owner gid")
 	chunkSize := fs.Uint64("chunk-size", model.DefaultChunkSize, "chunk size")
 	checkpoint := fs.Uint64("checkpoint-interval", store.DefaultCheckpointInterval, "commits between checkpoints")
-	fixedTimestamp := fs.Int64("fixed-timestamp-ns", -1, "fixed timestamp (tests)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -173,8 +198,8 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	opts.OwnerGID = *gid
 	opts.ChunkSize = *chunkSize
 	opts.CheckpointInterval = *checkpoint
-	if *fixedTimestamp >= 0 {
-		opts.FixedTimestampNS = fixedTimestamp
+	if fixedTimestampNS != nil {
+		opts.FixedTimestampNS = fixedTimestampNS
 	}
 	s, err := store.Init(storeDir, opts)
 	if err != nil {
