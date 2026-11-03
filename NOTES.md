@@ -472,3 +472,20 @@ Cross-language GC handoff (Rust binary is a test oracle only):
     paths only. There is no io_uring, EKBLOOM, or equivalent; none is claimed.
 11. **Replay bundles are whole-store and unsigned.** No partitioned subset,
     remote fetch, or signature exists. `tar`/`zstd` are required tools.
+
+## F5 — participation in the proof courts (2026-11-03)
+
+No WeftFS-Go code changed for F5. The independent Go store/FUSE implementation
+is exercised as a writer and reader in both F5 FUSE courts:
+
+- `bench/scripts/posix_torture.sh`: three seeds in both directions; the Go
+  frontend writes and the Rust frontend verifies/remounts, and vice versa.
+  Exact state (names, types, modes, uid/gid, nlink, mtime, content sha256,
+  symlinks, xattrs) matched in all six runs; 13,694 operations total.
+- `bench/scripts/crash_torture.sh`: 1,000 alternating Rust/Go writer/reader
+  iterations through `WEFT_CRASH_PHASE`; every observed state was the old or
+  new whole file, never partial.
+
+Receipts: `bench/receipts/posix-torture-20261103T213317Z.json` and
+`bench/receipts/crash-torture-20261103T213446Z.json`. The crash court is a
+process-fault proxy, not physical power loss.
