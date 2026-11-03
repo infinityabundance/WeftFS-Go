@@ -49,7 +49,7 @@ func usage() {
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
-  readlink setattr xattr relation query snapshot verify checkpoint pin mount
+  readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
 `)
 }
 
@@ -143,6 +143,8 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdSnapshot(args, storeDir, jsonOut)
 	case "verify":
 		return cmdVerify(args, storeDir, jsonOut)
+	case "gc":
+		return cmdGC(args, storeDir, jsonOut)
 	case "checkpoint":
 		return cmdCheckpoint(storeDir)
 	case "pin":
@@ -1271,6 +1273,95 @@ func cmdVerify(args []string, storeDir string, jsonOut bool) error {
 	}
 	if !report.OK {
 		return werr.Newf(werr.Corrupt, "verification found %d problem(s)", len(report.Problems))
+	}
+	return nil
+}
+
+// cmdGC runs mark-and-sweep. A dry run is the default; --apply deletes only
+// unreachable blobs admitted by the grace gate. Counts are reported in files
+// and bytes for reachable, unreachable, and deleted sets.
+func cmdGC(args []string, storeDir string, jsonOut bool) error {
+	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	apply := fs.Bool("apply", false, "delete unreachable blobs (default: dry run)")
+	dryRun := fs.Bool("dry-run", false, "report candidates without deleting (the default)")
+	graceSecs := fs.Uint64("grace-secs", store.DefaultGCGraceSecs, "retain unmarked blobs younger than this many seconds (0 disables)")
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return werr.Newf(werr.InvalidArgument, "gc takes no positional arguments")
+	}
+	if *dryRun && *apply {
+		return werr.Newf(werr.InvalidArgument, "--dry-run and --apply are mutually exclusive")
+	}
+	s, err := openStore(storeDir, store.ReadWrite)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	options := s.Options()
+	options.GCGraceSecs = *graceSecs
+	if err := s.SetOptions(options); err != nil {
+		return err
+	}
+	report, err := s.GC(*apply)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		candidates := report.Candidates
+		if candidates == nil {
+			candidates = []string{}
+		}
+		deleted := report.Deleted
+		if deleted == nil {
+			deleted = []string{}
+		}
+		removedOrphans := report.RemovedOrphans
+		if removedOrphans == nil {
+			removedOrphans = []string{}
+		}
+		problems := report.Problems
+		if problems == nil {
+			problems = []string{}
+		}
+		return printJSON(map[string]any{
+			"applied":           report.Applied,
+			"marked_manifests":  report.MarkedManifests,
+			"marked_chunks":     report.MarkedChunks,
+			"reachable_files":   report.ReachableFiles,
+			"reachable_bytes":   report.ReachableBytes,
+			"unreachable_files": report.UnreachableFiles,
+			"unreachable_bytes": report.UnreachableBytes,
+			"deleted_files":     report.DeletedFiles,
+			"deleted_bytes":     report.DeletedBytes,
+			"retained":          report.Retained,
+			"grace_retained":    report.GraceRetained,
+			"removed_orphans":   removedOrphans,
+			"candidates":        candidates,
+			"deleted":           deleted,
+			"problems":          problems,
+		})
+	}
+	fmt.Printf("applied=%v\n", report.Applied)
+	fmt.Printf("marked_manifests=%d\n", report.MarkedManifests)
+	fmt.Printf("marked_chunks=%d\n", report.MarkedChunks)
+	fmt.Printf("reachable_files=%d\n", report.ReachableFiles)
+	fmt.Printf("reachable_bytes=%d\n", report.ReachableBytes)
+	fmt.Printf("unreachable_files=%d\n", report.UnreachableFiles)
+	fmt.Printf("unreachable_bytes=%d\n", report.UnreachableBytes)
+	fmt.Printf("deleted_files=%d\n", report.DeletedFiles)
+	fmt.Printf("deleted_bytes=%d\n", report.DeletedBytes)
+	fmt.Printf("retained=%d\n", report.Retained)
+	fmt.Printf("grace_retained=%d\n", report.GraceRetained)
+	for _, id := range report.RemovedOrphans {
+		fmt.Printf("removed_orphan=%s\n", id)
+	}
+	for _, candidate := range report.Candidates {
+		fmt.Printf("candidate=%s\n", candidate)
+	}
+	for _, problem := range report.Problems {
+		fmt.Printf("problem=%s\n", problem)
 	}
 	return nil
 }

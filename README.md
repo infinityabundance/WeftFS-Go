@@ -30,6 +30,13 @@ Implemented and exercised in the Docker FUSE court:
   symlink/setattr/xattr, relations, snapshots, checkpoints, exclusive `flock`
   writer locking, read-only opens without a lock, open-handle pins, and
   `fsync` on file/directory/root plus superblock slot `gen % 2`.
+- **Mark-and-sweep GC** (`store.GC`, CLI `gc`): Rust-compatible roots (current
+  state, snapshot states, all checkpoint manifests including valid unpublished
+  tails, content pins), orphan-record cleanup on apply, `gc_grace_secs` age
+  gate, dry run by default, checked non-symlink regular-file sweep under
+  `objects/` and `manifests/`, and file/byte counts for reachable,
+  unreachable, and deleted sets. Cross-language handoff gates cover Rust→Go,
+  Go→Rust, alternating generations, and SIGKILL-during-commit recovery.
 - **Go FUSE frontend** (`fusefs`, `github.com/hanwen/go-fuse/v2`): mount,
   lookup/getattr/readdir(+)/open/create/read/write/flush/fsync/release/mkdir/
   rmdir/unlink/rename/link/symlink/readlink/setattr/statfs/xattrs/access,
@@ -37,10 +44,11 @@ Implemented and exercised in the Docker FUSE court:
   saved-context views with deterministic escaped display names.
 - **CLI** (`weftfs`): `init`, `info`, `create`, `write`, `cat`, `ls`, `stat`,
   `mkdir`, `unlink`, `rmdir`, `rename`, `link`, `symlink`, `readlink`,
-  `setattr`, `xattr`, `relation`, `query`, `snapshot`, `verify`, `checkpoint`,
-  `pin`, `mount`.
+  `setattr`, `xattr`, `relation`, `query`, `snapshot`, `verify`, `gc`,
+  `checkpoint`, `pin`, `mount`.
 
-Not implemented (see [NOTES.md](NOTES.md)): garbage collection, cross-process
+Not implemented (see [NOTES.md](NOTES.md)): online/background garbage collection
+(GC is an explicit pass), cross-process
 byte-range locking (answers `ENOSYS`), `mmap` writeback, `mknod`, `fallocate`,
 `lseek` hole queries, and `atime`/`ctime` persistence. No performance claims
 are made.
@@ -99,6 +107,9 @@ weftfs --store /tmp/store relation add --subject /hello.txt --predicate tagged_a
 weftfs --store /tmp/store snapshot create v1
 weftfs --store /tmp/store query --json 'select tag("greeting")'
 weftfs --store /tmp/store verify --full
+weftfs --store /tmp/store gc                     # dry run (default)
+weftfs --store /tmp/store gc --apply             # sweep, respecting 1h grace
+weftfs --store /tmp/store --json gc --grace-secs 0
 weftfs --store /tmp/store mount --mountpoint /mnt/weft --read-only
 ```
 
@@ -114,4 +125,7 @@ snapshot pointer bytes against the Rust fixture: with the fixture's fixed clock
 and explicit seeds the stores are byte-identical.
 
 Bidirectional gates (Rust → Go and Go → Rust) are recorded in
-[NOTES.md](NOTES.md). No result in this repository is a performance claim.
+[NOTES.md](NOTES.md), including four GC-specific gates: Rust garbage swept by
+Go, Go garbage swept by Rust, three alternating generations with GC between
+them, and SIGKILL-during-commit followed by Go GC and a Rust verify. No result
+in this repository is a performance claim.

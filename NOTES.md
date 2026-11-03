@@ -11,6 +11,7 @@ Revisions recorded for this work:
 | Item | Revision / value |
 |---|---|
 | WeftFS-Go branch `staging`, base before P6 | `447a7e401d0bf3aaaef547698817a4fbe1608278` |
+| WeftFS-Go branch `staging`, base before Go GC | `74c8c90202030ad0dcb0bca680501c6b8fef24a9` |
 | WeftCodec-Go (path-replaced module) | `b2beeab4b0da0401006984214dcfd6602be795a5` |
 | Rust oracle binary | `weftfs 0.1.0`, built from the program-home working tree (parent `HEAD` `66fbf3ec101335b76b3ee7dfbcf2d0680cc8711e`) |
 | Fixture generator revision (recorded inside the fixture) | `61b11a802f3475ecb1723b5c54cb83f49e465f8a` |
@@ -79,6 +80,16 @@ Revisions recorded for this work:
   Read-only opens take no lock and pin the state they loaded.
 - In-memory open-handle pins: unlink keeps a pinned record readable/writable;
   the final unpin deletes an entry-less record in one commit.
+- **Mark-and-sweep GC** (`store.GC`, CLI `gc`) with Rust-compatible semantics:
+  roots are the current state, every snapshot state, every checkpoint manifest
+  named by any parseable commit (including valid but unpublished/rejected
+  tails), and in-process content pins; object pins are roots because their
+  records remain in state. Dry run is the default; `--apply` takes the
+  exclusive writer lock, first removes crash-orphaned object records in one
+  commit, then deletes only unmarked regular files under `objects/<ab>/` and
+  `manifests/<ab>/` that are older than `gc_grace_secs` (default 3600, zero
+  disables the age gate). Sweep paths are `Lstat`-checked: no symlink is
+  followed and no non-regular file is removed.
 
 ### FUSE frontend (`fusefs`, `go-fuse/v2`) — implemented, with documented gaps
 
@@ -105,10 +116,11 @@ Revisions recorded for this work:
 
 ### Missing
 
-- **Garbage collection.** Rust's mark-and-sweep GC is not ported. Unreferenced
-  blobs from failed commits and unreferenced records from crash tails remain
-  until an external sweep. `UnpinObject` performs its own durable cleanup
-  commit; it is not a GC.
+- **Online/background GC.** GC is an explicit CLI/API pass, never a daemon.
+  No persisted mark record is kept; each run recomputes reachability from
+  roots, which makes an interrupted sweep recoverable by re-running. A
+  concurrent reader is not consulted; safety comes from the writer lock plus
+  immutable content addressing.
 - Multi-writer concurrency (v1 is single-writer by design; the lock refuses a
   second writer).
 - `atime`/`ctime` persistence. `Getattr` mirrors the stored mtime for both;
@@ -281,12 +293,91 @@ All six ran against a real `/dev/fuse` mount in the court:
   8→16 hex prefix extension when two results share a basename and an 8-hex
   prefix.
 
+### 2.7 Go garbage collection: commands, results, and handoff
+
+All runs used the FUSE court (it carries both toolchains and `/dev/fuse`).
+
+```sh
+cd /mnt/1tb_kingston/WeftFS
+scripts/docker-court.sh fuse \
+  "cd WeftFS-Go && go test -race ./store -run 'TestGC' -count=1 -v"
+```
+
+Observed (the full suite in §2.2 was also re-run after this work: `store`
+`ok 1.520s`, `fusefs` `ok 1.145s`; `gofmt -l .`, `go vet ./...`, and
+`CGO_ENABLED=0 go build ./...` were clean):
+
+- **13 GC tests passed**, **1 intentional helper skip**
+  (`TestGCRejectedTailChild`, re-executed by `TestGCRejectedTailKeepsCheckpoint`),
+  and **2 subtests passed** (`TestGCHandoffKilledGoCommit/after_commit_file`,
+  `.../after_superblock_write`).
+- `TestGCReclaimsUnreferencedBlobAndKeepsSnapshot`: dry run listed 2 candidates
+  and deleted 0; apply then removed the unreferenced manifest and chunk;
+  snapshot content stayed byte-exact and live content remained readable;
+  `verify --full` was clean.
+- `TestGCGraceWindow`: with `gc_grace_secs=3600` a fresh unreachable blob was
+  retained (`grace_retained > 0`, `deleted_files=0`); after `0`, apply removed
+  it.
+- `TestGCRetainsAndSweepsPinnedContent`: a pinned manifest/chunk was not a
+  candidate and remained readable; after unpin it was swept and the content
+  read failed.
+- `TestGCRemovesOrphanRecordsLeftByACrash`: an unlinked record kept alive only
+  by a process-local pin survived close/reopen, then `GC(true)` removed the
+  record in a new commit (`removed_orphans` named it), swept its blobs, and
+  `verify --full` was clean.
+- `TestGCRejectedTailKeepsCheckpoint`: a valid but unpublished tail commit
+  (SIGKILL at `after_commit_file`) carried a checkpoint. Apply swept
+  checkpoint-free garbage but retained the tail checkpoint manifest, the tail
+  file manifest, and every tail chunk. The tail stayed invisible, the head did
+  not move, a later commit published generation 5, and `verify --full` was
+  clean with the tail checkpoint still parseable.
+- `TestGCNeverSweepsFixtureReachability`: every manifest/chunk named by
+  `EXPECTED.json` and by the fixture snapshot states survived dry run and
+  apply; `verify --full` stayed clean.
+- `TestGCInterruptedSweepIsRecoverable`: after one candidate was deleted by
+  hand (simulating a killed sweep), the next pass recomputed roots, removed
+  the remainder, and verified clean. No persisted mark record is trusted.
+- `TestGCSweepSkipsSymlinksAndNonRegularEntries`: symlink and directory
+  entries with valid 64-lowercase-hex blob names were never candidates; a
+  symlink target outside the store was untouched; exactly the one regular
+  unmarked file was deleted. Paths are `Lstat`-checked.
+
+CLI smoke run (exact commands in the court, store at `/tmp/gcstore`; output
+abridged):
+
+```sh
+weftfs --store /tmp/gcstore gc --grace-secs 0            # dry run
+weftfs --store /tmp/gcstore gc --apply --grace-secs 0
+weftfs --store /tmp/gcstore --json gc --grace-secs 0
+weftfs --store /tmp/gcstore verify --full
+```
+
+Observed: dry run `applied=false unreachable_files=2 unreachable_bytes=171
+deleted_files=0`; apply `deleted_files=2 deleted_bytes=171`;
+the next run `unreachable_files=0`; `verify --full` `ok=true generation=6`;
+`cat /keep.txt` returned `LIVE-CONTENT-123`. With the default grace in the
+same smoke store, the first run reported `unreachable_files=0
+grace_retained=2 retained=6`, proving the age gate. JSON output used
+lowercase keys and empty arrays for empty candidate/deleted/problem sets.
+
+Cross-language GC handoff (Rust binary is a test oracle only):
+
+| Gate | Observed |
+|---|---|
+| A. Rust store + snapshot + unreferenced blob → Go `gc --apply` | Go dry run listed the blob, apply deleted it; Rust `verify --full` `ok=true`, Rust `cat /keep.txt` and a Rust snapshot mount read returned the exact pre-snapshot bytes; Go snapshot read also exact |
+| B. Go store + snapshot + garbage → Rust `gc --apply --grace-secs 0` | Rust reported `applied=true`; Go-created garbage manifest/chunk were gone; the snapshot-only chunk survived; Rust and Go `verify --full` clean; snapshot and live reads exact |
+| C. Three alternating generations with GC between | Go wrote/GC’d, Rust wrote/GC’d, Go wrote/GC’d; after every round the stable ObjectId, VersionId, ContentId, and snapshot commit were unchanged, snapshot/live bytes were exact, and both `verify --full` runs were clean |
+| D. SIGKILL during Go commit → Go GC → Rust verify | `after_commit_file`: the tail’s chunk was swept, the tail stayed invisible, Rust `verify --full` reported only `commit file for generation 2 exists above the highest published superblock generation 1`. `after_superblock_write`: the chunk survived, Rust `verify --full` was `ok=true`, and Rust read the killed commit’s exact bytes |
+
 ---
 
 ## 3. Known limitations and honest gaps
 
-1. **No GC.** See above. A long-lived store accumulates unreferenced blobs
-   after failed commits and after crash tails until swept by other means.
+1. **No online/background GC.** Collection is an explicit `store.GC`/`weftfs
+   gc` pass under the exclusive writer lock. There is no persisted mark record:
+   every run recomputes roots, so an interrupted sweep is recovered by
+   re-running. Readers do not participate; safety rests on the writer lock and
+   immutable blobs.
 2. **Same-inode concurrent direct read/write is not claimed.** The parent
    project records a kernel EIO issue for that pattern in
    `docs/fuse-status.md`. This implementation tests concurrent traffic on
