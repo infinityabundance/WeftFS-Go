@@ -158,7 +158,7 @@ ok  	github.com/infinityabundance/WeftFS-Go/store	1.339s
 ```
 
 `CGO_ENABLED=0 go build ./...` and `go vet ./...` exited 0. With `-v`, the run
-reported **29 top-level tests passed** (23 in `store`, 6 in `fusefs`) plus
+reported **31 top-level tests passed** (23 in `store`, 8 in `fusefs`) plus
 **5 subtests passed**, and **1 intentional helper skip**
 (`TestCrashChildProcess`, re-executed as a child by `TestCrashProxy`).
 
@@ -269,6 +269,11 @@ All six ran against a real `/dev/fuse` mount in the court:
   descriptor; the record is reclaimed after the last release.
 - `TestSeparateFileConcurrency` — six workers write/read distinct files for 12
   rounds; `verify --full` is clean.
+- `TestEscapeComponentMatchesRustRules` and
+  `TestContextNamesExtendPrefixOnCollision` — unit tests that pin the escaping
+  table (including `%`, `/`, control bytes, non-UTF-8, empty, `.`/`..`) and the
+  8→16 hex prefix extension when two results share a basename and an 8-hex
+  prefix.
 
 ---
 

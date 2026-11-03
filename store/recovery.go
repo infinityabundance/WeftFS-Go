@@ -345,6 +345,9 @@ func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
 // touches. When verifyWhole is true and the range is the whole file, the
 // whole-content hash is verified too.
 func ReadRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
+	if manifest.Size > MaxFileBytes {
+		return nil, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the 256 MiB v1 bound", manifest.Size)
+	}
 	if offset >= manifest.Size {
 		return []byte{}, nil
 	}
