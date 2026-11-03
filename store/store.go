@@ -464,6 +464,13 @@ func (s *Store) maxVisibleGeneration() (uint64, error) {
 	return max, nil
 }
 
+// LineageEntry is one commit on the published parent chain (newest first).
+type LineageEntry struct {
+	Commit      model.Hash32
+	Generation  uint64
+	TimestampNS int64
+}
+
 // StateAt rebuilds the state at a commit on the published parent chain.
 func (s *Store) StateAt(commit model.Hash32) (*model.State, error) {
 	if commit == s.head {
@@ -512,6 +519,64 @@ func (s *Store) isPublishedAncestor(target model.Hash32) (bool, error) {
 		}
 		cursor = *loaded.Commit.Parent
 	}
+}
+
+// CommitLineage returns the published ancestry of base, newest first, down to
+// the genesis commit. Every entry was reachable from the recovered head.
+func (s *Store) CommitLineage(base model.Hash32) ([]LineageEntry, error) {
+	maxVisible, err := s.maxVisibleGeneration()
+	if err != nil {
+		return nil, err
+	}
+	index, err := CommitIndex(s.root, maxVisible)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LineageEntry, 0)
+	cursor := base
+	seen := make(map[model.Hash32]bool)
+	for {
+		if seen[cursor] {
+			return nil, werr.Newf(werr.Corrupt, "commit parent chain contains a cycle")
+		}
+		seen[cursor] = true
+		loaded, ok := index[cursor]
+		if !ok {
+			return nil, werr.Newf(werr.NotFound, "commit is not present on the store's parent chain")
+		}
+		out = append(out, LineageEntry{
+			Commit: cursor, Generation: loaded.Generation, TimestampNS: loaded.Commit.TimestampNS,
+		})
+		if loaded.Commit.Parent == nil {
+			break
+		}
+		cursor = *loaded.Commit.Parent
+	}
+	return out, nil
+}
+
+// CommitAtOrBefore returns the newest commit in base's lineage whose timestamp
+// is <= atNS. Ties on timestamp break toward the higher generation. A nil
+// result means the requested time predates the lineage; callers must fail
+// closed rather than substitute a different state.
+func (s *Store) CommitAtOrBefore(base model.Hash32, atNS int64) (*LineageEntry, error) {
+	lineage, err := s.CommitLineage(base)
+	if err != nil {
+		return nil, err
+	}
+	var best *LineageEntry
+	for i := range lineage {
+		entry := lineage[i]
+		if entry.TimestampNS > atNS {
+			continue
+		}
+		if best == nil || entry.TimestampNS > best.TimestampNS ||
+			(entry.TimestampNS == best.TimestampNS && entry.Generation > best.Generation) {
+			copy := entry
+			best = &copy
+		}
+	}
+	return best, nil
 }
 
 // ---- reads ---------------------------------------------------------------

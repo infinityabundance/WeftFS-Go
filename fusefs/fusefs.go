@@ -34,6 +34,18 @@ type Options struct {
 	Debug      bool
 	// Capability optionally narrows exact-id and saved-context views.
 	Capability *auth.Capability
+	// Context makes the mount root a resolved Context Root's result set.
+	Context *ContextMount
+}
+
+// ContextMount is a resolved Context Root used as the mount root.
+type ContextMount struct {
+	Name          string
+	ContextRootID model.Hash32
+	Snapshot      model.Hash32
+	SelectorID    model.Hash32
+	// Results are the ordered, capability-authorized result ids.
+	Results []model.Hash32
 }
 
 // Server owns the mount state and serializes access to the store. All node
@@ -159,6 +171,7 @@ type nodeKind int
 
 const (
 	kindObject nodeKind = iota
+	kindContextRoot
 	kindWeftRoot
 	kindWeftIDs
 	kindWeftContexts
@@ -184,6 +197,8 @@ func (s *Server) newNode(kind nodeKind, id model.Hash32, contextName string) *no
 
 func (n *node) stable() fs.StableAttr {
 	switch n.kind {
+	case kindContextRoot:
+		return fs.StableAttr{Mode: syscall.S_IFDIR, Ino: rootIno}
 	case kindWeftRoot, kindWeftIDs, kindWeftContexts, kindWeftContextDir:
 		return fs.StableAttr{Mode: syscall.S_IFDIR, Ino: n.srv.virtualIno(n)}
 	case kindObject, kindWeftID, kindWeftContextResult:
@@ -194,6 +209,8 @@ func (n *node) stable() fs.StableAttr {
 
 func (s *Server) virtualIno(n *node) uint64 {
 	switch n.kind {
+	case kindContextRoot:
+		return rootIno
 	case kindWeftRoot:
 		return weftIno
 	case kindWeftIDs:
@@ -252,16 +269,25 @@ func (s *Server) viewSnapshot() model.Hash32 {
 // Mount mounts the store. The caller owns the store and must keep it open.
 func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
 	s := &Server{store: st, opts: opts, inodes: newInodeTable()}
-	if opts.Snapshot != nil {
-		pinned, err := st.StateAt(*opts.Snapshot)
+	if opts.Context != nil {
+		if opts.Snapshot == nil {
+			snapshot := opts.Context.Snapshot
+			s.opts.Snapshot = &snapshot
+		}
+	}
+	if s.opts.Snapshot != nil {
+		pinned, err := st.StateAt(*s.opts.Snapshot)
 		if err != nil {
 			return nil, nil, err
 		}
 		s.state = pinned
 		s.pinned = true
 	}
-	s.readOnly = opts.ReadOnly || opts.Snapshot != nil || st.Mode() == store.ReadOnly
+	s.readOnly = opts.ReadOnly || s.opts.Snapshot != nil || opts.Context != nil || st.Mode() == store.ReadOnly
 	s.root = &node{srv: s, kind: kindObject, id: model.RootID}
+	if opts.Context != nil {
+		s.root = &node{srv: s, kind: kindContextRoot, context: opts.Context.Name}
+	}
 
 	mountOptions := fuse.MountOptions{
 		AllowOther: opts.AllowOther,

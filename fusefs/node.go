@@ -114,11 +114,30 @@ func (n *node) recordLocked() (model.ObjectRecord, error) {
 
 func (n *node) isVirtual() bool {
 	switch n.kind {
-	case kindWeftRoot, kindWeftIDs, kindWeftContexts, kindWeftContextDir:
+	case kindContextRoot, kindWeftRoot, kindWeftIDs, kindWeftContexts, kindWeftContextDir:
 		return true
 	default:
 		return false
 	}
+}
+
+// contextEntries names the context mount's authorized results. The same
+// helper feeds readdir and lookup, so they cannot disagree.
+func (s *Server) contextEntries(state *model.State, principal auth.Principal) []struct {
+	Name []byte
+	ID   model.Hash32
+} {
+	if s.opts.Context == nil {
+		return nil
+	}
+	ids := make([]model.Hash32, 0, len(s.opts.Context.Results))
+	for _, id := range s.opts.Context.Results {
+		record, ok := state.Objects[id]
+		if ok && auth.CanRead(record, principal) {
+			ids = append(ids, id)
+		}
+	}
+	return contextEntryNames(ids, state)
 }
 
 func (n *node) isDirectory() bool {
@@ -192,6 +211,24 @@ func (n *node) listLocked(principal auth.Principal) ([]dirItem, error) {
 		if n.id == model.RootID {
 			items = append(items, dirItem{name: []byte(".weft"), ino: weftIno, mode: syscall.S_IFDIR})
 		}
+	case kindContextRoot:
+		if n.srv.opts.Context == nil {
+			return nil, werr.Newf(werr.Corrupt, "context mount has no context root")
+		}
+		for _, named := range n.srv.contextEntries(state, principal) {
+			record, ok := state.Objects[named.ID]
+			if !ok {
+				return nil, werr.Newf(werr.Corrupt, "selector result has no object record")
+			}
+			items = append(items, dirItem{
+				name: named.Name,
+				ino:  n.srv.inodes.contextNodeIno(n.srv.opts.Context.Name, named.ID),
+				mode: modeFor(record),
+			})
+		}
+		// Constant name: the exact-id surface stays reachable and never changes
+		// the result listing.
+		items = append(items, dirItem{name: []byte(".weft"), ino: weftIno, mode: syscall.S_IFDIR})
 	case kindWeftRoot:
 		items = append(items,
 			dirItem{name: []byte("contexts"), ino: weftCtxIno, mode: syscall.S_IFDIR},
@@ -332,6 +369,26 @@ func (n *node) lookupLocked(name string, principal auth.Principal, out *fuse.Ent
 		child := n.srv.newNode(kindObject, target, "")
 		fillAttr(&out.Attr, record, state.NLink(target), n.srv.inodes.objectIno(target))
 		return child, nil
+	case kindContextRoot:
+		if name == ".weft" {
+			child := n.srv.newNode(kindWeftRoot, model.Hash32{}, "")
+			child.virtualDirAttr(&out.Attr, weftIno)
+			return child, nil
+		}
+		for _, named := range n.srv.contextEntries(state, principal) {
+			if string(named.Name) != name {
+				continue
+			}
+			record, ok := state.Objects[named.ID]
+			if !ok || !auth.CanRead(record, principal) {
+				return nil, werr.Newf(werr.NotFound, "no such context entry")
+			}
+			child := n.srv.newNode(kindWeftContextResult, named.ID, n.srv.opts.Context.Name)
+			fillAttr(&out.Attr, record, state.NLink(named.ID),
+				n.srv.inodes.contextNodeIno(n.srv.opts.Context.Name, named.ID))
+			return child, nil
+		}
+		return nil, werr.Newf(werr.NotFound, "no such context entry")
 	case kindWeftRoot:
 		switch name {
 		case "id":

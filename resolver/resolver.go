@@ -16,6 +16,7 @@ package resolver
 import (
 	"bytes"
 	"sort"
+	"strings"
 
 	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
@@ -248,7 +249,22 @@ func RequireOne(sel *selector.Selector, snapshotID model.Hash32, state *model.St
 		}
 		return again.Results[0], nil
 	default:
-		return ResolvedRef{}, werr.Newf(werr.Ambiguous, "selector matched %d authorized objects; require_one needs exactly 1", resolution.MatchedCount)
+		// List every authorized id from the complete, unpaged evaluation. The
+		// ambiguity class is only actionable if the caller sees the competing set.
+		unpaged := *sel
+		unpaged.Offset = nil
+		unpaged.Limit = nil
+		complete, err := ResolveState(&unpaged, snapshotID, state, principal, lim)
+		if err != nil {
+			return ResolvedRef{}, err
+		}
+		ids := make([]string, 0, len(complete.Results))
+		for _, result := range complete.Results {
+			ids = append(ids, result.ObjectID.Hex())
+		}
+		return ResolvedRef{}, werr.Newf(werr.Ambiguous,
+			"selector matched %d authorized objects; require_one needs exactly 1 (object_ids: %s)",
+			resolution.MatchedCount, strings.Join(ids, ","))
 	}
 }
 

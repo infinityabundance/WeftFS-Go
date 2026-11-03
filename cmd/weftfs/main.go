@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
@@ -1456,6 +1457,8 @@ func cmdMount(args []string, storeDir string) error {
 	fs := flag.NewFlagSet("mount", flag.ContinueOnError)
 	mountpoint := fs.String("mountpoint", "", "existing directory to mount on")
 	snapshot := fs.String("snapshot", "", "mount a named snapshot or commit hex read-only")
+	contextName := fs.String("context", "", "mount a Context Root's result set as the read-only root")
+	at := fs.String("at", "", "mount the newest commit at or before this time (RFC 3339 or unix ns)")
 	readOnly := fs.Bool("read-only", false, "mount the current state read-only")
 	allowOther := fs.Bool("allow-other", false, "allow other users")
 	debug := fs.Bool("debug", false, "go-fuse debug logging")
@@ -1465,6 +1468,9 @@ func cmdMount(args []string, storeDir string) error {
 	}
 	if *mountpoint == "" {
 		return werr.Newf(werr.InvalidArgument, "--mountpoint is required")
+	}
+	if *contextName != "" && *at != "" {
+		return werr.Newf(werr.InvalidArgument, "--context pins its own snapshot; --at cannot be combined with it")
 	}
 	if err := requireStore(storeDir); err != nil {
 		return err
@@ -1478,7 +1484,7 @@ func cmdMount(args []string, storeDir string) error {
 		capability = loaded
 	}
 	mode := store.ReadWrite
-	if *readOnly || *snapshot != "" || capability != nil {
+	if *readOnly || *snapshot != "" || *contextName != "" || *at != "" || capability != nil {
 		mode = store.ReadOnly
 	}
 	s, err := store.Open(storeDir, mode)
@@ -1490,7 +1496,46 @@ func cmdMount(args []string, storeDir string) error {
 		Mountpoint: *mountpoint, ReadOnly: *readOnly || capability != nil, AllowOther: *allowOther, Debug: *debug,
 		Capability: capability,
 	}
-	if *snapshot != "" {
+	switch {
+	case *contextName != "":
+		resolved, err := s.ResolveContext(*contextName, capability, auth.Root(), limits.Default(), s.ClockNowNS())
+		if err != nil {
+			return err
+		}
+		results := make([]model.Hash32, 0, len(resolved.Resolution.Results))
+		for _, result := range resolved.Resolution.Results {
+			results = append(results, result.ObjectID)
+		}
+		snapshotID := resolved.Stored.Root.Snapshot
+		opts.Snapshot = &snapshotID
+		opts.Context = &fusefs.ContextMount{
+			Name:          resolved.Stored.Name,
+			ContextRootID: resolved.Stored.ContextRootID,
+			Snapshot:      snapshotID,
+			SelectorID:    resolved.Resolution.SelectorID,
+			Results:       results,
+		}
+	case *at != "":
+		atNS, err := parseAtNS(*at)
+		if err != nil {
+			return err
+		}
+		base := s.Head()
+		if *snapshot != "" {
+			base, err = s.LookupSnapshot(*snapshot)
+			if err != nil {
+				return err
+			}
+		}
+		selected, err := s.CommitAtOrBefore(base, atNS)
+		if err != nil {
+			return err
+		}
+		if selected == nil {
+			return werr.Newf(werr.NotFound, "no commit at or before %d ns in the mounted lineage", atNS)
+		}
+		opts.Snapshot = &selected.Commit
+	case *snapshot != "":
 		commit, err := s.LookupSnapshot(*snapshot)
 		if err != nil {
 			return err
@@ -1509,6 +1554,35 @@ func cmdMount(args []string, storeDir string) error {
 	}()
 	server.Wait()
 	return nil
+}
+
+// parseAtNS accepts unix nanoseconds or an RFC 3339 timestamp.
+func parseAtNS(text string) (int64, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0, werr.Newf(werr.InvalidArgument, "--at must not be empty")
+	}
+	digits := trimmed
+	negative := false
+	if strings.HasPrefix(digits, "-") {
+		negative = true
+		digits = digits[1:]
+	}
+	if digits != "" && strings.Trim(digits, "0123456789") == "" {
+		value, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil {
+			return 0, werr.Newf(werr.InvalidArgument, "--at unix nanoseconds are out of range")
+		}
+		if negative {
+			value = -value
+		}
+		return value, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil {
+		return 0, werr.Newf(werr.InvalidArgument, "--at must be unix nanoseconds or an RFC 3339 timestamp")
+	}
+	return parsed.UnixNano(), nil
 }
 
 func parseHashList(text string, what string) ([]model.Hash32, error) {
@@ -1863,6 +1937,7 @@ func cmdContext(args []string, storeDir string, jsonOut bool) error {
 		uid := fs.Uint64("uid", uint64(os.Getuid()), "principal uid")
 		gid := fs.Uint64("gid", uint64(os.Getgid()), "principal gid")
 		groups := fs.String("groups", "", "comma-separated supplementary groups")
+		requireOne := fs.Bool("require-one", false, "fail with Ambiguous unless exactly one object matches")
 		if err := parseFlags(fs, args[1:]); err != nil {
 			return err
 		}
@@ -1882,6 +1957,21 @@ func cmdContext(args []string, storeDir string, jsonOut bool) error {
 			}
 		}
 		principal := auth.New(*uid, *gid, parseGroups(*groups))
+		if *requireOne {
+			resolved, err := s.ResolveContext(fs.Arg(0), capability, principal, limits.Default(), s.ClockNowNS())
+			if err != nil {
+				return err
+			}
+			if resolved.Resolution.MatchedCount != 1 {
+				ids := make([]string, 0, len(resolved.Resolution.Results))
+				for _, result := range resolved.Resolution.Results {
+					ids = append(ids, result.ObjectID.Hex())
+				}
+				return werr.Newf(werr.Ambiguous,
+					"context matched %d authorized objects; require_one needs exactly 1 (object_ids: %s)",
+					resolved.Resolution.MatchedCount, strings.Join(ids, ","))
+			}
+		}
 		report, err := s.MaterializeContext(fs.Arg(0), *out, capability, principal, limits.Default(), s.ClockNowNS())
 		if err != nil {
 			return err
