@@ -1,0 +1,15 @@
+.git
+.docker-cache
+**/target
+bench
+research
+docs
+spec
+scripts
+verification
+conformance
+WeftCodec
+adapters
+examples
+tests
+AGENTS.md
