@@ -358,7 +358,7 @@ func TestHandoffAlternatingGenerations(t *testing.T) {
 			t.Fatalf("go verify after rust round %d: ok=%v err=%v problems=%+v", round, report != nil && report.OK, err, reportProblems(report))
 		}
 		for _, note := range reader.RecoveryNotes() {
-			if strings.Contains(note, "checkpoint") {
+			if isIgnoredCheckpointNote(note) {
 				reader.Close()
 				t.Fatalf("go ignored a Rust checkpoint in round %d: %s", round, note)
 			}
@@ -399,6 +399,21 @@ func TestHandoffAlternatingGenerations(t *testing.T) {
 	}
 }
 
+// isIgnoredCheckpointNote reports a recovery note that means a checkpoint was
+// rejected or ignored. Rust's bounded replay legitimately emits "bounded replay
+// resumed from the checkpoint at generation N", which is resumption, not
+// rejection. Match the rejection phrasings instead of any mention of
+// "checkpoint" so that a benign note cannot fail this check and a genuine one
+// cannot slip through.
+func isIgnoredCheckpointNote(note string) bool {
+	if !strings.Contains(note, "checkpoint") {
+		return false
+	}
+	return strings.Contains(note, "is invalid") ||
+		strings.Contains(note, "ignored") ||
+		strings.Contains(note, "declares generation")
+}
+
 // Gate 5: checkpoint state manifests are understood in both directions.
 func TestHandoffCheckpointsBothWays(t *testing.T) {
 	bin := rustBinary(t)
@@ -430,7 +445,7 @@ func TestHandoffCheckpointsBothWays(t *testing.T) {
 		t.Fatalf("parse rust info: %v\n%s", err, info)
 	}
 	for _, note := range rustInfo.RecoveryNotes {
-		if strings.Contains(note, "checkpoint") {
+		if isIgnoredCheckpointNote(note) {
 			t.Fatalf("rust ignored the Go checkpoint: %s", note)
 		}
 	}
@@ -452,7 +467,7 @@ func TestHandoffCheckpointsBothWays(t *testing.T) {
 		t.Fatalf("go verify: ok=%v err=%v problems=%+v", report != nil && report.OK, err, reportProblems(report))
 	}
 	for _, note := range reader.RecoveryNotes() {
-		if strings.Contains(note, "checkpoint") {
+		if isIgnoredCheckpointNote(note) {
 			t.Fatalf("go ignored the Rust checkpoint: %s", note)
 		}
 	}
