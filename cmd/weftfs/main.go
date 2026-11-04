@@ -20,6 +20,7 @@ import (
 	weftcontext "github.com/infinityabundance/WeftCodec-Go/context"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
 	"github.com/infinityabundance/WeftCodec-Go/selector"
+	"github.com/infinityabundance/WeftCodec-Go/tensor"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
 
 	"github.com/infinityabundance/WeftFS-Go/auth"
@@ -55,7 +56,7 @@ func usage() {
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
-  context causal uri
+  context causal uri tensor
 `)
 }
 
@@ -209,6 +210,8 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdCausal(args, storeDir, jsonOut)
 	case "uri":
 		return cmdURI(args, storeDir, jsonOut)
+	case "tensor":
+		return cmdTensor(args, storeDir, jsonOut)
 	default:
 		return werr.Newf(werr.InvalidArgument, "unknown command `%s`", command)
 	}
@@ -450,22 +453,24 @@ func cmdWrite(args []string, storeDir string) error {
 	text := fs.String("text", "", "bytes to write")
 	file := fs.String("file", "", "read bytes from a file")
 	causal := fs.String("causal", "", "comma-separated causal parent ids")
+	tensorFlag := fs.Bool("tensor", false, "treat the input as a logical tensor (creates a new file)")
+	dtype := fs.String("dtype", "", "tensor dtype (bf16, f32, q8_0, ...)")
+	shapeText := fs.String("shape", "", "comma-separated tensor dimensions")
+	layoutName := fs.String("layout", "row-major", "row-major, column-major, blocked, or sharded")
+	blockShape := fs.String("block-shape", "", "blocked layout block shape")
+	shardAxis := fs.Uint("shard-axis", 0, "sharded layout axis")
+	shards := fs.Uint("shards", 1, "sharded layout shard count")
+	shardIndex := fs.Uint("shard-index", 0, "sharded layout shard index")
+	strategyText := fs.String("strategy", "auto", "auto, or a required tensor strategy")
+	lambdaNS := fs.Uint64("lambda-ns", 0, "bytes charged per estimated decode nanosecond")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
 		return werr.Newf(werr.InvalidArgument, "write requires exactly one path")
 	}
-	s, err := openStore(storeDir, store.ReadWrite)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	id, err := resolveObject(s, fs.Arg(0))
-	if err != nil {
-		return err
-	}
 	var data []byte
+	var err error
 	if *file != "" {
 		data, err = os.ReadFile(*file)
 		if err != nil {
@@ -475,6 +480,49 @@ func cmdWrite(args []string, storeDir string) error {
 		data = []byte(*text)
 	}
 	causalIDs, err := parseCausalEntries(*causal)
+	if err != nil {
+		return err
+	}
+	s, err := openStore(storeDir, store.ReadWrite)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if *tensorFlag {
+		if *dtype == "" {
+			return werr.Newf(werr.InvalidArgument, "--tensor requires --dtype")
+		}
+		if *shapeText == "" {
+			return werr.Newf(werr.InvalidArgument, "--tensor requires --shape")
+		}
+		shape, err := parseU64List(*shapeText, "--shape")
+		if err != nil {
+			return err
+		}
+		layout, err := parseTensorLayout(*layoutName, *blockShape, uint32(*shardAxis), uint32(*shards), uint32(*shardIndex))
+		if err != nil {
+			return err
+		}
+		hint, err := store.ParseTensorStrategyHint(*strategyText)
+		if err != nil {
+			return err
+		}
+		parent, name, err := parentAndName(s, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		id, err := s.WriteTensorFileWithSpec(parent, name, *dtype, shape, data, layout, store.TensorWriteSpec{
+			StrategyHint: hint,
+			Causal:       causalIDs,
+			Plan:         store.TensorPlanOptions{LambdaNS: *lambdaNS},
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Println(id.Hex())
+		return nil
+	}
+	id, err := resolveObject(s, fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -490,6 +538,7 @@ func cmdCat(args []string, storeDir string) error {
 	fs := flag.NewFlagSet("cat", flag.ContinueOnError)
 	offset := fs.Uint64("offset", 0, "byte offset")
 	length := fs.Uint64("len", 0, "byte length (0 means to EOF)")
+	regionText := fs.String("region", "", "logical tensor region s0,s1:e0,e1")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -506,7 +555,17 @@ func cmdCat(args []string, storeDir string) error {
 		return err
 	}
 	var data []byte
-	if *length == 0 {
+	if *regionText != "" {
+		region, err := parseRegion(*regionText)
+		if err != nil {
+			return err
+		}
+		read, err := s.ReadTensorRegion(id, region)
+		if err != nil {
+			return err
+		}
+		data = read.Bytes
+	} else if *length == 0 {
 		data, err = s.ReadObject(id)
 	} else {
 		data, err = s.ReadRange(id, *offset, *length)
@@ -516,6 +575,128 @@ func cmdCat(args []string, storeDir string) error {
 	}
 	_, err = os.Stdout.Write(data)
 	return err
+}
+
+// cmdTensor exposes tensor identity: `tensor logical-root PATH` or
+// `tensor meta PATH`.
+func cmdTensor(args []string, storeDir string, jsonOut bool) error {
+	if len(args) < 1 {
+		return werr.Newf(werr.InvalidArgument,
+			"tensor requires `logical-root` or `meta` and a path")
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("tensor "+action, flag.ContinueOnError)
+	if err := parseFlags(fs, args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return werr.Newf(werr.InvalidArgument, "tensor %s requires exactly one path", action)
+	}
+	s, err := openStore(storeDir, store.ReadOnly)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	id, err := resolveObject(s, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	switch action {
+	case "logical-root":
+		root, err := s.TensorLogicalRoot(id)
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{"object_id": id.Hex(), "logical_root": root.Hex()})
+		}
+		fmt.Println(root.Hex())
+		return nil
+	case "meta":
+		meta, err := s.TensorMetadata(id)
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{
+				"object_id":    id.Hex(),
+				"dtype":        meta.Dtype,
+				"shape":        meta.Shape,
+				"layout":       meta.Layout.Name(),
+				"logical_root": meta.LogicalRoot.Hex(),
+				"strategy":     meta.Strategy,
+			})
+		}
+		fmt.Printf("dtype=%s\nshape=%v\nlayout=%s\nlogical_root=%s\nstrategy=%s\n",
+			meta.Dtype, meta.Shape, meta.Layout.Name(), meta.LogicalRoot.Hex(), meta.Strategy)
+		return nil
+	default:
+		return werr.Newf(werr.InvalidArgument,
+			"unknown tensor action `%s` (expected logical-root or meta)", action)
+	}
+}
+
+func parseU64List(text, flagName string) ([]uint64, error) {
+	parts := strings.Split(text, ",")
+	out := make([]uint64, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, werr.Newf(werr.InvalidArgument, "%s has an empty component", flagName)
+		}
+		value, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return nil, werr.Newf(werr.InvalidArgument,
+				"%s component `%s` is not a u64", flagName, part)
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
+func parseTensorLayout(name, blockShape string, axis, shards, index uint32) (store.TensorLayoutSpec, error) {
+	switch name {
+	case "row-major":
+		return store.RowMajorTensorLayout(), nil
+	case "column-major":
+		return store.ColumnMajorTensorLayout(), nil
+	case "blocked":
+		if blockShape == "" {
+			return store.TensorLayoutSpec{},
+				werr.Newf(werr.InvalidArgument, "--layout blocked requires --block-shape")
+		}
+		block, err := parseU64List(blockShape, "--block-shape")
+		if err != nil {
+			return store.TensorLayoutSpec{}, err
+		}
+		return store.BlockedTensorLayout(block), nil
+	case "sharded":
+		return store.ShardedTensorLayout(axis, shards, index), nil
+	default:
+		return store.TensorLayoutSpec{}, werr.Newf(werr.InvalidArgument,
+			"--layout must be row-major, column-major, blocked, or sharded (got `%s`)", name)
+	}
+}
+
+func parseRegion(text string) (tensor.Region, error) {
+	startText, endText, ok := strings.Cut(text, ":")
+	if !ok {
+		return tensor.Region{}, werr.Newf(werr.InvalidArgument,
+			"--region must be `s0,s1:e0,e1`")
+	}
+	start, err := parseU64List(startText, "--region start")
+	if err != nil {
+		return tensor.Region{}, err
+	}
+	end, err := parseU64List(endText, "--region end")
+	if err != nil {
+		return tensor.Region{}, err
+	}
+	if len(start) != len(end) {
+		return tensor.Region{}, werr.Newf(werr.InvalidArgument,
+			"--region start and end ranks differ")
+	}
+	return tensor.NewRegion(start, end), nil
 }
 
 func cmdLs(args []string, storeDir string) error {

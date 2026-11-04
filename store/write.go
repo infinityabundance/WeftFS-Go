@@ -172,10 +172,10 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 		if err != nil {
 			return model.Hash32{}, err
 		}
-		attrs = model.CloneAttrs(old.Attrs)
+		attrs = stripTensorAttrs(model.CloneAttrs(old.Attrs))
 	} else {
 		var closure *weftcontext.CausalClosure
-		attrs, identityMode, causalHash, closure, err = s.prepareCausal(old.Attrs, causal)
+		attrs, identityMode, causalHash, closure, err = s.prepareCausal(stripTensorAttrs(old.Attrs), causal)
 		if err != nil {
 			return model.Hash32{}, err
 		}
@@ -253,6 +253,8 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	record.MtimeNS = mtime
 	record.Content = manifestID
 	record.Size = size
+	// A byte rewrite is not the tensor the reserved attributes describe.
+	record.Attrs = stripTensorAttrs(record.Attrs)
 	ops := []model.Op{
 		model.PutObjectOp{Record: record},
 		model.SetTipOp{Object: id, Version: version},
@@ -288,6 +290,8 @@ func (s *Store) commitFileBuffer(id model.Hash32, old model.ObjectRecord, buffer
 	record.MtimeNS = mtime
 	record.Content = manifestID
 	record.Size = size
+	// A byte rewrite is not the tensor the reserved attributes describe.
+	record.Attrs = stripTensorAttrs(record.Attrs)
 	ops := []model.Op{
 		model.PutObjectOp{Record: record},
 		model.SetTipOp{Object: id, Version: version},

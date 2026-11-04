@@ -322,16 +322,19 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		if manifest.Size != record.Size {
 			report.problem(string(werr.Corrupt), "object "+id.Hex()+" size disagrees with manifest")
 		}
-		if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationCodec {
+		if manifest.Representation != nil &&
+			(manifest.Representation.Kind == model.RepresentationCodec ||
+				manifest.Representation.Kind == model.RepresentationTensor) {
 			if full {
 				frame := "<none>"
 				if manifest.Representation.Frame != nil {
 					frame = manifest.Representation.Frame.Hex()
 				}
+				kind := manifest.Representation.Kind
 				contentRoot := record.Content
 				if _, err := readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
 					report.problem(string(werr.ClassOf(err)),
-						"codec representation for object "+id.Hex()+" manifest "+record.Content.Hex()+" frame "+frame+": "+err.Error())
+						string(kind)+" representation for object "+id.Hex()+" manifest "+record.Content.Hex()+" frame "+frame+": "+err.Error())
 				} else {
 					report.CheckedRepresentations++
 				}

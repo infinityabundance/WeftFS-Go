@@ -109,6 +109,9 @@ const (
 	RepresentationRaw RepresentationKind = "raw"
 	// RepresentationCodec means a WFT1 frame decodes to the content.
 	RepresentationCodec RepresentationKind = "codec"
+	// RepresentationTensor means a WeftTensor frame (modes 10-14) decodes to
+	// the content. It is additive within v2; raw and codec are unchanged.
+	RepresentationTensor RepresentationKind = "tensor"
 )
 
 // Representation strategies carried by a v2 manifest. The strategy is
@@ -119,6 +122,13 @@ const (
 	StrategyZstd      = "zstd"
 	StrategyDelta     = "delta"
 	StrategyReference = "reference"
+	// Tensor strategies; the spelling is fixed by the tensor mode (WEFT-MODEL
+	// §2.3.1).
+	StrategyTensorSharded = "tensor-sharded"
+	StrategyWeightDelta   = "weight-delta"
+	StrategyKvCache       = "kv-cache"
+	StrategyActivation    = "activation"
+	StrategySemanticDelta = "semantic-delta"
 )
 
 // Representation is the canonical WCB `representation` map of a
@@ -133,12 +143,17 @@ type Representation struct {
 	Dependencies []Hash32
 	Strategy     string
 	DecodedSize  uint64
+	// Tensor is non-nil exactly when Kind is RepresentationTensor.
+	Tensor *TensorRepresentation
 }
 
 var representationKeys = []string{"kind", "frame", "dependencies", "strategy", "decoded_size"}
 
 // ToWCB returns the canonical representation map.
 func (r Representation) ToWCB() wcb.Value {
+	if r.Kind == RepresentationTensor {
+		return tensorRepresentationToWCB(r)
+	}
 	dependencies := make([]wcb.Value, 0, len(r.Dependencies))
 	for _, dependency := range r.Dependencies {
 		dependencies = append(dependencies, HashValue(dependency))
@@ -159,16 +174,19 @@ func RepresentationFromWCB(v wcb.Value) (Representation, error) {
 	if err != nil {
 		return representation, err
 	}
-	if err := CheckKeys(m, representationKeys...); err != nil {
-		return representation, err
-	}
 	kindText, err := GetText(m, "kind")
 	if err != nil {
 		return representation, err
 	}
 	kind := RepresentationKind(kindText)
+	if kind == RepresentationTensor {
+		return tensorRepresentationFromWCB(m)
+	}
 	if kind != RepresentationRaw && kind != RepresentationCodec {
 		return representation, werr.Newf(werr.Malformed, "unknown representation kind `%s`", kindText)
+	}
+	if err := CheckKeys(m, representationKeys...); err != nil {
+		return representation, err
 	}
 	frame, err := GetOptHash(m, "frame")
 	if err != nil {
@@ -348,8 +366,11 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 		}
 		representation = &parsed
 	}
-	codec := representation != nil && representation.Kind == RepresentationCodec
-	if !codec {
+	// A codec or tensor representation carries bytes only inside its frame and
+	// lists no chunk references; raw (and v1) manifests list them.
+	representationBacked := representation != nil &&
+		(representation.Kind == RepresentationCodec || representation.Kind == RepresentationTensor)
+	if !representationBacked {
 		// Every non-final chunk must be full (checked below), so the chunk
 		// count is fixed by size/chunk_size. Reject an over-bound declaration
 		// before any per-chunk work happens.
@@ -368,8 +389,8 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 	if uint64(len(items)) > MaxChunksPerFile {
 		return Manifest{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", MaxChunksPerFile)
 	}
-	if codec && len(items) != 0 {
-		return Manifest{}, werr.Newf(werr.Corrupt, "codec manifest must not list chunk references")
+	if representationBacked && len(items) != 0 {
+		return Manifest{}, werr.Newf(werr.Corrupt, "%s manifest must not list chunk references", representation.Kind)
 	}
 	chunks := make([]ChunkRef, 0, len(items))
 	var total uint64
@@ -402,7 +423,7 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 		}
 		chunks = append(chunks, ChunkRef{Hash: hash, Len: length})
 	}
-	if !codec {
+	if !representationBacked {
 		if total != size {
 			return Manifest{}, werr.Newf(werr.Corrupt, "manifest chunk lengths sum to %d, declared size is %d", total, size)
 		}

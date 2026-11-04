@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -72,6 +73,77 @@ func captureStdout(t *testing.T, fn func() error) string {
 		t.Fatalf("read captured stdout: %v", readErr)
 	}
 	return string(output)
+}
+
+func cliSmoothBf16(elements int) []byte {
+	out := make([]byte, 0, elements*2)
+	state := uint64(0x11)
+	for index := 0; index < elements; index++ {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		low := (uint16(index) * 37) & 0x3ff
+		word := uint16(0x3f00|low) ^ (uint16(state) & 0x3f)
+		out = append(out, byte(word), byte(word>>8))
+	}
+	return out
+}
+
+func TestTensorCLIWriteLogicalRootAndRegion(t *testing.T) {
+	resetRepresentationPolicy(t)
+	representationMode = store.RepresentationModeCodecAuto
+	dir := t.TempDir()
+	if err := run("init", nil, dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	payload := cliSmoothBf16(64)
+	payloadPath := t.TempDir() + "/tensor.bin"
+	if err := os.WriteFile(payloadPath, payload, 0o644); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if err := run("write", []string{"/t.bin", "--tensor", "--dtype", "bf16",
+		"--shape", "8,8", "--file", payloadPath}, dir, false); err != nil {
+		t.Fatalf("write --tensor: %v", err)
+	}
+
+	s, err := store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	id, err := s.ResolvePath("/t.bin")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	root, err := s.TensorLogicalRoot(id)
+	if err != nil {
+		t.Fatalf("logical root: %v", err)
+	}
+	_ = s.Close()
+
+	output := captureStdout(t, func() error {
+		return run("tensor", []string{"logical-root", "/t.bin"}, dir, false)
+	})
+	if output != root.Hex()+"\n" {
+		t.Fatalf("tensor logical-root output = %q, want %q", output, root.Hex())
+	}
+
+	metaOutput := captureStdout(t, func() error {
+		return run("tensor", []string{"meta", "/t.bin"}, dir, true)
+	})
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(metaOutput), &meta); err != nil {
+		t.Fatalf("tensor meta JSON: %v\n%s", err, metaOutput)
+	}
+	if meta["dtype"] != "bf16" || meta["logical_root"] != root.Hex() {
+		t.Fatalf("tensor meta = %+v", meta)
+	}
+
+	region := captureStdout(t, func() error {
+		return run("cat", []string{"/t.bin", "--region", "0,0:2,8"}, dir, false)
+	})
+	if !bytes.Equal([]byte(region), payload[:2*8*2]) {
+		t.Fatal("cat --region returned the wrong bytes")
+	}
 }
 
 func TestInfoJSONReportsRepresentationPolicy(t *testing.T) {

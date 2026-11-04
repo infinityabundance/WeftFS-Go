@@ -368,7 +368,8 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 			"cannot read manifest "+manifestID.Hex()+": "+err.Error())
 		return nil
 	}
-	if rep := manifest.Representation; rep != nil && rep.Kind == model.RepresentationCodec {
+	if rep := manifest.Representation; rep != nil &&
+		(rep.Kind == model.RepresentationCodec || rep.Kind == model.RepresentationTensor) {
 		if rep.Frame != nil {
 			manifests[*rep.Frame] = struct{}{}
 		}

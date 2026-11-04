@@ -30,6 +30,9 @@ func readManifestRangeInner(root string, manifest model.Manifest, offset, length
 	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationCodec {
 		return readCodecRange(root, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
 	}
+	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationTensor {
+		return readTensorRange(root, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
+	}
 	return readRawRange(root, manifest, offset, length, verifyWhole)
 }
 
