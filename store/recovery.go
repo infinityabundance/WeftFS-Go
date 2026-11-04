@@ -341,62 +341,13 @@ func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
 	return out, nil
 }
 
-// ReadRange assembles a byte range from a manifest, verifying every chunk it
-// touches. When verifyWhole is true and the range is the whole file, the
-// whole-content hash is verified too.
+// ReadRange assembles a byte range from a manifest, verifying every chunk or
+// codec chunk it touches. When verifyWhole is true and the range is the whole
+// file, the whole-content hash is verified too. v1 and v2 `kind:"raw"`
+// manifests read through the chunk path; v2 `kind:"codec"` manifests decode
+// the named frame.
 func ReadRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
-	if manifest.Size > MaxFileBytes {
-		return nil, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the %d-byte v1 bound", manifest.Size, MaxFileBytes)
-	}
-	if offset >= manifest.Size {
-		return []byte{}, nil
-	}
-	end := offset + length
-	if end < offset || end > manifest.Size {
-		end = manifest.Size
-	}
-	capacity, err := checkedSize(end - offset)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, 0, capacity)
-	var cursor uint64
-	for _, chunk := range manifest.Chunks {
-		chunkStart := cursor
-		chunkEnd := cursor + chunk.Len
-		if chunkEnd < cursor {
-			return nil, werr.Newf(werr.Corrupt, "chunk offset overflow")
-		}
-		cursor = chunkEnd
-		if chunkEnd <= offset || chunkStart >= end {
-			continue
-		}
-		bytesValue, err := ReadBlobVerified(root, BlobObject, chunk.Hash, model.DomainChunk)
-		if err != nil {
-			return nil, err
-		}
-		if uint64(len(bytesValue)) != chunk.Len {
-			return nil, werr.Newf(werr.Corrupt, "chunk length disagrees with manifest")
-		}
-		localStart := uint64(0)
-		if offset > chunkStart {
-			localStart = offset - chunkStart
-		}
-		localEnd := end - chunkStart
-		if localEnd > chunk.Len {
-			localEnd = chunk.Len
-		}
-		out = append(out, bytesValue[localStart:localEnd]...)
-	}
-	if uint64(len(out)) != end-offset {
-		return nil, werr.Newf(werr.Corrupt, "assembled range length mismatch")
-	}
-	if verifyWhole && offset == 0 && end == manifest.Size {
-		if model.ContentHash(out) != manifest.ContentHash {
-			return nil, werr.Newf(werr.Corrupt, "whole-content hash mismatch")
-		}
-	}
-	return out, nil
+	return readManifestRange(root, nil, manifest, offset, length, verifyWhole)
 }
 
 // itoa formats a generation for recovery notes.

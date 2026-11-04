@@ -84,18 +84,31 @@ type Options struct {
 	// FixedTimestampNS overrides every generated mtime and commit timestamp
 	// (tests and the deterministic fixture). Nil uses the wall clock.
 	FixedTimestampNS *int64
+	// Representation selects the physical manifest policy for new content:
+	// `raw` (the frozen v1 writer, the default) or `codec-auto` (experimental
+	// v2 manifests).
+	Representation RepresentationMode
+	// CodecMinBytes leaves files smaller than this on the raw path under
+	// `codec-auto`.
+	CodecMinBytes uint64
+	// CodecDeltaMarginPercent is the margin by which a DELTA frame must beat
+	// the ZSTD frame to be selected. 0 disables the margin.
+	CodecDeltaMarginPercent uint8
 }
 
 // DefaultOptions returns the normative v1 defaults.
 func DefaultOptions() Options {
 	return Options{
-		OwnerUID:           0,
-		OwnerGID:           0,
-		ChunkSize:          model.DefaultChunkSize,
-		CheckpointInterval: DefaultCheckpointInterval,
-		GCGraceSecs:        DefaultGCGraceSecs,
-		GCIntervalSecs:     DefaultGCIntervalSecs,
-		GCWatchMaxDeletes:  DefaultGCWatchMaxDeletes,
+		OwnerUID:                0,
+		OwnerGID:                0,
+		ChunkSize:               model.DefaultChunkSize,
+		CheckpointInterval:      DefaultCheckpointInterval,
+		GCGraceSecs:             DefaultGCGraceSecs,
+		GCIntervalSecs:          DefaultGCIntervalSecs,
+		GCWatchMaxDeletes:       DefaultGCWatchMaxDeletes,
+		Representation:          RepresentationModeRaw,
+		CodecMinBytes:           DefaultCodecMinBytes,
+		CodecDeltaMarginPercent: DefaultCodecDeltaMarginPercent,
 	}
 }
 
@@ -187,8 +200,16 @@ func validateOptions(opts Options) error {
 	if opts.ChunkSize == 0 || opts.ChunkSize > model.MaxChunkSize {
 		return werr.Newf(werr.InvalidArgument, "chunk_size must be 1..=16 MiB")
 	}
+	switch opts.Representation {
+	case RepresentationModeRaw, RepresentationModeCodecAuto:
+	default:
+		return werr.Newf(werr.InvalidArgument, "representation must be `raw` or `codec-auto` (got `%s`)", opts.Representation)
+	}
 	if opts.CheckpointInterval > 1_000_000 {
 		return werr.Newf(werr.InvalidArgument, "checkpoint_interval must be at most 1,000,000")
+	}
+	if opts.CodecDeltaMarginPercent > 90 {
+		return werr.Newf(werr.InvalidArgument, "codec_delta_margin_percent must be at most 90")
 	}
 	if opts.GCBackground {
 		if opts.GCIntervalSecs == 0 || opts.GCIntervalSecs > 86400 {
@@ -752,7 +773,8 @@ func (s *Store) readObjectState(state *model.State, id model.Hash32) ([]byte, er
 		if manifest.Size != record.Size {
 			return nil, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 		}
-		return ReadRange(s.root, manifest, 0, manifest.Size, true)
+		contentRoot := record.Content
+		return readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true)
 	}
 }
 
@@ -772,7 +794,8 @@ func (s *Store) ReadRange(id model.Hash32, offset, length uint64) ([]byte, error
 	if manifest.Size != record.Size {
 		return nil, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 	}
-	return ReadRange(s.root, manifest, offset, length, false)
+	contentRoot := record.Content
+	return readManifestRange(s.root, &contentRoot, manifest, offset, length, false)
 }
 
 // ReadContent reads a byte range directly from a content root (manifest id).
@@ -784,7 +807,7 @@ func (s *Store) ReadContent(contentRoot model.Hash32, offset, length uint64) ([]
 		return nil, err
 	}
 	whole := offset == 0 && length >= manifest.Size
-	return ReadRange(s.root, manifest, offset, length, whole)
+	return readManifestRange(s.root, &contentRoot, manifest, offset, length, whole)
 }
 
 // NLink returns the POSIX link count for an object.
@@ -1106,6 +1129,15 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 }
 
 func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentHash model.Hash32, size uint64, err error) {
+	return s.storeFileContentWithBase(data, nil)
+}
+
+// storeFileContentWithBase stores a complete buffer. With `codec-auto` and a
+// buffer at or above CodecMinBytes it may write a v2 codec representation; a
+// frame that is not smaller than the plaintext (or cannot be produced) falls
+// back to a v2 `kind:"raw"` manifest. The raw policy writes the frozen v1
+// manifest byte for byte.
+func (s *Store) storeFileContentWithBase(data []byte, base *deltaBase) (manifestID model.Hash32, contentHash model.Hash32, size uint64, err error) {
 	size = uint64(len(data))
 	if size > MaxFileBytes {
 		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
@@ -1115,6 +1147,45 @@ func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentH
 		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
 	}
 	contentHash = model.ContentHash(data)
+	codecAuto := s.options.Representation == RepresentationModeCodecAuto
+
+	if codecAuto && size >= s.options.CodecMinBytes {
+		representation, frameBytes, err := s.tryCodecRepresentation(data, chunkSize, base)
+		if err != nil {
+			return model.Hash32{}, model.Hash32{}, 0, err
+		}
+		if representation != nil {
+			frameID, err := s.storeBlob(BlobManifest, model.DomainManifest, frameBytes)
+			if err != nil {
+				return model.Hash32{}, model.Hash32{}, 0, err
+			}
+			representation.Frame = &frameID
+			manifest := model.Manifest{
+				Size: size, ChunkSize: chunkSize, ContentHash: contentHash,
+				Representation: representation,
+			}
+			return s.storeManifest(manifest)
+		}
+	}
+
+	manifest, err := s.buildRawManifest(data, chunkSize, contentHash)
+	if err != nil {
+		return model.Hash32{}, model.Hash32{}, 0, err
+	}
+	if codecAuto {
+		// CodecAuto always writes v2, even when it falls back to the raw chunk
+		// layout.
+		manifest.Representation = &model.Representation{
+			Kind: model.RepresentationRaw, Frame: nil, Dependencies: nil,
+			Strategy: model.StrategyRaw, DecodedSize: size,
+		}
+	}
+	return s.storeManifest(manifest)
+}
+
+// buildRawManifest writes the chunk blobs for a raw layout and returns a
+// v1-shaped manifest value (no representation).
+func (s *Store) buildRawManifest(data []byte, chunkSize uint64, contentHash model.Hash32) (model.Manifest, error) {
 	chunks := make([]model.ChunkRef, 0)
 	step := int(chunkSize)
 	for start := 0; start < len(data); start += step {
@@ -1124,15 +1195,20 @@ func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentH
 		}
 		chunk := data[start:end]
 		if uint64(len(chunks)) >= model.MaxChunksPerFile {
-			return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+			return model.Manifest{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
 		}
 		hash, err := s.storeBlob(BlobObject, model.DomainChunk, chunk)
 		if err != nil {
-			return model.Hash32{}, model.Hash32{}, 0, err
+			return model.Manifest{}, err
 		}
 		chunks = append(chunks, model.ChunkRef{Hash: hash, Len: uint64(len(chunk))})
 	}
-	manifest := model.Manifest{Size: size, ChunkSize: chunkSize, Chunks: chunks, ContentHash: contentHash}
+	return model.Manifest{Size: uint64(len(data)), ChunkSize: chunkSize, Chunks: chunks, ContentHash: contentHash}, nil
+}
+
+func (s *Store) storeManifest(manifest model.Manifest) (model.Hash32, model.Hash32, uint64, error) {
+	size := manifest.Size
+	contentHash := manifest.ContentHash
 	wcbBytes, err := manifest.Encode()
 	if err != nil {
 		return model.Hash32{}, model.Hash32{}, 0, err
@@ -1140,7 +1216,7 @@ func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentH
 	if uint64(len(wcbBytes)) > model.MaxChunkSize*64 {
 		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "manifest encoding is implausibly large")
 	}
-	manifestID, err = s.storeBlob(BlobManifest, model.DomainManifest, wcbBytes)
+	manifestID, err := s.storeBlob(BlobManifest, model.DomainManifest, wcbBytes)
 	if err != nil {
 		return model.Hash32{}, model.Hash32{}, 0, err
 	}

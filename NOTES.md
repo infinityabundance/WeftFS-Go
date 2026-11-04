@@ -46,6 +46,10 @@ Revisions recorded for this work:
   verified on full-range reads. A 1 TiB decoder bound (`MaxFileBytes`, matching
   Rust `MAX_FILE_BYTES`) and a 16,777,216-chunk manifest bound (`MaxChunksPerFile`,
   matching Rust `MAX_CHUNKS_PER_FILE`) fail closed before a larger allocation.
+- `weft.manifest.v2` representation parity with Rust is implemented and
+  cross-language tested: the Go store reads and verifies Rust `codec-auto`
+  stores (ZSTD, DELTA with a causal base, v2 raw fallback) and Rust reads and
+  verifies Go `codec-auto` stores; frames are not claimed byte-identical.
 - `verify --full` recomputes commit, checkpoint, manifest, chunk, and
   whole-content identities and reports generation, counts, rejected
   generations, and problems.

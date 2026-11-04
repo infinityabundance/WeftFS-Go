@@ -49,7 +49,8 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] <command> [args]
+	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto]
+              [--codec-min-bytes N] <command> [args]
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
@@ -68,8 +69,21 @@ func fail(err error) {
 // command that opens the store must apply it to keep fixtures reproducible.
 var fixedTimestampNS *int64
 
-// globals extracts --store and --json wherever they appear, leaving the
-// subcommand and its flags in source order.
+// Representation policy flags. They are global in the same sense as the Rust
+// CLI: read-only commands accept and ignore them, invalid values fail before
+// any command runs, and every writable open applies them to new content.
+var (
+	representationMode = store.RepresentationModeRaw
+	codecMinBytes      = store.DefaultCodecMinBytes
+)
+
+func applyRepresentationPolicy(opts *store.Options) {
+	opts.Representation = representationMode
+	opts.CodecMinBytes = codecMinBytes
+}
+
+// globals extracts --store, --json, and the representation policy wherever
+// they appear, leaving the subcommand and its flags in source order.
 func globals(args []string) (rest []string, storeDir string, jsonOut bool, err error) {
 	for i := 0; i < len(args); i++ {
 		switch {
@@ -83,6 +97,39 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			storeDir = strings.TrimPrefix(args[i], "--store=")
 		case args[i] == "--json":
 			jsonOut = true
+		case args[i] == "--representation" || args[i] == "-representation":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--representation requires a value")
+			}
+			mode, parseErr := store.ParseRepresentationMode(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			representationMode = mode
+			i++
+		case strings.HasPrefix(args[i], "--representation="):
+			mode, parseErr := store.ParseRepresentationMode(strings.TrimPrefix(args[i], "--representation="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			representationMode = mode
+		case args[i] == "--codec-min-bytes" || args[i] == "-codec-min-bytes":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--codec-min-bytes requires a value")
+			}
+			value, parseErr := strconv.ParseUint(args[i+1], 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--codec-min-bytes must be a non-negative integer (got `%s`)", args[i+1])
+			}
+			codecMinBytes = value
+			i++
+		case strings.HasPrefix(args[i], "--codec-min-bytes="):
+			text := strings.TrimPrefix(args[i], "--codec-min-bytes=")
+			value, parseErr := strconv.ParseUint(text, 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--codec-min-bytes must be a non-negative integer (got `%s`)", text)
+			}
+			codecMinBytes = value
 		case args[i] == "--fixed-timestamp-ns" || args[i] == "-fixed-timestamp-ns":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--fixed-timestamp-ns requires a value")
@@ -178,11 +225,11 @@ func openStore(storeDir string, mode store.OpenMode) (*store.Store, error) {
 	if err := requireStore(storeDir); err != nil {
 		return nil, err
 	}
-	if fixedTimestampNS == nil {
-		return store.Open(storeDir, mode)
-	}
 	opts := store.DefaultOptions()
-	opts.FixedTimestampNS = fixedTimestampNS
+	applyRepresentationPolicy(&opts)
+	if fixedTimestampNS != nil {
+		opts.FixedTimestampNS = fixedTimestampNS
+	}
 	return store.OpenWithOptions(storeDir, mode, opts)
 }
 
@@ -211,6 +258,7 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	opts.OwnerGID = *gid
 	opts.ChunkSize = *chunkSize
 	opts.CheckpointInterval = *checkpoint
+	applyRepresentationPolicy(&opts)
 	if fixedTimestampNS != nil {
 		opts.FixedTimestampNS = fixedTimestampNS
 	}
@@ -248,6 +296,8 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 			"entries":              len(state.Entries),
 			"relations":            len(state.Relations),
 			"snapshots":            snapshots,
+			"representation":       representationMode.AsString(),
+			"codec_min_bytes":      codecMinBytes,
 			"rejected_generations": s.RejectedGenerations(),
 			"recovery_notes":       s.RecoveryNotes(),
 		})
@@ -255,6 +305,7 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 	fmt.Printf("format=weftfs-store 1\ngeneration=%d\nsnapshot_root=%s\n", s.Generation(), s.Head().Hex())
 	fmt.Printf("objects=%d\nentries=%d\nrelations=%d\nsnapshots=%d\n",
 		len(state.Objects), len(state.Entries), len(state.Relations), len(state.Snapshots))
+	fmt.Printf("representation=%s\ncodec_min_bytes=%d\n", representationMode.AsString(), codecMinBytes)
 	for _, generation := range s.RejectedGenerations() {
 		fmt.Printf("rejected_generation=%d\n", generation)
 	}
@@ -1294,6 +1345,7 @@ func cmdVerify(args []string, storeDir string, jsonOut bool) error {
 		}
 		fmt.Printf("checked_commits=%d\nchecked_objects=%d\nchecked_manifests=%d\nchecked_chunks=%d\n",
 			report.CheckedCommits, report.CheckedObjects, report.CheckedManifests, report.CheckedChunks)
+		fmt.Printf("checked_representations=%d\n", report.CheckedRepresentations)
 		for _, generation := range report.RejectedGenerations {
 			fmt.Printf("rejected_generation=%d\n", generation)
 		}
@@ -1532,7 +1584,12 @@ func cmdMount(args []string, storeDir string) error {
 	if *gcWatch && *gcMaxDeletes <= 0 {
 		return werr.Newf(werr.InvalidArgument, "--gc-max-deletes must be >= 1")
 	}
-	s, err := store.Open(storeDir, mode)
+	mountOpts := store.DefaultOptions()
+	applyRepresentationPolicy(&mountOpts)
+	if fixedTimestampNS != nil {
+		mountOpts.FixedTimestampNS = fixedTimestampNS
+	}
+	s, err := store.OpenWithOptions(storeDir, mode, mountOpts)
 	if err != nil {
 		return err
 	}

@@ -50,7 +50,11 @@ func (s *Store) CreateFileSeededCausal(parent model.Hash32, name []byte, data []
 	if uint64(len(data)) > MaxFileBytes {
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
-	manifestID, _, size, err := s.storeFileContent(data)
+	base, err := s.deltaBaseFor(causal)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	manifestID, _, size, err := s.storeFileContentWithBase(data, base)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -142,7 +146,21 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	buffer := make([]byte, sizeInt)
 	copy(buffer, current)
 	copy(buffer[offsetInt:endInt], data)
-	manifestID, _, size, err := s.storeFileContent(buffer)
+	parentVersions := causal
+	if len(parentVersions) == 0 {
+		closure, err := model.ObjectCausalClosure(old)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		if closure != nil {
+			parentVersions = closure.Parents
+		}
+	}
+	base, err := s.deltaBaseFor(parentVersions)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	manifestID, _, size, err := s.storeFileContentWithBase(buffer, base)
 	if err != nil {
 		return model.Hash32{}, err
 	}

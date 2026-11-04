@@ -227,14 +227,9 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 			return report, err
 		}
 		markedManifests[content] = struct{}{}
-		manifest, err := ReadManifest(s.root, content)
-		if err != nil {
-			report.Problems = append(report.Problems,
-				"pinned content "+content.Hex()+" is unreadable: "+err.Error())
-			continue
-		}
-		for _, chunk := range manifest.Chunks {
-			markedChunks[chunk.Hash] = struct{}{}
+		seen := make(map[model.Hash32]struct{})
+		if err := markManifestTree(ctx, s.root, content, markedManifests, markedChunks, &report.Problems, 0, seen); err != nil {
+			return report, err
 		}
 	}
 
@@ -339,16 +334,53 @@ func markState(ctx context.Context, root string, state *model.State, manifests, 
 		if record.Kind != model.KindFile {
 			continue
 		}
-		manifests[record.Content] = struct{}{}
-		manifest, err := ReadManifest(root, record.Content)
-		if err != nil {
-			*problems = append(*problems,
-				"cannot read manifest "+record.Content.Hex()+" for object "+id.Hex()+": "+err.Error())
-			continue
+		seen := make(map[model.Hash32]struct{})
+		if err := markManifestTree(ctx, root, record.Content, manifests, chunks, problems, 0, seen); err != nil {
+			return err
 		}
-		for _, chunk := range manifest.Chunks {
-			chunks[chunk.Hash] = struct{}{}
+	}
+	return nil
+}
+
+// markManifestTree marks a manifest and everything it physically references:
+// raw chunks, the codec frame blob, and (transitively, bounded) dependency
+// content roots. It mirrors the Rust GC so a GC that keeps a dependent keeps
+// its whole dependency closure.
+func markManifestTree(ctx context.Context, root string, manifestID model.Hash32, manifests, chunks map[model.Hash32]struct{}, problems *[]string, depth int, seen map[model.Hash32]struct{}) error {
+	if err := checkCancel(ctx); err != nil {
+		return err
+	}
+	if depth > MaxCodecDependencyDepth {
+		*problems = append(*problems,
+			"manifest "+manifestID.Hex()+" exceeds the codec dependency depth bound")
+		return nil
+	}
+	if _, ok := seen[manifestID]; ok {
+		*problems = append(*problems,
+			"manifest "+manifestID.Hex()+" participates in a cycle")
+		return nil
+	}
+	seen[manifestID] = struct{}{}
+	manifests[manifestID] = struct{}{}
+	manifest, err := ReadManifest(root, manifestID)
+	if err != nil {
+		*problems = append(*problems,
+			"cannot read manifest "+manifestID.Hex()+": "+err.Error())
+		return nil
+	}
+	if rep := manifest.Representation; rep != nil && rep.Kind == model.RepresentationCodec {
+		if rep.Frame != nil {
+			manifests[*rep.Frame] = struct{}{}
 		}
+		for _, dependency := range rep.Dependencies {
+			if err := markManifestTree(ctx, root, dependency, manifests, chunks, problems, depth+1, seen); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, chunk := range manifest.Chunks {
+		chunks[chunk.Hash] = struct{}{}
 	}
 	return nil
 }

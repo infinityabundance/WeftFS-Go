@@ -41,6 +41,7 @@ const (
 	FormatMinor      = 0
 	CommitSchema     = "weftfs.commit.v1"
 	ManifestSchema   = "weft.manifest.v1"
+	ManifestSchemaV2 = "weft.manifest.v2"
 	StateSchema      = "weftfs.state.v1"
 	VersionSchema    = "weftfs.version.v1"
 	LegacyManifest   = "weftfs.manifest.v1"

@@ -32,9 +32,12 @@ type VerifyReport struct {
 	CheckedChunks       uint64
 	CheckedContextRoots uint64
 	CheckedCausal       uint64
-	CheckedCapabilities uint64
-	RejectedGenerations []uint64
-	Problems            []VerifyProblem
+	// CheckedRepresentations counts codec representations fully decoded and
+	// re-hashed by Verify(true).
+	CheckedRepresentations uint64
+	CheckedCapabilities    uint64
+	RejectedGenerations    []uint64
+	Problems               []VerifyProblem
 }
 
 func (r *VerifyReport) problem(class, detail string) {
@@ -111,9 +114,30 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		report.problem(string(werr.ClassOf(err)), "recovery failed: "+err.Error())
 	} else {
 		report.RejectedGenerations = recovered.Rejected
+		for _, note := range recovered.Notes {
+			if strings.Contains(note, "rejected:") {
+				report.problem(string(werr.Corrupt), note)
+			}
+		}
 		if recovered.Generation < maxVisible {
 			report.problem(string(werr.Corrupt), "recovery selected generation "+itoa(recovered.Generation)+
 				" but the superblock published "+itoa(maxVisible))
+			// Recovery validated catalog integrity strictly and fell back. Verify
+			// the highest published state too, without the catalog gate, so a
+			// representation decode failure names the affected object instead of
+			// only the resulting generation gap.
+			if path, ok := files[maxVisible]; ok {
+				expected := maxVisible
+				if loaded, loadErr := LoadCommitFile(path, &expected); loadErr == nil {
+					if highest, loadNotes, stateErr := LoadStateAt(s.root, loaded.Hash, maxVisible, false); stateErr == nil {
+						for _, note := range loadNotes {
+							report.problem(string(werr.Corrupt), note)
+						}
+						s.verifyState(highest, full, report)
+						s.verifyContextState(highest, full, report)
+					}
+				}
+			}
 		}
 		state, notes, err := LoadStateAt(s.root, recovered.Head, maxVisible, true)
 		if err != nil {
@@ -297,6 +321,22 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		report.CheckedManifests++
 		if manifest.Size != record.Size {
 			report.problem(string(werr.Corrupt), "object "+id.Hex()+" size disagrees with manifest")
+		}
+		if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationCodec {
+			if full {
+				frame := "<none>"
+				if manifest.Representation.Frame != nil {
+					frame = manifest.Representation.Frame.Hex()
+				}
+				contentRoot := record.Content
+				if _, err := readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
+					report.problem(string(werr.ClassOf(err)),
+						"codec representation for object "+id.Hex()+" manifest "+record.Content.Hex()+" frame "+frame+": "+err.Error())
+				} else {
+					report.CheckedRepresentations++
+				}
+			}
+			continue
 		}
 		if !full {
 			continue

@@ -1,0 +1,129 @@
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"os"
+	"testing"
+
+	"github.com/infinityabundance/WeftFS-Go/store"
+)
+
+func resetRepresentationPolicy(t *testing.T) {
+	t.Helper()
+	previousMode := representationMode
+	previousMin := codecMinBytes
+	t.Cleanup(func() {
+		representationMode = previousMode
+		codecMinBytes = previousMin
+	})
+	representationMode = store.RepresentationModeRaw
+	codecMinBytes = store.DefaultCodecMinBytes
+}
+
+func TestGlobalsRepresentationPolicy(t *testing.T) {
+	resetRepresentationPolicy(t)
+
+	rest, dir, jsonOut, err := globals([]string{
+		"--store", "/tmp/store", "--representation", "codec-auto",
+		"--codec-min-bytes", "8192", "info",
+	})
+	if err != nil {
+		t.Fatalf("globals: %v", err)
+	}
+	if dir != "/tmp/store" || jsonOut || len(rest) != 1 || rest[0] != "info" {
+		t.Fatalf("globals rest=%v dir=%s json=%v", rest, dir, jsonOut)
+	}
+	if representationMode != store.RepresentationModeCodecAuto || codecMinBytes != 8192 {
+		t.Fatalf("policy not applied: %s/%d", representationMode, codecMinBytes)
+	}
+
+	if _, _, _, err := globals([]string{"--representation", "bogus", "cat", "/x"}); err == nil {
+		t.Fatal("invalid --representation was accepted")
+	}
+	if _, _, _, err := globals([]string{"--codec-min-bytes", "not-a-number", "cat", "/x"}); err == nil {
+		t.Fatal("invalid --codec-min-bytes was accepted")
+	}
+	if _, _, _, err := globals([]string{"--representation=raw", "--codec-min-bytes=0", "cat", "/x"}); err != nil {
+		t.Fatalf("valid policy form rejected: %v", err)
+	}
+	if representationMode != store.RepresentationModeRaw || codecMinBytes != 0 {
+		t.Fatalf("equals-form policy not applied: %s/%d", representationMode, codecMinBytes)
+	}
+}
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+	previous := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = writer
+	runErr := fn()
+	_ = writer.Close()
+	os.Stdout = previous
+	output, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if runErr != nil {
+		t.Fatalf("command: %v", runErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+	return string(output)
+}
+
+func TestInfoJSONReportsRepresentationPolicy(t *testing.T) {
+	resetRepresentationPolicy(t)
+	representationMode = store.RepresentationModeCodecAuto
+	codecMinBytes = 8192
+	dir := t.TempDir()
+	if err := run("init", nil, dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	payloadPath := t.TempDir() + "/payload.txt"
+	payload := ""
+	for len(payload) < 16*1024 {
+		payload += "WeftFS CLI representation policy. "
+	}
+	if err := os.WriteFile(payloadPath, []byte(payload), 0o644); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if err := run("create", []string{"/big.txt", "--file", payloadPath}, dir, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	s, err := store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	id, err := s.ResolvePath("/big.txt")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	record, err := s.ObjectMeta(id)
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	manifest, err := store.ReadManifest(dir, record.Content)
+	if err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	if manifest.Representation == nil || manifest.Representation.Kind != "codec" {
+		t.Fatalf("CLI codec-auto did not write a v2 codec representation: %+v", manifest.Representation)
+	}
+	_ = s.Close()
+	output := captureStdout(t, func() error {
+		return run("info", nil, dir, true)
+	})
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("info JSON: %v\n%s", err, output)
+	}
+	if parsed["representation"] != "codec-auto" {
+		t.Fatalf("info representation = %v", parsed["representation"])
+	}
+	if parsed["codec_min_bytes"] != float64(8192) {
+		t.Fatalf("info codec_min_bytes = %v", parsed["codec_min_bytes"])
+	}
+}
