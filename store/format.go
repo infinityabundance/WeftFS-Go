@@ -250,8 +250,10 @@ func ScanCommitFiles(root string) (map[uint64]string, error) {
 }
 
 // LoadCommitFile reads and validates one commit file. When expected is
-// non-nil, the commit's declared generation must match it.
+// non-nil, the commit's declared generation must match it. Every call is
+// counted by CommitFileReads for open-path diagnostics.
 func LoadCommitFile(path string, expected *uint64) (LoadedCommit, error) {
+	commitFileReads.Add(1)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return LoadedCommit{}, werr.Wrap(werr.Corrupt, err, "cannot read %s", path)

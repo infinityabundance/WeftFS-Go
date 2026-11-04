@@ -373,8 +373,21 @@ func Init(path string, opts Options) (*Store, error) {
 	return store, nil
 }
 
-// Open opens an existing store.
+// Open opens an existing store. Read-only opens use the generation-addressed
+// bounded replay and never enumerate the commit directory; a writable open
+// enumerates it once so next_generation cannot reuse a rejected generation.
 func Open(path string, mode OpenMode) (*Store, error) {
+	return openWithStrategy(path, mode, false)
+}
+
+// OpenFullScanForBench opens through the original full commit-directory scan so
+// the bounded fast path's cost can be measured against it. It is not used by
+// any production path.
+func OpenFullScanForBench(path string, mode OpenMode) (*Store, error) {
+	return openWithStrategy(path, mode, true)
+}
+
+func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error) {
 	format, err := os.ReadFile(filepath.Join(path, "FORMAT"))
 	if err != nil {
 		return nil, werr.Wrap(werr.Corrupt, err, "cannot read FORMAT")
@@ -403,29 +416,24 @@ func Open(path string, mode OpenMode) (*Store, error) {
 		}
 	}
 
-	recovery, err := Recover(path)
+	var recovery *Recovery
+	switch {
+	case fullScan:
+		recovery, err = recoverFullScan(path)
+	case mode == ReadWrite:
+		recovery, err = recoverForWrite(path)
+	default:
+		recovery, err = Recover(path)
+	}
 	if err != nil {
 		if lock != nil {
 			lock.Close()
 		}
 		return nil, err
-	}
-	files, err := ScanCommitFiles(path)
-	if err != nil {
-		if lock != nil {
-			lock.Close()
-		}
-		return nil, err
-	}
-	var highest uint64
-	for generation := range files {
-		if generation > highest {
-			highest = generation
-		}
 	}
 	base := recovery.Generation
-	if highest > base {
-		base = highest
+	if recovery.HighestFileGeneration > base {
+		base = recovery.HighestFileGeneration
 	}
 	if base == ^uint64(0) {
 		if lock != nil {

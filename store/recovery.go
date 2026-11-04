@@ -3,10 +3,35 @@ package store
 import (
 	"os"
 	"sort"
+	"sync/atomic"
 
 	"github.com/infinityabundance/WeftCodec-Go/hash"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
+)
+
+// commitFileReads counts commit files decoded by LoadCommitFile for the whole
+// process. It is a diagnostic for tests and benchmarks that need to prove the
+// bounded open path reads O(checkpoint interval) commits rather than every
+// commit in the store. It is never used for correctness.
+var commitFileReads atomic.Uint64
+
+// CommitFileReads reports commit files decoded since the process started.
+func CommitFileReads() uint64 { return commitFileReads.Load() }
+
+// ResetCommitFileReads resets the process-wide commit-file read counter.
+func ResetCommitFileReads() { commitFileReads.Store(0) }
+
+// replayStrategy selects how open-time recovery resolves the committed state.
+type replayStrategy int
+
+const (
+	// replayBounded is the generation-addressed walk from the head down to the
+	// nearest verified checkpoint, falling back to the full scan on any
+	// inconsistency.
+	replayBounded replayStrategy = iota
+	// replayFullScan is the original full commit-directory scan and replay.
+	replayFullScan
 )
 
 // BlobKind selects the content-addressed namespace.
@@ -237,11 +262,36 @@ type Recovery struct {
 	State      *model.State
 	Rejected   []uint64
 	Notes      []string
+	// HighestFileGeneration is the highest commit-file generation present on
+	// disk (including unpublished files above the selected head). The
+	// directory-free fast path cannot enumerate the commit directory, so it
+	// reports the selected generation instead; the value only advances
+	// next_generation on a writable open.
+	HighestFileGeneration uint64
 }
 
-// Recover selects the highest valid published generation. It never invents
-// data and never deletes rejected generations.
+// Recover selects the highest valid published generation using
+// generation-addressed bounded replay. It never invents data and never deletes
+// rejected generations.
 func Recover(root string) (*Recovery, error) {
+	return recoverWithStrategy(root, replayBounded, true)
+}
+
+// recoverForWrite is the writable-open path. It needs one commit-directory
+// enumeration so next_generation never reuses a rejected generation; the commit
+// decode window is still bounded by the checkpoint interval.
+func recoverForWrite(root string) (*Recovery, error) {
+	return recoverWithStrategy(root, replayBounded, false)
+}
+
+// recoverFullScan is the original full commit-directory recovery. It stays
+// authoritative for its rejected set and notes, and is the fallback for every
+// bounded-replay inconsistency.
+func recoverFullScan(root string) (*Recovery, error) {
+	return recoverWithStrategy(root, replayFullScan, false)
+}
+
+func recoverWithStrategy(root string, strategy replayStrategy, allowDirectoryFree bool) (*Recovery, error) {
 	view, err := ReadSuperblock(root)
 	if err != nil {
 		return nil, err
@@ -263,12 +313,32 @@ func Recover(root string) (*Recovery, error) {
 		slotByGen[slot.Generation] = slot
 	}
 
+	if allowDirectoryFree && strategy == replayBounded {
+		recovery, err := recoverDirectoryFree(root, view, validSlots, maxVisible, slotByGen)
+		if err == nil {
+			return recovery, nil
+		}
+		// Do not reuse anything from the fast attempt: the scan-based recovery
+		// is authoritative, including its rejected set and notes. Record that
+		// the fallback happened.
+		recovery, fallbackErr := recoverWithStrategy(root, replayBounded, false)
+		if fallbackErr != nil {
+			return nil, fallbackErr
+		}
+		recovery.Notes = append(recovery.Notes, "open fast path fell back to full commit-directory recovery: "+err.Error())
+		return recovery, nil
+	}
+
 	files, err := ScanCommitFiles(root)
 	if err != nil {
 		return nil, err
 	}
 	candidates := make([]uint64, 0, len(files))
+	highestFileGeneration := uint64(0)
 	for generation := range files {
+		if generation > highestFileGeneration {
+			highestFileGeneration = generation
+		}
 		if generation <= maxVisible {
 			candidates = append(candidates, generation)
 		}
@@ -276,10 +346,13 @@ func Recover(root string) (*Recovery, error) {
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i] > candidates[j] })
 
 	rejected := make([]uint64, 0)
-	for slotGeneration := range slotByGen {
-		if _, ok := files[slotGeneration]; !ok {
-			notes = append(notes, "generation "+itoa(slotGeneration)+" rejected: published slot has no commit file")
-			rejected = append(rejected, slotGeneration)
+	// Iterate the sorted slots so the notes are deterministic. A published
+	// generation whose commit file is absent is a rejection, never an
+	// invitation to invent a head.
+	for _, slot := range validSlots {
+		if _, ok := files[slot.Generation]; !ok {
+			notes = append(notes, "generation "+itoa(slot.Generation)+" rejected: published slot has no commit file")
+			rejected = append(rejected, slot.Generation)
 		}
 	}
 
@@ -304,7 +377,17 @@ func Recover(root string) (*Recovery, error) {
 				continue
 			}
 		}
-		state, loadNotes, err := LoadStateAt(root, loaded.Hash, maxVisible, true)
+		var state *model.State
+		var loadNotes []string
+		if strategy == replayBounded {
+			state, loadNotes, err = loadStateBounded(root, loaded.Hash, loaded.Generation, maxVisible)
+			if err != nil {
+				notes = append(notes, "generation "+itoa(generation)+": bounded replay fell back to full scan: "+err.Error())
+				state, loadNotes, err = LoadStateAt(root, loaded.Hash, maxVisible, true)
+			}
+		} else {
+			state, loadNotes, err = LoadStateAt(root, loaded.Hash, maxVisible, true)
+		}
 		if err != nil {
 			notes = append(notes, "generation "+itoa(generation)+" rejected: "+err.Error())
 			rejected = append(rejected, generation)
@@ -314,12 +397,208 @@ func Recover(root string) (*Recovery, error) {
 		return &Recovery{
 			Head: loaded.Hash, Generation: loaded.Generation, State: state,
 			Rejected: rejected, Notes: notes,
+			HighestFileGeneration: highestFileGeneration,
 		}, nil
 	}
 	return nil, werr.Newf(werr.Corrupt, "no valid generation at or below %d; rejected %v", maxVisible, rejected)
 }
 
-// AllCommits lists every valid parsed commit file up to maxGeneration.
+// recoverDirectoryFree is the read-only fast open: the highest published slot
+// must be the head, its commit file must exist and match the slot hash and
+// length, and the bounded chain replay must complete. Anything else returns an
+// error so the caller can fall back to the full directory scan.
+func recoverDirectoryFree(root string, view SuperblockView, validSlots []SuperblockSlot, maxVisible uint64, slotByGen map[uint64]SuperblockSlot) (*Recovery, error) {
+	// The scan-based path records a rejection for every published slot whose
+	// commit file is missing. Reproducing that note without enumerating is not
+	// possible, so fall back when it happens.
+	for _, slot := range validSlots {
+		path := CommitPath(root, slot.Generation)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, werr.Wrap(werr.Corrupt, err, "published generation %d has no commit file", slot.Generation)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, werr.Newf(werr.Corrupt, "published generation %d commit path %s is not a regular file", slot.Generation, path)
+		}
+	}
+
+	expected := maxVisible
+	loaded, err := LoadCommitFile(CommitPath(root, maxVisible), &expected)
+	if err != nil {
+		return nil, err
+	}
+	if slot, ok := slotByGen[maxVisible]; ok {
+		if slot.Commit != loaded.Hash {
+			return nil, werr.Newf(werr.Corrupt, "superblock hash for generation %d does not match the commit record", maxVisible)
+		}
+		if slot.CommitLen != loaded.WCBLength {
+			return nil, werr.Newf(werr.Corrupt, "superblock length for generation %d does not match the commit record", maxVisible)
+		}
+	}
+
+	state, loadNotes, err := loadStateBounded(root, loaded.Hash, loaded.Generation, maxVisible)
+	if err != nil {
+		return nil, err
+	}
+	notes := append([]string(nil), view.Notes...)
+	notes = append(notes, loadNotes...)
+	return &Recovery{
+		Head: loaded.Hash, Generation: loaded.Generation, State: state,
+		Notes: notes, HighestFileGeneration: loaded.Generation,
+	}, nil
+}
+
+// loadStateBounded is generation-addressed bounded replay from headHash.
+//
+// Unlike LoadStateAt, it never scans the commit directory and never decodes
+// more than the chain window between the head and the nearest usable
+// checkpoint:
+//
+//  1. Read commits/<headGeneration>.commit directly, require its declared
+//     generation to equal the path generation, and require its identity hash to
+//     equal headHash.
+//  2. Walk parent down one generation at a time (commits/<gen-1>.commit),
+//     requiring every loaded commit's hash to equal the child's declared parent
+//     hash and every generation to be exactly one lower.
+//  3. Stop at the newest commit that carries a checkpoint whose state manifest
+//     is readable and declares the same generation. Apply that checkpoint state
+//     and then the commits above it exactly as LoadStateAt does.
+//  4. Validate the catalog (manifest identity, chunk existence and length).
+//
+// Any surprise - a missing file, a generation that disagrees with its name, a
+// hash or parent mismatch, a non-contiguous generation, an unreadable or
+// mislabelled checkpoint - is returned as an error. The caller must then fall
+// back to LoadStateAt; this function never accepts a shorter or partial chain
+// as a substitute. The walk is bounded by headGeneration steps and by
+// maxGeneration, so a hostile chain cannot force unbounded work.
+func loadStateBounded(root string, headHash model.Hash32, headGeneration, maxGeneration uint64) (*model.State, []string, error) {
+	if headGeneration == 0 {
+		return nil, nil, werr.Newf(werr.Corrupt, "bounded replay requires a non-zero head generation")
+	}
+	if headGeneration > maxGeneration {
+		return nil, nil, werr.Newf(werr.Corrupt, "bounded replay head generation %d exceeds max_generation %d", headGeneration, maxGeneration)
+	}
+
+	// Newest-first window. It holds only the head-to-checkpoint commits, so its
+	// length is bounded by the checkpoint interval when a checkpoint exists.
+	chain := make([]LoadedCommit, 0)
+	cursorHash := headHash
+	cursorGeneration := headGeneration
+	seen := make(map[model.Hash32]bool)
+	var steps uint64
+	var checkpointState *model.State
+	var resumedAtCheckpoint uint64
+	var resumed bool
+
+	for {
+		if seen[cursorHash] {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit parent chain contains a cycle")
+		}
+		seen[cursorHash] = true
+		expected := cursorGeneration
+		loaded, err := LoadCommitFile(CommitPath(root, cursorGeneration), &expected)
+		if err != nil {
+			return nil, nil, err
+		}
+		if loaded.Hash != cursorHash {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit %s hashes to %s but the child or superblock declares %s",
+				CommitPath(root, cursorGeneration), loaded.Hash.Hex(), cursorHash.Hex())
+		}
+		steps++
+		if steps > headGeneration {
+			return nil, nil, werr.Newf(werr.Corrupt, "bounded commit walk exceeded its %d-generation bound", headGeneration)
+		}
+
+		if loaded.Commit.Checkpoint != nil {
+			// A checkpoint that cannot be verified is not silently ignored
+			// here: the caller replays through the full path instead.
+			state, err := ReadStateManifest(root, *loaded.Commit.Checkpoint)
+			if err != nil {
+				return nil, nil, err
+			}
+			if state.Generation != loaded.Generation {
+				return nil, nil, werr.Newf(werr.Corrupt, "checkpoint %s in generation %d declares generation %d",
+					loaded.Commit.Checkpoint.Hex(), loaded.Generation, state.Generation)
+			}
+			chain = append(chain, loaded)
+			checkpointState = state
+			resumedAtCheckpoint = loaded.Generation
+			resumed = true
+			break
+		}
+
+		parent := loaded.Commit.Parent
+		chain = append(chain, loaded)
+		if parent == nil {
+			break
+		}
+		if cursorGeneration == 0 {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit chain descends below generation 1")
+		}
+		cursorHash = *parent
+		cursorGeneration--
+	}
+	// reverse newest-first into oldest-first
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	// Mirror the structural checks LoadStateAt performs on the materialised
+	// window. The window either starts at generation 1 or at a verified
+	// checkpoint, so nothing below it is needed to replay state.
+	for i := 0; i+1 < len(chain); i++ {
+		if chain[i+1].Generation <= chain[i].Generation {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit generations do not increase along the parent chain")
+		}
+		expectedParent := chain[i].Hash
+		if chain[i+1].Commit.Parent == nil || *chain[i+1].Commit.Parent != expectedParent {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit parent hash does not match the previous commit")
+		}
+	}
+	if !resumed {
+		if len(chain) == 0 || chain[0].Generation != 1 {
+			return nil, nil, werr.Newf(werr.Corrupt, "commit chain does not start at generation 1")
+		}
+		if chain[0].Commit.Parent != nil {
+			return nil, nil, werr.Newf(werr.Corrupt, "generation 1 has a parent")
+		}
+	}
+
+	state := model.NewState()
+	for _, loaded := range chain {
+		if loaded.Commit.Checkpoint != nil {
+			if checkpointState == nil {
+				return nil, nil, werr.Newf(werr.Corrupt, "commit window carries an unverified checkpoint")
+			}
+			state = checkpointState
+			checkpointState = nil
+			continue
+		}
+		if err := state.ApplyOps(loaded.Commit.Ops); err != nil {
+			return nil, nil, werr.Newf(werr.Corrupt, "generation %d ops cannot be applied: %s", loaded.Generation, err)
+		}
+		state.Generation = loaded.Generation
+	}
+
+	if err := ValidateCatalog(root, state); err != nil {
+		return nil, nil, err
+	}
+	// Honest recovery note: a bounded open does not enumerate commit files below
+	// the checkpoint. The checkpoint state is hash-verified and its generation is
+	// matched, so the recovered state is exact for the head; but a gap in older
+	// history is not detected here. verify --full still enumerates every commit
+	// file and reports such gaps.
+	var notes []string
+	if resumed {
+		notes = append(notes, "bounded replay resumed from the checkpoint at generation "+
+			itoa(resumedAtCheckpoint)+"; commit files below it were not enumerated")
+	}
+	return state, notes, nil
+}
+
+// AllCommits lists every valid parsed commit file up to maxGeneration. It
+// always enumerates the commit directory; verify --full and GC roots rely on
+// it and must never inherit the bounded open's window.
 func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
 	files, err := ScanCommitFiles(root)
 	if err != nil {

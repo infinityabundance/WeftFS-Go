@@ -33,6 +33,29 @@ Revisions recorded for this work:
   `H("weft/store/commit/v1", WCB)` checks.
 - Parent-chain walk: cycle rejection, strictly increasing generations, parent
   hash equality, generation 1 has no parent.
+- **Bounded open replay** (parity with Rust `load_state_bounded`): a read-only
+  open starts at the highest published superblock generation, reads
+  `commits/<gen>.commit` by generation, requires the declared generation to
+  equal the path, records the hash and parent linkage, and descends to
+  `gen-1`. It stops at the newest commit whose checkpoint manifest verifies
+  (hash valid and declared generation equal to the commit generation). It never
+  enumerates the commit directory. A writable open does one enumeration for
+  `next_generation`; its commit decode window is still checkpoint-bounded. When
+  the bounded walk resumes from a checkpoint it returns exactly:
+  `bounded replay resumed from the checkpoint at generation <g>; commit files
+  below it were not enumerated`.
+- **Every bounded-replay inconsistency falls back to the authoritative full
+  scan**: missing file, generation/name disagreement, hash or parent mismatch,
+  non-contiguous generation, truncated record, unreadable or mislabelled
+  checkpoint, published slot without a commit file, or a step bound exceeded.
+  The fallback is recorded as `open fast path fell back to full commit-directory
+  recovery: <reason>`; the full scan owns the rejected set and notes. A bounded
+  walk never yields a shorter state.
+- `store.CommitFileReads()`/`store.ResetCommitFileReads()` expose a process-wide
+  counter incremented per `LoadCommitFile`; it is diagnostic only, used by the
+  fast-open tests and the bench.
+- `store.OpenFullScanForBench` forces the pre-optimisation full scan. It is not
+  used by any production path.
 - Replay of `put_object`, `delete_object`, `put_entry`, `del_entry`,
   `put_relation`, `del_relation`, `set_snapshot`, `set_tip` with the same
   all-or-nothing validation as the Rust reference.
@@ -197,7 +220,9 @@ Revisions recorded for this work:
   `setattr` ignores `FATTR_ATIME`/`FATTR_CTIME`.
 - `mmap` writeback. Writable handles are write-through; read handles request
   direct I/O so one read is served from one immutable content root.
-- Performance measurements. None are made.
+- Performance measurements: the frontend makes no throughput or latency claim.
+  The only measurement recorded here is the bounded-open comparison in §2.8,
+  which is an open-path microbenchmark, not a filesystem performance claim.
 
 ---
 
@@ -438,6 +463,51 @@ Cross-language GC handoff (Rust binary is a test oracle only):
 | B. Go store + snapshot + garbage → Rust `gc --apply --grace-secs 0` | Rust reported `applied=true`; Go-created garbage manifest/chunk were gone; the snapshot-only chunk survived; Rust and Go `verify --full` clean; snapshot and live reads exact |
 | C. Three alternating generations with GC between | Go wrote/GC’d, Rust wrote/GC’d, Go wrote/GC’d; after every round the stable ObjectId, VersionId, ContentId, and snapshot commit were unchanged, snapshot/live bytes were exact, and both `verify --full` runs were clean |
 | D. SIGKILL during Go commit → Go GC → Rust verify | `after_commit_file`: the tail’s chunk was swept, the tail stayed invisible, Rust `verify --full` reported only `commit file for generation 2 exists above the highest published superblock generation 1`. `after_superblock_write`: the chunk survived, Rust `verify --full` was `ok=true`, and Rust read the killed commit’s exact bytes |
+
+### 2.8 Bounded open replay and the fast-open bench (2026-11-04)
+
+Code revision WeftFS-Go `d7d8d06` plus this change; parent `8c112de`. Court
+`weft/fuse-court:1` (tests) and `weft/go-court:1` (bench), kernel
+`7.3.1-1-cachyos`, hard limits `--memory=3g --memory-swap=3g
+--pids-limit=1024 --cpus=4`, bounded `/tmp` (1 GiB).
+
+```sh
+# new courts
+scripts/docker-court.sh go "cd /work/WeftFS-Go && go test -race -count=1 ./store -run 'TestFastOpen|TestCorruptedChains|TestOpenStopsAt' -v"
+scripts/docker-court.sh fuse "cd /work/WeftFS-Go && go test -race -count=1 ./..."
+# bench (100,000 generations, checkpoint interval 256)
+scripts/docker-court.sh go "cd /work/WeftFS-Go && go build -o /work/.docker-cache/go-tmp/openbench ./cmd/openbench && /work/.docker-cache/go-tmp/openbench --generations 100000 --samples 5 --work-dir /tmp/weft-go-open-bench --out /work/bench/receipts/go-fast-open-20261104T190342Z.json"
+```
+
+Observed:
+
+- `store` fast-open courts: 4/4 pass. The 2,000-generation store opens in the
+  head-to-checkpoint window (≤ 130 commit decodes), returns exactly one note
+  naming generation 1920, and matches the full-scan oracle in generation, head,
+  objects, entries, relations, snapshots, and tips. The forced full path decodes
+  ≥ 2,000 commits. Deleting, corrupting, truncating, and mislabelling commits,
+  and removing the checkpoint manifest, each fall back with a note and match the
+  full oracle; no case produced a shorter state.
+- Full suite: `go test -race -count=1 ./...` → 101 PASS / 2 SKIP / 0 FAIL
+  (the 2 skips are the existing child-process helper guards). `TestHandoff`
+  checkpoint gates pass unchanged, including `TestHandoffCheckpointsBothWays`.
+- Bench receipt `bench/receipts/go-fast-open-20261104T190342Z.json` in the
+  program-home repo: 100,000 generations, 9 objects, 8 entries, 1 relation,
+  1 snapshot, 1,000+ checkpoints; store apparent bytes 47,585,212, allocated
+  bytes 411,287,552 (fits the 1 GiB `/tmp`); build 2.977 s; peak RSS
+  229,312 KiB.
+
+| Path | Commit files read | Open wall ms (5 runs) | Median | p95 |
+|---|---|---|---|---|
+| `store.Open(ReadOnly)` (bounded) | 162, 162, 162, 162, 162 | 2.88, 2.69, 2.67, 4.14, 3.52 | **2.88 ms** | 4.14 ms |
+| `OpenFullScanForBench` (full scan) | 100,001 × 5 | 2128.85, 2273.22, 2235.48, 2188.83, 2130.76 | **2188.83 ms** | 2273.22 ms |
+
+Both paths recovered identical state (`state_match=true`). The fast path read
+161 window commits plus one head load. The payload is identical for every
+generation, so content blobs deduplicate and the store is one commit file per
+generation; the commit chain and replay work are real. This is a synthetic,
+single-host, tmpfs, page-cache measurement — not a device, fleet, power-loss, or
+production claim. No court limit was raised for this run.
 
 ---
 
