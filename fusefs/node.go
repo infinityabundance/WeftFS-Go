@@ -1452,7 +1452,7 @@ var _ = (fs.NodeCopyFileRanger)((*node)(nil))
 
 // CopyFileRange copies within the daemon. Both ends must be regular file
 // objects; the destination must be writable. A short copy at EOF or at the
-// 256 MiB v1 bound is returned as the copied length, matching read(2)-style
+// 1 TiB v1 bound is returned as the copied length, matching read(2)-style
 // short-copy semantics rather than inventing a failure.
 func (n *node) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, offIn uint64, out *fs.Inode, fhOut fs.FileHandle, offOut uint64, length uint64, flags uint64) (uint32, syscall.Errno) {
 	if flags != 0 {

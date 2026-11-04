@@ -301,7 +301,12 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		if !full {
 			continue
 		}
-		assembled := make([]byte, 0, int(manifest.Size))
+		capacity, err := checkedSize(manifest.Size)
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "object "+id.Hex()+": "+err.Error())
+			continue
+		}
+		assembled := make([]byte, 0, capacity)
 		for _, chunk := range manifest.Chunks {
 			report.CheckedChunks++
 			bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)

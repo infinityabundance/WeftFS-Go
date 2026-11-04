@@ -48,7 +48,7 @@ func (s *Store) CreateFileSeededCausal(parent model.Hash32, name []byte, data []
 		return model.Hash32{}, err
 	}
 	if uint64(len(data)) > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	manifestID, _, size, err := s.storeFileContent(data)
 	if err != nil {
@@ -114,7 +114,7 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	}
 	end := offset + uint64(len(data))
 	if end < offset || end > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	current, err := s.ReadObject(id)
 	if err != nil {
@@ -127,9 +127,21 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	if old.Size > newSize {
 		newSize = old.Size
 	}
-	buffer := make([]byte, int(newSize))
+	sizeInt, err := checkedSize(newSize)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	offsetInt, err := checkedSize(offset)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	endInt, err := checkedSize(end)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	buffer := make([]byte, sizeInt)
 	copy(buffer, current)
-	copy(buffer[int(offset):int(end)], data)
+	copy(buffer[offsetInt:endInt], data)
 	manifestID, _, size, err := s.storeFileContent(buffer)
 	if err != nil {
 		return model.Hash32{}, err
@@ -182,7 +194,7 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 		return model.Hash32{}, err
 	}
 	if size > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	old, ok := s.state.Objects[id]
 	if !ok {
@@ -195,7 +207,11 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	if err != nil {
 		return model.Hash32{}, err
 	}
-	buffer := make([]byte, int(size))
+	sizeInt, err := checkedSize(size)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	buffer := make([]byte, sizeInt)
 	copied := len(current)
 	if copied > len(buffer) {
 		copied = len(buffer)
@@ -234,7 +250,7 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 // the single-writer serialization.
 func (s *Store) commitFileBuffer(id model.Hash32, old model.ObjectRecord, buffer []byte) (model.Hash32, error) {
 	if uint64(len(buffer)) > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	manifestID, _, size, err := s.storeFileContent(buffer)
 	if err != nil {
@@ -287,7 +303,7 @@ func (s *Store) ZeroRange(id model.Hash32, offset, length uint64, extend bool) (
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "zero range requires a file object")
 	}
 	if extend && end > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	high := offset
 	if end > high {
@@ -311,9 +327,21 @@ func (s *Store) ZeroRange(id model.Hash32, offset, length uint64, extend bool) (
 	if uint64(len(current)) != old.Size {
 		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while zeroing")
 	}
-	buffer := make([]byte, int(newSize))
+	sizeInt, err := checkedSize(newSize)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	offsetInt, err := checkedSize(offset)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	zeroEndInt, err := checkedSize(zeroEnd)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	buffer := make([]byte, sizeInt)
 	copy(buffer, current)
-	clear(buffer[int(offset):int(zeroEnd)])
+	clear(buffer[offsetInt:zeroEndInt])
 	return s.commitFileBuffer(id, old, buffer)
 }
 
@@ -342,9 +370,21 @@ func (s *Store) CollapseRange(id model.Hash32, offset, length uint64) (model.Has
 	if uint64(len(current)) != old.Size {
 		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while collapsing")
 	}
-	buffer := make([]byte, int(old.Size-length))
-	copy(buffer, current[:int(offset)])
-	copy(buffer[int(offset):], current[int(offset+length):])
+	newLength, err := checkedSize(old.Size - length)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	offsetInt, err := checkedSize(offset)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	shiftEnd, err := checkedSize(offset + length)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	buffer := make([]byte, newLength)
+	copy(buffer, current[:offsetInt])
+	copy(buffer[offsetInt:], current[shiftEnd:])
 	return s.commitFileBuffer(id, old, buffer)
 }
 
@@ -368,7 +408,7 @@ func (s *Store) InsertRange(id model.Hash32, offset, length uint64) (model.Hash3
 	}
 	newSize := old.Size + length
 	if newSize < old.Size || newSize > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	current, err := s.ReadObject(id)
 	if err != nil {
@@ -377,9 +417,21 @@ func (s *Store) InsertRange(id model.Hash32, offset, length uint64) (model.Hash3
 	if uint64(len(current)) != old.Size {
 		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while inserting")
 	}
-	buffer := make([]byte, int(newSize))
-	copy(buffer, current[:int(offset)])
-	copy(buffer[int(offset+length):], current[int(offset):])
+	sizeInt, err := checkedSize(newSize)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	offsetInt, err := checkedSize(offset)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	shiftStart, err := checkedSize(offset + length)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	buffer := make([]byte, sizeInt)
+	copy(buffer, current[:offsetInt])
+	copy(buffer[shiftStart:], current[offsetInt:])
 	return s.commitFileBuffer(id, old, buffer)
 }
 
@@ -404,7 +456,7 @@ func (s *Store) CreateUnlinkedFileSeeded(data []byte, mode, uid, gid uint64, att
 		return model.Hash32{}, err
 	}
 	if uint64(len(data)) > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	manifestID, _, size, err := s.storeFileContent(data)
 	if err != nil {

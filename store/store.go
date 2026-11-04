@@ -23,7 +23,18 @@ import (
 
 // Bounds (v1).
 const (
-	MaxFileBytes              uint64 = 256 * 1024 * 1024
+	// MaxFileBytes is the maximum logical file size accepted by every
+	// create/write/append/truncate path and by manifest validation.
+	//
+	// 1 TiB is a deliberate format/resource bound, not a product preference. A
+	// v1 manifest carries one ChunkRef per chunk_size bytes; at the default
+	// 64 KiB chunk size a full 1 TiB file still encodes to a manifest below the
+	// MaxChunkSize*64 defensive cap enforced by storeFileContent. The bound is
+	// enforced with LimitExceeded on create, buffered write, range write,
+	// truncate, zero/collapse/insert, and on every manifest read. It matches
+	// the Rust store's MAX_FILE_BYTES so both implementations accept the same
+	// on-disk objects.
+	MaxFileBytes              uint64 = 1024 * 1024 * 1024 * 1024
 	DefaultCheckpointInterval uint64 = 256
 	DefaultGCGraceSecs        uint64 = 3600
 	DefaultGCIntervalSecs     uint64 = 60
@@ -32,6 +43,19 @@ const (
 	MaxXattrValueBytes        uint64 = 65536
 	MaxXattrCount                    = 1024
 )
+
+// maxInt is the largest value an int can hold on this platform.
+const maxInt = int(^uint(0) >> 1)
+
+// checkedSize converts a byte count to int for an allocation. A size the
+// platform cannot address is a LimitExceeded, never a truncated index or a
+// wrapped length.
+func checkedSize(value uint64) (int, error) {
+	if value > uint64(maxInt) {
+		return 0, werr.Newf(werr.LimitExceeded, "size (%d) does not fit int", value)
+	}
+	return int(value), nil
+}
 
 // OpenMode selects writer locking.
 type OpenMode int
@@ -1084,7 +1108,7 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentHash model.Hash32, size uint64, err error) {
 	size = uint64(len(data))
 	if size > MaxFileBytes {
-		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "file exceeds the 256 MiB v1 bound")
+		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
 	chunkSize := s.options.ChunkSize
 	if chunkSize == 0 || chunkSize > model.MaxChunkSize {
@@ -1099,6 +1123,9 @@ func (s *Store) storeFileContent(data []byte) (manifestID model.Hash32, contentH
 			end = len(data)
 		}
 		chunk := data[start:end]
+		if uint64(len(chunks)) >= model.MaxChunksPerFile {
+			return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+		}
 		hash, err := s.storeBlob(BlobObject, model.DomainChunk, chunk)
 		if err != nil {
 			return model.Hash32{}, model.Hash32{}, 0, err

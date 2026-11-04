@@ -110,6 +110,15 @@ type Manifest struct {
 
 var manifestKeys = []string{"schema", "size", "chunk_size", "chunks", "content_hash"}
 
+// MaxChunksPerFile is the maximum number of chunk references in one manifest
+// (16 Mi, i.e. exactly the 1 TiB file bound at the default 64 KiB chunk size).
+// It mirrors the Rust store's MAX_CHUNKS_PER_FILE. A smaller configured
+// chunk_size reaches this resource limit first and fails with LimitExceeded on
+// write; it bounds the in-memory and encoded manifest rather than silently
+// growing with file size. Reading validates it too, so a manifest over the
+// bound is rejected instead of materialized.
+const MaxChunksPerFile uint64 = 16_777_216
+
 // ToWCB returns the canonical manifest map.
 func (m Manifest) ToWCB() wcb.Value {
 	chunks := make([]wcb.Value, 0, len(m.Chunks))
@@ -170,9 +179,22 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 	if chunkSize == 0 || chunkSize > MaxChunkSize {
 		return Manifest{}, werr.Newf(werr.Malformed, "manifest chunk_size is out of range")
 	}
+	// Every non-final chunk must be full (checked below), so the chunk count is
+	// fixed by size/chunk_size. Reject an over-bound declaration before any
+	// per-chunk work happens.
+	requiredChunks := size / chunkSize
+	if size%chunkSize != 0 {
+		requiredChunks++
+	}
+	if requiredChunks > MaxChunksPerFile {
+		return Manifest{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", MaxChunksPerFile)
+	}
 	items, err := GetArray(m, "chunks")
 	if err != nil {
 		return Manifest{}, err
+	}
+	if uint64(len(items)) > MaxChunksPerFile {
+		return Manifest{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", MaxChunksPerFile)
 	}
 	chunks := make([]ChunkRef, 0, len(items))
 	var total uint64

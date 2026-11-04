@@ -43,8 +43,9 @@ Revisions recorded for this work:
 - File manifests: 64 KiB chunks in v1 output, non-final chunks full, chunk
   lengths sum to `size`, `content_hash` is `H("weft/chunk/v1", plaintext)`,
   every chunk is hash-verified before use, and the whole-content hash is
-  verified on full-range reads. A 256 MiB decoder bound fails closed before a
-  larger allocation.
+  verified on full-range reads. A 1 TiB decoder bound (`MaxFileBytes`, matching
+  Rust `MAX_FILE_BYTES`) and a 16,777,216-chunk manifest bound (`MaxChunksPerFile`,
+  matching Rust `MAX_CHUNKS_PER_FILE`) fail closed before a larger allocation.
 - `verify --full` recomputes commit, checkpoint, manifest, chunk, and
   whole-content identities and reports generation, counts, rejected
   generations, and problems.
@@ -466,8 +467,10 @@ Cross-language GC handoff (Rust binary is a test oracle only):
 5. **atime/ctime** are not stored; getattr mirrors mtime. `setattr` applies
    mode/uid/gid/mtime/size only.
 6. **`write` is whole-file rematerialisation** in v1 (`WEFT-MODEL.md` §3), so a
-   write is O(file size) and bounded at 256 MiB. This is the normative v1
-   behaviour, not an optimization.
+   write is O(file size) and bounded at 1 TiB (matching Rust `MAX_FILE_BYTES`).
+   This is the normative v1 behaviour, not an optimization; a random write to a
+   multi-GiB file allocates the whole file in the Go process. Reads can open and
+   read Rust-written files above 256 MiB (the format is unchanged).
 7. **No hardware power-loss court.** Crash evidence is a process-fault proxy.
 8. **Module replacement.** The committed `go.mod` uses
    `replace ... => ../WeftCodec-Go` for the monorepo. The standalone repository
@@ -528,11 +531,11 @@ module at `ce2cff9283c2ccb841ee27ea5415ef3cb4691c6a`. The final revision is the
   Dense v1 files mean `PUNCH_HOLE`/`ZERO_RANGE` zero content but do not reclaim
   physical chunks; this is stated rather than claimed as space reclamation.
   Unknown modes are `EOPNOTSUPP`; zero length is `EINVAL`; ranges past the
-  256 MiB v1 bound are `EFBIG`.
+  1 TiB v1 bound are `EFBIG`.
 - `copy_file_range`: daemon-side copy for regular objects, `flags != 0` is
   `EINVAL`, source ACL and destination write authorization are checked,
   read-only/snapshot destinations are `EROFS`, and a short copy at EOF or at
-  the 256 MiB bound returns the copied length.
+  the 1 TiB bound returns the copied length.
 - `lseek`: `SEEK_DATA` returns the offset for a dense file and `ENXIO` at/after
   EOF; `SEEK_HOLE` returns the file size (the only hole) and `ENXIO` past EOF;
   `SEEK_SET` is answered directly; `SEEK_CUR`/`SEEK_END` answer `ENOSYS` if the

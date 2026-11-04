@@ -56,10 +56,10 @@ func ReadManifest(root string, manifestID model.Hash32) (model.Manifest, error) 
 	if err != nil {
 		return model.Manifest{}, err
 	}
-	// v1 writers bound files to 256 MiB. Reject a manifest that would force a
-	// larger allocation; this is a decoder limit, not a lossy fallback.
+	// Reject a manifest above the v1 file bound before it can force a larger
+	// allocation; this is a decoder limit, not a lossy fallback.
 	if manifest.Size > MaxFileBytes {
-		return model.Manifest{}, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the 256 MiB v1 bound", manifest.Size)
+		return model.Manifest{}, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the %d-byte v1 bound", manifest.Size, MaxFileBytes)
 	}
 	return manifest, nil
 }
@@ -346,7 +346,7 @@ func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
 // whole-content hash is verified too.
 func ReadRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
 	if manifest.Size > MaxFileBytes {
-		return nil, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the 256 MiB v1 bound", manifest.Size)
+		return nil, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the %d-byte v1 bound", manifest.Size, MaxFileBytes)
 	}
 	if offset >= manifest.Size {
 		return []byte{}, nil
@@ -355,7 +355,11 @@ func ReadRange(root string, manifest model.Manifest, offset, length uint64, veri
 	if end < offset || end > manifest.Size {
 		end = manifest.Size
 	}
-	out := make([]byte, 0, end-offset)
+	capacity, err := checkedSize(end - offset)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, capacity)
 	var cursor uint64
 	for _, chunk := range manifest.Chunks {
 		chunkStart := cursor
