@@ -466,7 +466,7 @@ Cross-language GC handoff (Rust binary is a test oracle only):
 
 ### 2.8 Bounded open replay and the fast-open bench (2026-11-04)
 
-Code revision WeftFS-Go `d7d8d06` plus this change; parent `8c112de`. Court
+Code revision WeftFS-Go `1461c04` (measured); parent `8c112de`. Court
 `weft/fuse-court:1` (tests) and `weft/go-court:1` (bench), kernel
 `7.3.1-1-cachyos`, hard limits `--memory=3g --memory-swap=3g
 --pids-limit=1024 --cpus=4`, bounded `/tmp` (1 GiB).
@@ -476,7 +476,7 @@ Code revision WeftFS-Go `d7d8d06` plus this change; parent `8c112de`. Court
 scripts/docker-court.sh go "cd /work/WeftFS-Go && go test -race -count=1 ./store -run 'TestFastOpen|TestCorruptedChains|TestOpenStopsAt' -v"
 scripts/docker-court.sh fuse "cd /work/WeftFS-Go && go test -race -count=1 ./..."
 # bench (100,000 generations, checkpoint interval 256)
-scripts/docker-court.sh go "cd /work/WeftFS-Go && go build -o /work/.docker-cache/go-tmp/openbench ./cmd/openbench && /work/.docker-cache/go-tmp/openbench --generations 100000 --samples 5 --work-dir /tmp/weft-go-open-bench --out /work/bench/receipts/go-fast-open-20261104T190342Z.json"
+scripts/docker-court.sh go "cd /work/WeftFS-Go && go build -o /work/.docker-cache/go-tmp/openbench ./cmd/openbench && /work/.docker-cache/go-tmp/openbench --generations 100000 --samples 5 --work-dir /tmp/weft-go-open-bench --out /work/bench/receipts/go-fast-open-20261104T190732Z.json"
 ```
 
 Observed:
@@ -491,16 +491,15 @@ Observed:
 - Full suite: `go test -race -count=1 ./...` → 101 PASS / 2 SKIP / 0 FAIL
   (the 2 skips are the existing child-process helper guards). `TestHandoff`
   checkpoint gates pass unchanged, including `TestHandoffCheckpointsBothWays`.
-- Bench receipt `bench/receipts/go-fast-open-20261104T190342Z.json` in the
+- Bench receipt `bench/receipts/go-fast-open-20261104T190732Z.json` in the
   program-home repo: 100,000 generations, 9 objects, 8 entries, 1 relation,
-  1 snapshot, 1,000+ checkpoints; store apparent bytes 47,585,212, allocated
-  bytes 411,287,552 (fits the 1 GiB `/tmp`); build 2.977 s; peak RSS
-  229,312 KiB.
+  1 snapshot; store apparent bytes 47,585,212, allocated bytes 411,287,552
+  (fits the 1 GiB `/tmp`); build 2.962 s; peak RSS 243,484 KiB.
 
 | Path | Commit files read | Open wall ms (5 runs) | Median | p95 |
 |---|---|---|---|---|
-| `store.Open(ReadOnly)` (bounded) | 162, 162, 162, 162, 162 | 2.88, 2.69, 2.67, 4.14, 3.52 | **2.88 ms** | 4.14 ms |
-| `OpenFullScanForBench` (full scan) | 100,001 × 5 | 2128.85, 2273.22, 2235.48, 2188.83, 2130.76 | **2188.83 ms** | 2273.22 ms |
+| `store.Open(ReadOnly)` (bounded) | 162, 162, 162, 162, 162 | 2.80, 2.69, 2.72, 4.14, 3.48 | **2.80 ms** | 4.14 ms |
+| `OpenFullScanForBench` (full scan) | 100,001 × 5 | 2093.34, 2155.65, 2174.52, 2181.77, 2148.18 | **2155.65 ms** | 2181.77 ms |
 
 Both paths recovered identical state (`state_match=true`). The fast path read
 161 window commits plus one head load. The payload is identical for every
