@@ -119,3 +119,87 @@ A feature is deprecated only after a replacement is specified, tested, and
 documented. Deprecated readers remain for at least one major version. Removing
 read support is a major change and requires an archival note naming the last
 version that could read the data.
+
+---
+
+## 9. Context Root, causal, and capability version lines (additive)
+
+These lines are additive to the v1 lines in §1. They introduce no change to
+`weftcodec-format`, `weft-selectors`, or `weftfs-store` v1 bytes.
+
+| Line | Where recorded | v1 value |
+|---|---|---|
+| `weft-context-root` | record `schema` string | `weft.context-root.v1` |
+| `weft-causal` | record `schema` string | `weft.causal.v1` |
+| `weft-capabilities` | record `schema` string | `weft.capability.v1` |
+
+### 9.1 Read/write matrix (v1)
+
+| Reader | Writer | Behavior |
+|---|---|---|
+| root 1.x | root 1.0 | MUST read all frozen context/causal vectors; unknown ordering policy is `UnsupportedVersion` |
+| root 1.x | root 1.y (y>x) | MUST reject unknown critical fields/policies; additive optional fields require a documented default |
+| causal 1.x | bytes_only | MUST accept; it is the v1 default and byte-identical to the frozen version record |
+| causal 1.x | causal_exact | MUST either implement the mode or reject with `UnsupportedVersion`; MUST NOT ignore the fields |
+
+### 9.2 Change classes
+
+- **Patch:** documentation, bug fixes that do not change accepted canonical
+  bytes. A fix that changes emitted bytes for the same logical record is a minor
+  change plus new vectors; existing vectors are never mutated.
+- **Minor:** new optional Context Root field with a safe default, new budget key
+  that old readers reject explicitly, new resolver version name, new canonical
+  ordering policy name that old readers reject with `UnsupportedVersion`.
+- **Major:** changed schema string for the same meaning, changed hash domain,
+  changed canonical encoding, changed closure semantics, changed URI grammar in
+  a way that alters accepted strings. Requires new vectors, a migration tool,
+  and a compatibility report.
+
+### 9.3 Frozen vectors
+
+New append-only sets:
+
+- `conformance/v1/context/` — canonical context-root bytes, `ContextRootId`,
+  authoritative URI, descriptor spellings, and rejection vectors;
+- `conformance/v1/causal/` — canonical closure records, `CausalClosureId`, and
+  rejection vectors.
+
+Rules in §6 apply unchanged: existing files are never edited, every file records
+who produced it, invalid vectors record the error **class**, and cross-language
+replay consumes the same files rather than regenerated copies.
+
+### 9.4 Identity modes and compatibility
+
+The `bytes_only` mode is the v1 default and leaves every existing identity
+frozen. `causal_exact` uses the same `weft/version/v1` domain over an extended
+record; it is an opt-in identity mode, not a reinterpretation of existing bytes.
+An implementation MUST NOT silently downgrade a `causal_exact` artifact to
+`bytes_only`, and MUST NOT present a `bytes_only` identity as if it were causal.
+
+---
+
+## 10. AI codec mode allocation (additive, v1)
+
+`WEFT-AI-CODEC.md` v1.1.0 allocates two previously reserved payload modes:
+
+| Value | Name | Body |
+|---:|---|---|
+| 6 | `TENSOR` | `u32le(meta_len) || WCB(weft.tensor.v1) || payload` |
+| 7 | `TOKEN_SEQUENCE` | `u32le(meta_len) || WCB(weft.tokens.v1) || payload` |
+
+This is an additive extension of the `weftcodec-format 1.0` mode space, not a
+change to existing modes. Rules:
+
+- A reader that does not implement these modes MUST reject them as
+  `UnsupportedMode`. It MUST NOT treat the payload as opaque bytes.
+- Mode values `8..=127` stay reserved and `128..=255` stay experimental.
+- The new hash domains `weft/tensor/payload/v1` and
+  `weft/tokens/payload/v1` are additive; existing domains are unchanged.
+- Neither mode changes RAW, ZSTD, REFERENCE, DELTA, DICTIONARY, STRUCTURED, the
+  header, the tables, WCB, or selector bytes.
+- Historical vector `017_unknown_mode` asserted that value 6 was unknown. It is
+  retained byte-for-byte and marked `superseded_by`
+  `017_unknown_mode_reserved8`; both replay suites skip superseded vectors.
+  The authoritative reserved-value reject is now mode 8.
+- Because these modes are deterministic, cross-language conformance requires
+  byte-identical frames **and** decode equivalence, unlike ZSTD/DICTIONARY.

@@ -97,9 +97,15 @@ Canonical WCB map:
 }
 ```
 
-`checkpoint` is the manifest hash of a full state snapshot used as a replay
-base. Without it, replay starts at generation 1. Checkpoints are written every
-256 commits (configurable) and by `weftfs checkpoint`.
+`checkpoint` is the manifest hash of a full state snapshot (§2.4) used as a
+replay base. Without it, replay starts at generation 1. Checkpoints are written
+every 256 commits (configurable) and by `weftfs checkpoint`. A checkpoint named
+by a commit MUST describe the state **after** applying that commit's ops and
+MUST declare `generation` equal to the commit's generation. A mismatch is
+`Corrupt`, and replay ignores the checkpoint and falls back to an earlier base.
+When replay reaches a commit whose checkpoint verifies, it loads that state and
+**skips** that commit's own ops (they are already included), then continues with
+the next generation.
 
 Ops (maps with `"op"` text):
 
@@ -135,6 +141,105 @@ experimental profile, not v1 persistence). The manifest is:
 Manifest identity is the manifest hash; whole-content identity is
 `H("weft/chunk/v1", plaintext)` and MUST be verified after assembly. Empty files
 have zero chunks and content hash of the empty byte string.
+
+### 2.3.1 Derived identities
+
+```
+version_record = {"schema":"weftfs.version.v1", "object":bytes32,
+                  "content":bytes32, "size":u64, "mtime_ns":timestamp,
+                  "parent":bytes32|null}
+VersionId      = H("weft/version/v1", WCB(version_record))
+
+ObjectId       = H("weft/object/v1", seed)       # seed = 32 random bytes by
+                                                  # default; tests may supply
+EntryId        = H("weft/entry/v1", WCB({"parent":bytes32,"name":bytes}))
+RelationId     = H("weft/relation/v1", WCB({"subject":bytes32,
+                  "predicate":text,"kind":text,"object":bytes32|scalar,
+                  "provenance":map|null,"attrs":map}))
+SnapshotId     = commit root hash of the snapshot commit
+```
+
+An entry identity is the (parent,name) pair: renaming removes and inserts an
+entry, while the target ObjectId is unchanged. Two entries with the same
+parent/name cannot coexist. A relation identity excludes any edge-local
+metadata that is not part of the assertion; the fields above are all part of
+it in v1.
+
+### 2.4 Checkpoint state manifest
+
+`commit.checkpoint` names a WCB state manifest stored content-addressed under
+`manifests/`. Its bytes are:
+
+```
+{
+  "schema": "weftfs.state.v1",
+  "generation": u64,
+  "objects":  [ object_record, ... ],
+  "entries":  [ entry_record, ... ],
+  "relations":[ relation_record, ... ],
+  "snapshots": { text_name: bytes32_commit, ... },
+  "tips":      { bytes32_object: bytes32_version, ... }
+}
+```
+
+`object_record`:
+
+```
+{"id":bytes32, "kind":text, "mode":u64, "uid":u64, "gid":u64,
+ "mtime_ns":timestamp, "version":bytes32, "content":bytes32, "size":u64,
+ "attrs":map}
+```
+
+`entry_record`:
+
+```
+{"id":bytes32, "parent":bytes32, "name":bytes, "target":bytes32}
+```
+
+`relation_record`:
+
+```
+{"id":bytes32, "subject":bytes32, "predicate":text, "kind":text,
+ "object":bytes32|scalar, "provenance":map|null, "attrs":map}
+```
+
+A symlink's target is stored in `attrs["weft.symlink.target"]` as `bytes`.
+A checkpoint MUST describe exactly the state after applying the commit that
+names it; a mismatch is `Corrupt` and replay falls back to an earlier base.
+The state manifest hash is `H("weft/manifest/v1", WCB bytes)`.
+
+### 2.5 Reserved relation values, saved contexts, and xattrs
+
+Reserved predicate `tagged_as` is sugar for a tag: target is a text value.
+
+Reserved predicate `saved_context` stores a named selector as a normal
+relation, so it participates in the same transactions and snapshots:
+
+```
+subject   = root ObjectId (32 zero bytes)
+predicate = "saved_context"
+kind      = "value"
+target    = text name (unique among saved contexts)
+attrs     = {"selector_hex": text}, where selector_hex is lowercase hex of
+            the canonical selector bytes from WEFT-SELECTORS.md
+```
+
+A `saved_context` relation is visible only to principals allowed to read the
+root object. Two relations with the same name but different selectors are a
+validation error; replacement is delete+add in one commit.
+
+Extended attributes are stored in the object's `attrs` map with the key
+`xattr.<name>` and a `bytes` value. `listxattr` exposes the `<name>` suffixes;
+`getxattr`/`setxattr`/`removexattr` operate on those entries. Names are UTF-8
+without NUL and without `/`; values are bounded by the store's attribute
+limit. Reserved `weft.*` keys are not exposed through xattr calls.
+
+### 2.6 Pointer files
+
+`refs/snapshots/<name>` and `refs/tags/<name>` contain lowercase hex of a
+32-byte hash followed by a single `\n`. They are **caches**, not authority:
+a reader MUST validate the named commit by replay. Names are UTF-8 without
+`/` or NUL; a name collision is an error, not a silent overwrite.
 
 ---
 
@@ -215,7 +320,9 @@ A `Principal` is `(uid, gid, groups)`. Access checks:
 
 1. Namespace root must be readable/traversable.
 2. An object is visible if its POSIX mode permits the requested access for the
-   principal, and, if `attrs["weft.acl.read"]` exists, the principal is listed.
+   principal, and, if `attrs["weft.acl.read"]` exists, it is an array of `u64`
+   uid values and the principal's uid is listed (uid 0 is not special in the
+   authorization predicate; mount-level root behavior is a FUSE policy).
 3. A relation is visible only if its subject and target are visible.
 4. Selector resolution filters the universe **before** matching; result counts
    and evidence contain only authorized objects.
@@ -270,3 +377,68 @@ On open (writer):
 
 Recovery is read-only until `verify --repair` explicitly requests a destructive
 action; repair defaults to quarantine, not deletion.
+
+---
+
+## 9. Context Roots, causal identity, and capabilities (additive)
+
+This section is additive to the frozen v1 model above. It introduces no change
+to any existing v1 byte, identity, or commit record. The normative definitions
+live in `spec/WEFT-CONTEXT-ROOT.md`, `spec/WEFT-CAUSAL.md`, and
+`spec/WEFT-CAPABILITIES.md`.
+
+### 9.1 New entities
+
+| Entity | Definition | Stability |
+|---|---|---|
+| `ContextRootId` | `H("weft/context-root/v1", WCB(context-root record))` | immutable selection identity |
+| `CausalClosureId` | `H("weft/causal/v1", WCB(causal record))` | immutable ancestry identity |
+| `CapabilityHash` | `H("weft/capability/v1", WCB(capability record))` | immutable grant identity |
+
+A Context Root binds a canonical selector, its `SelectorId`, a pinned snapshot
+commit, a resolver/policy version, an ordered causal closure, an optional
+capability hash, an optional budget, and the v1 ordering policy
+`selector_then_object_id`. It denotes a selection, never a result set and never
+the first match.
+
+### 9.2 Version-record causal fields (opt-in only)
+
+`WEFT-CAUSAL.md` §2 defines two identity modes. `bytes_only` is the **v1
+default and is byte-identical to §2.3.1 above**; its version record carries no
+additional fields. `causal_exact` adds exactly two fields to the version
+record:
+
+```
+"identity_mode": "causal_exact",
+"causal_hash":   bytes32
+```
+
+and derives `VersionId = H("weft/version/v1", WCB(record))` over the extended
+record. `ContentId`, `ManifestId`, and every existing frozen vector are
+unchanged. An implementation that does not implement `causal_exact` MUST reject
+it with `UnsupportedVersion`; it MUST NOT ignore the fields.
+
+### 9.3 Reserved attributes
+
+`weft.causal.parents`, `weft.causal.closure`, `weft.causal.hash`, and
+`weft.identity.mode` are reserved `weft.*` attribute keys and are not exposed
+through xattr calls (§2.5). Their encodings and validation are defined in
+`WEFT-CAUSAL.md` §3.
+
+### 9.4 Invariants (additive)
+
+- **I9 Root pinning:** a `ContextRootId` always resolves at exactly its named
+  snapshot; it never follows a tag or the live head.
+- **I10 Root cardinality:** a Context Root exposes the authorized cardinality of
+  its selection and never collapses n>1 to one result.
+- **I11 Identity separation:** content identity does not imply selection
+  identity, and selection identity does not imply content existence.
+- **I12 Causal graphs may cycle; codec dependency graphs must not.**
+- **I13 Capability narrowing:** a capability context can only narrow, never
+  widen, the authorization already enforced by §6.
+
+`I9`/`I10` are implemented by the codec-level canonicalization and specified for
+resolution in F2/F3; `I11` is tested by F1 vectors; `I12` is normative here and
+in both code docs; `I13` is specified for F2. No property in this section is
+claimed model-checked until the corresponding artifact is named in
+`CLAIM_LEDGER`.
