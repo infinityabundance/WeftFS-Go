@@ -574,9 +574,50 @@ assuming them:
   because it performs no publication.
 
 Backend selection is explicit (`Store::init_with_backend`,
-`Store::open_with_backend`, `Options`-equivalent CLI `--backend local|object`).
+`Store::open_with_backend`, `Options`-equivalent CLI `--backend local|object|s3`).
 The default is `LocalBackend`, so every existing fixture and handoff is
 unchanged.
+
+### 4.1.1 Conditional-write head publication (S3-compatible backends)
+
+An object-store backend has no POSIX `rename(2)` and no in-place range write.
+`S3Backend` maps the contract as follows:
+
+- **Keys.** The logical layout of §2 is used verbatim: `FORMAT`, `superblock`,
+  `LOCK`, `commits/<gen>.commit`, `objects/<ab>/<hash>`,
+  `manifests/<ab>/<hash>`, `indexes/<ab>/<commit>.idx`,
+  `refs/snapshots/<name>`, `refs/tags/<name>`, `quota`, `quota.migrated`.
+  Consequently a local store and an S3 store built from identical operations
+  publish identical artifact bytes under identical names.
+- **`put_atomic`.** A single `PUT` with `If-None-Match: *`. `200` publishes;
+  `412` means the key already exists. The writer then reads the existing bytes:
+  identical bytes are an idempotent success, different bytes are `Exists`.
+  A backend that accepts the second `PUT` has ignored the precondition and is
+  not usable for this store.
+- **`write_at` (superblock).** Read the whole `superblock` object and its ETag,
+  patch the inactive 4096-byte slot, then `PUT` the whole object with
+  `If-Match: <ETag>`. A `412` is a lost race: re-read and retry a bounded number
+  of times, then fail `Busy`. A successful write is visible all-or-nothing under
+  the key; the previous generation remains readable because the other slot is
+  unchanged. The 8192-byte object shape and both slot CRCs are exactly those of
+  §2.1.
+- **Writer lock.** A `LOCK` object created with `If-None-Match: *`, carrying an
+  owner and an expiry. A second live writer fails `Busy`. An expired lease is
+  replaced with `If-Match`, so a crashed writer does not brick the store. The
+  lock is advisory and provider-side; it is not a POSIX file lock and it is not
+  a multi-host coordination protocol.
+- **Probe.** A writable open performs a temporary `If-None-Match: *` create, a
+  duplicate-create attempt, and a stale-`If-Match` attempt. If either
+  precondition is ignored, the store refuses writable mode with
+  `UnsupportedVersion`. It never degrades to an unconditional overwrite.
+- **Durability semantics.** The backend declares `durable_fsync` only in the
+  sense that the provider acknowledged the write. There is no local `fsync`.
+  This is a provider-level durability assumption, not a media or power-loss
+  guarantee; the MinIO court backs its data with a tmpfs and makes no such
+  claim.
+
+A backend that cannot provide both conditional forms must not be used for this
+store. The refusal is the required behaviour, not a limitation to work around.
 
 Network and distributed filesystems. A POSIX-namespace target (for example 3FS)
 can be addressed through the local backend because it exposes files, `rename`,
