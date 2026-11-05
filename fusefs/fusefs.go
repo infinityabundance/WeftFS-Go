@@ -39,6 +39,12 @@ type Options struct {
 	Capability *auth.Capability
 	// Context makes the mount root a resolved Context Root's result set.
 	Context *ContextMount
+	// WriteBack buffers each handle's writes and commits them at
+	// flush/fsync/release. Off by default (commit per write).
+	WriteBack bool
+	// GroupCommit batches independent mutations arriving within a short window
+	// into one durable commit. Off by default.
+	GroupCommit bool
 }
 
 // ContextMount is a resolved Context Root used as the mount root.
@@ -76,6 +82,21 @@ type Server struct {
 	gcPasses atomic.Uint64
 	gcErrMu  sync.Mutex
 	gcErr    error
+	// Write-back and group-commit state. Both are serialized by mu.
+	writeBack     bool
+	groupCommit   bool
+	groupOpen     bool
+	groupOpenedAt time.Time
+	groupOps      int
+	groupErr      error
+	groupStop     chan struct{}
+	groupDone     chan struct{}
+	// groupLifecycle guards starting/stopping the publisher. StopGroupCommit
+	// is called both from OnForget and from tests, possibly concurrently.
+	groupLifecycle sync.Mutex
+	// handles is the set of live file handles, used to flush buffered writes
+	// before a namespace mutation.
+	handles map[*fileHandle]struct{}
 }
 
 // inodeTable assigns stable, collision-free inode numbers per mount.
@@ -298,6 +319,9 @@ func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
 		s.pinned = true
 	}
 	s.readOnly = opts.ReadOnly || s.opts.Snapshot != nil || opts.Context != nil || st.Mode() == store.ReadOnly
+	s.writeBack = opts.WriteBack && !s.readOnly
+	s.groupCommit = opts.GroupCommit && !s.readOnly
+	s.handles = map[*fileHandle]struct{}{}
 	s.root = &node{srv: s, kind: kindObject, id: model.RootID}
 	if opts.Context != nil {
 		s.root = &node{srv: s, kind: kindContextRoot, context: opts.Context.Name}
@@ -336,6 +360,11 @@ func Mount(st *store.Store, opts Options) (*fuse.Server, *Server, error) {
 			_ = server.Unmount()
 			return nil, nil, err
 		}
+	}
+	if s.groupCommit {
+		s.StartGroupCommit()
+		// A failed start is impossible (the goroutine cannot fail); the stop
+		// channel is always created so StopGroupCommit is safe.
 	}
 	return server, s, nil
 }

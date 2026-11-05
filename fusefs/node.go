@@ -166,6 +166,12 @@ func (n *node) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) 
 		return errno(err)
 	}
 	fillAttr(&out.Attr, record, n.srv.viewState().NLink(n.id), ino)
+	// fstat on a write-back handle reports the buffered size; a path stat
+	// still sees the committed size (see docs/fuse-status.md).
+	if handle, ok := f.(*fileHandle); ok && handle != nil && handle.srv.writeBack && len(handle.pending) > 0 {
+		out.Attr.Size = handle.pendingEnd()
+		out.Attr.Blocks = (out.Attr.Size + 511) / 512
+	}
 	return 0
 }
 
@@ -555,6 +561,11 @@ type fileHandle struct {
 	pinnedObject  bool
 	pinnedContent bool
 	tmpfile       bool
+	// pending holds write-back buffered ranges in call order.
+	pending []pendingWrite
+	// manifest is the last manifest this handle produced or read, reused by
+	// the next non-buffered write. Advisory only.
+	manifest *store.ManifestCache
 	// lockOwners are the FUSE lock owners observed on this handle. They are
 	// released when the handle is released (see locks.go for the limitation).
 	lockOwners map[uint64]struct{}
@@ -607,6 +618,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		srv: n.srv, id: n.id, content: record.Content, size: record.Size,
 		append: flags&uint32(syscall.O_APPEND) != 0, readOnlyView: readOnlyView,
 	}
+	n.srv.handles[handle] = struct{}{}
 	if readOnlyView {
 		n.srv.store.PinContent(record.Content)
 		handle.pinnedContent = true
@@ -637,17 +649,58 @@ func (h *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.Rea
 	}
 	h.srv.mu.Lock()
 	content, size := h.currentLocked()
+	// A write-back handle sees its own buffered bytes; every other reader
+	// sees committed content until this handle flushes.
+	visible := size
+	var pending []pendingWrite
+	if h.srv.writeBack {
+		if end := h.pendingEnd(); end > visible {
+			visible = end
+		}
+		if len(h.pending) > 0 {
+			pending = append(pending, h.pending...)
+		}
+	}
 	h.srv.mu.Unlock()
-	if uint64(off) >= size {
+	if uint64(off) >= visible {
 		return fuse.ReadResultData(nil), 0
 	}
 	length := uint64(len(dest))
-	if uint64(off)+length > size {
-		length = size - uint64(off)
+	if uint64(off)+length > visible {
+		length = visible - uint64(off)
 	}
-	data, err := h.srv.store.ReadContent(content, uint64(off), length)
+	committed := uint64(0)
+	if size > uint64(off) {
+		committed = size - uint64(off)
+		if committed > length {
+			committed = length
+		}
+	}
+	data, err := h.srv.store.ReadContent(content, uint64(off), committed)
 	if err != nil {
 		return nil, errno(err)
+	}
+	if len(pending) > 0 {
+		out := make([]byte, int(length))
+		copy(out, data)
+		readEnd := uint64(off) + length
+		for _, write := range pending {
+			writeStart := write.offset
+			writeEnd := write.offset + uint64(len(write.data))
+			start := writeStart
+			if uint64(off) > start {
+				start = uint64(off)
+			}
+			end := writeEnd
+			if readEnd < end {
+				end = readEnd
+			}
+			if start >= end {
+				continue
+			}
+			copy(out[start-uint64(off):end-uint64(off)], write.data[start-writeStart:end-writeStart])
+		}
+		return fuse.ReadResultData(out), 0
 	}
 	return fuse.ReadResultData(data), 0
 }
@@ -669,34 +722,88 @@ func (h *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32,
 	if record, ok := state.Objects[h.id]; ok {
 		if h.append {
 			writeOffset = record.Size
+			if end := h.pendingEnd(); end > writeOffset {
+				writeOffset = end
+			}
 		}
 	} else if h.append {
 		writeOffset = h.size
+		if end := h.pendingEnd(); end > writeOffset {
+			writeOffset = end
+		}
 	}
 	if writeOffset > store.MaxFileBytes || uint64(len(data)) > store.MaxFileBytes ||
 		writeOffset+uint64(len(data)) < writeOffset ||
 		writeOffset+uint64(len(data)) > store.MaxFileBytes {
 		return 0, syscall.EFBIG
 	}
-	if _, err := h.srv.store.WriteFile(h.id, writeOffset, data); err != nil {
+	if h.srv.writeBack {
+		if h.pendingBytes()+len(data) > writeBackMaxBytes {
+			if err := h.srv.flushHandleLocked(h); err != nil {
+				return 0, errno(err)
+			}
+		}
+		buffered := make([]byte, len(data))
+		copy(buffered, data)
+		h.pending = append(h.pending, pendingWrite{offset: writeOffset, data: buffered})
+		if writeOffset+uint64(len(data)) > h.size {
+			h.size = writeOffset + uint64(len(data))
+		}
+		return uint32(len(data)), 0
+	}
+	if err := h.srv.beginGroupedMutationLocked(); err != nil {
 		return 0, errno(err)
 	}
-	if record, ok := h.srv.viewState().Objects[h.id]; ok {
-		h.content = record.Content
-		h.size = record.Size
+	outcome, err := h.srv.store.WriteFileCached(h.id, writeOffset, data, h.manifest)
+	if err != nil {
+		_ = h.srv.finishGroupedMutationLocked()
+		return 0, errno(err)
+	}
+	h.content = outcome.Content
+	h.size = outcome.Size
+	if manifest, manifestErr := h.srv.store.ManifestOf(outcome.Content); manifestErr == nil {
+		h.manifest = &store.ManifestCache{Content: outcome.Content, Manifest: manifest}
+	}
+	if err := h.srv.finishGroupedMutationLocked(); err != nil {
+		return 0, errno(err)
 	}
 	return uint32(len(data)), 0
 }
 
-func (h *fileHandle) Flush(ctx context.Context) syscall.Errno { return 0 }
+func (h *fileHandle) Flush(ctx context.Context) syscall.Errno {
+	h.srv.mu.Lock()
+	defer h.srv.mu.Unlock()
+	if h.srv.writeBack {
+		if err := h.srv.flushHandleLocked(h); err != nil {
+			return errno(err)
+		}
+	}
+	return 0
+}
+
 func (h *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	// Every mutation is a durably published commit before its reply.
+	h.srv.mu.Lock()
+	defer h.srv.mu.Unlock()
+	if h.srv.writeBack {
+		if err := h.srv.flushHandleLocked(h); err != nil {
+			return errno(err)
+		}
+		return 0
+	}
+	if err := h.srv.publishGroupLocked(); err != nil {
+		return errno(err)
+	}
 	return 0
 }
 
 func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 	h.srv.mu.Lock()
 	defer h.srv.mu.Unlock()
+	var flushErr error
+	if h.srv.writeBack {
+		flushErr = h.srv.flushHandleLocked(h)
+	}
+	delete(h.srv.handles, h)
 	for owner := range h.lockOwners {
 		h.srv.locks.releaseOwner(owner)
 	}
@@ -710,6 +817,9 @@ func (h *fileHandle) Release(ctx context.Context) syscall.Errno {
 		// unreferenced record is retained (and reclaimed by GC in Rust).
 		_, _ = h.srv.store.UnpinObject(h.id)
 		h.pinnedObject = false
+	}
+	if flushErr != nil {
+		return errno(flushErr)
 	}
 	return 0
 }
@@ -729,6 +839,14 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 	}
 	principal := principalOf(ctx)
 	if err := model.ValidateNameBytes([]byte(name)); err != nil {
+		return nil, nil, 0, errno(err)
+	}
+	if n.srv.writeBack {
+		if err := n.srv.flushAllPendingLocked(); err != nil {
+			return nil, nil, 0, errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
 		return nil, nil, 0, errno(err)
 	}
 	state := n.srv.viewState()
@@ -777,6 +895,10 @@ func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint3
 		srv: n.srv, id: id, content: record.Content, size: record.Size,
 		append: flags&uint32(syscall.O_APPEND) != 0, pinnedObject: true,
 	}
+	n.srv.handles[handle] = struct{}{}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, nil, 0, errno(err)
+	}
 	return n.NewInode(ctx, child, child.stable()), handle, 0, 0
 }
 
@@ -795,6 +917,9 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 		return nil, errno(err)
 	}
 	principal := principalOf(ctx)
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	id, err := n.srv.store.Mkdir(n.id, []byte(name), uint64(mode&0o7777), uint64(principal.UID), uint64(principal.GID))
 	if err != nil {
 		return nil, errno(err)
@@ -805,6 +930,9 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	}
 	child := n.srv.newNode(kindObject, id, "")
 	fillAttr(&out.Attr, record, n.srv.viewState().NLink(id), n.srv.inodes.objectIno(id))
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	return n.NewInode(ctx, child, child.stable()), 0
 }
 
@@ -819,7 +947,18 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if n.srv.readOnly {
 		return syscall.EROFS
 	}
+	if n.srv.writeBack {
+		if err := n.srv.flushAllPendingLocked(); err != nil {
+			return errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	if err := n.srv.store.Unlink(n.id, []byte(name)); err != nil {
+		return errno(err)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
 		return errno(err)
 	}
 	return 0
@@ -836,7 +975,18 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if n.srv.readOnly {
 		return syscall.EROFS
 	}
+	if n.srv.writeBack {
+		if err := n.srv.flushAllPendingLocked(); err != nil {
+			return errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	if err := n.srv.store.Rmdir(n.id, []byte(name)); err != nil {
+		return errno(err)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
 		return errno(err)
 	}
 	return 0
@@ -857,6 +1007,14 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	if n.srv.readOnly {
 		return syscall.EROFS
 	}
+	if n.srv.writeBack {
+		if err := n.srv.flushAllPendingLocked(); err != nil {
+			return errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	var err error
 	switch {
 	case flags&fs.RENAME_EXCHANGE != 0:
@@ -873,6 +1031,9 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		err = n.srv.store.Rename(n.id, []byte(name), target.id, []byte(newName))
 	}
 	if err != nil {
+		return errno(err)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
 		return errno(err)
 	}
 	return 0
@@ -893,6 +1054,9 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	if n.srv.readOnly {
 		return nil, syscall.EROFS
 	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	if err := n.srv.store.Link(targetNode.id, n.id, []byte(name)); err != nil {
 		return nil, errno(err)
 	}
@@ -902,6 +1066,9 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 	}
 	child := n.srv.newNode(kindObject, targetNode.id, "")
 	fillAttr(&out.Attr, record, n.srv.viewState().NLink(targetNode.id), n.srv.inodes.objectIno(targetNode.id))
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	return n.NewInode(ctx, child, child.stable()), 0
 }
 
@@ -917,6 +1084,9 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 		return nil, syscall.EROFS
 	}
 	principal := principalOf(ctx)
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	id, err := n.srv.store.Symlink(n.id, []byte(name), []byte(target), uint64(principal.UID), uint64(principal.GID))
 	if err != nil {
 		return nil, errno(err)
@@ -927,6 +1097,9 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	}
 	child := n.srv.newNode(kindObject, id, "")
 	fillAttr(&out.Attr, record, n.srv.viewState().NLink(id), n.srv.inodes.objectIno(id))
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	return n.NewInode(ctx, child, child.stable()), 0
 }
 
@@ -988,6 +1161,16 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 	if err != nil {
 		return errno(err)
 	}
+	// Publish buffered writes before a truncate/metadata change so a later
+	// flush cannot write into a stale version.
+	if n.srv.writeBack {
+		if err := n.srv.flushNodePendingLocked(n.id); err != nil {
+			return errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	if size, ok := in.GetSize(); ok {
 		if record.Kind != model.KindFile {
 			if record.Kind == model.KindDir {
@@ -1003,6 +1186,9 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if _, err := n.srv.store.Setattr(n.id, changes); err != nil {
 			return errno(err)
 		}
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return errno(err)
 	}
 	record, err = n.recordLocked()
 	if err != nil {
@@ -1127,7 +1313,13 @@ func (n *node) Setxattr(ctx context.Context, attr string, data []byte, flags uin
 	if flags&^(xattrCreate|xattrReplace) != 0 {
 		return syscall.EINVAL
 	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	if err := n.srv.store.SetXattr(n.id, attr, data); err != nil {
+		return errno(err)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
 		return errno(err)
 	}
 	return 0
@@ -1142,12 +1334,18 @@ func (n *node) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	if n.srv.readOnly {
 		return syscall.EROFS
 	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	removed, err := n.srv.store.RemoveXattr(n.id, attr)
 	if err != nil {
 		return errno(err)
 	}
 	if !removed {
 		return syscall.ENODATA
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return errno(err)
 	}
 	return 0
 }
@@ -1282,6 +1480,11 @@ var _ = (fs.NodeOnForgetter)((*node)(nil))
 func (n *node) OnForget() {
 	if n.kind == kindContextRoot || (n.kind == kindObject && n.id == model.RootID) {
 		n.srv.StopBackgroundGC()
+		n.srv.StopGroupCommit()
+		n.srv.mu.Lock()
+		_ = n.srv.flushAllPendingLocked()
+		_ = n.srv.publishGroupLocked()
+		n.srv.mu.Unlock()
 		n.srv.locks.clear()
 	}
 }
@@ -1321,6 +1524,9 @@ func (n *node) Mknod(ctx context.Context, name string, mode uint32, dev uint32, 
 		return nil, errno(err)
 	}
 	principal := principalOf(ctx)
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	id, err := n.srv.store.CreateFile(n.id, []byte(name), nil, uint64(mode&0o7777), uint64(principal.UID), uint64(principal.GID), nil)
 	if err != nil {
 		return nil, errno(err)
@@ -1331,6 +1537,9 @@ func (n *node) Mknod(ctx context.Context, name string, mode uint32, dev uint32, 
 	}
 	child := n.srv.newNode(kindObject, id, "")
 	fillAttr(&out.Attr, record, n.srv.viewState().NLink(id), n.srv.inodes.objectIno(id))
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, errno(err)
+	}
 	return n.NewInode(ctx, child, child.stable()), 0
 }
 
@@ -1352,6 +1561,9 @@ func (n *node) Tmpfile(ctx context.Context, flags uint32, mode uint32, out *fuse
 		return nil, nil, 0, syscall.EROFS
 	}
 	principal := principalOf(ctx)
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return nil, nil, 0, errno(err)
+	}
 	id, err := n.srv.store.CreateUnlinkedFile(nil, uint64(mode&0o7777), uint64(principal.UID), uint64(principal.GID), nil)
 	if err != nil {
 		return nil, nil, 0, errno(err)
@@ -1368,6 +1580,10 @@ func (n *node) Tmpfile(ctx context.Context, flags uint32, mode uint32, out *fuse
 	handle := &fileHandle{
 		srv: n.srv, id: id, content: record.Content, size: record.Size,
 		append: flags&uint32(syscall.O_APPEND) != 0, pinnedObject: true, tmpfile: true,
+	}
+	n.srv.handles[handle] = struct{}{}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return nil, nil, 0, errno(err)
 	}
 	return n.NewInode(ctx, child, child.stable()), handle, 0, 0
 }
@@ -1409,6 +1625,15 @@ func (n *node) Allocate(ctx context.Context, f fs.FileHandle, off uint64, size u
 	if mode&^known != 0 {
 		return syscall.EOPNOTSUPP
 	}
+	// Publish buffered writes first: a fallocate rewrites the same content.
+	if n.srv.writeBack {
+		if err := n.srv.flushNodePendingLocked(n.id); err != nil {
+			return errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return errno(err)
+	}
 	var operation error
 	switch {
 	case mode&fallocCollapse != 0:
@@ -1444,6 +1669,9 @@ func (n *node) Allocate(ctx context.Context, f fs.FileHandle, off uint64, size u
 	}
 	if operation != nil {
 		return errno(operation)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
+		return errno(err)
 	}
 	return 0
 }
@@ -1521,7 +1749,18 @@ func (n *node) CopyFileRange(ctx context.Context, fhIn fs.FileHandle, offIn uint
 	if err != nil {
 		return 0, errno(err)
 	}
+	if n.srv.writeBack {
+		if err := n.srv.flushNodePendingLocked(outNode.id); err != nil {
+			return 0, errno(err)
+		}
+	}
+	if err := n.srv.beginGroupedMutationLocked(); err != nil {
+		return 0, errno(err)
+	}
 	if _, err := n.srv.store.WriteFile(outNode.id, offOut, data); err != nil {
+		return 0, errno(err)
+	}
+	if err := n.srv.finishGroupedMutationLocked(); err != nil {
 		return 0, errno(err)
 	}
 	return uint32(len(data)), 0

@@ -750,3 +750,44 @@ Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
 - **Limits.** Admission budgets do not return budget on deletion. Tenant
   attribution requires the `weft.tenant` attribute (`create --tenant`); the
   FUSE write path does not set it yet. Merge is not a three-way content merge.
+
+### Q1 mount write path (`store`, `fusefs`, `cmd`) — implemented
+
+- **Mount identity default.** `mount` defaults `--content-identity` to `merkle`
+  when the flag is not supplied; every other command keeps `whole-file`. A
+  Merkle file is written as `weft.manifest.v3` and a v1/v2/v3 file keeps its
+  identity on rewrite (v3 is never downgraded). Reads accept both.
+  `--representation codec-auto` on a mount requires an explicit
+  `--content-identity whole-file` and otherwise fails with `InvalidArgument`.
+- **`--write-back`.** Per-handle buffered ranges (`RangeWrite`), committed as one
+  `WriteFileRanges` call at `flush`/`fsync`/`release`. The writing descriptor
+  reads its own buffer; other readers see the last commit until the flush.
+  `fsync` publishes before replying. A crash loses unflushed ranges. The buffer
+  is bounded at 32 MiB per handle (early flush on overflow).
+- **`--group-commit`.** `Store.BeginGroup`/`CommitGroup`/`AbortGroup` buffer the
+  ops of independent mutations; one commit is published when a 10 ms window
+  elapses, 256 ops accumulate, `fsync` runs, or the mount is torn down. A
+  pre-image journal restores the pre-group state on abort and is used for quota
+  attribution. A crash leaves the previous whole generation. Publisher failures
+  after a reply surface as `EIO` on later mutations.
+- **Redundant work removed.** `Store.WriteFileRanges` decodes and encodes the
+  manifest once per flush and reuses untouched chunk refs; `WriteFileCached`
+  reuses a caller-held manifest only while it still names the current content
+  id; `Store.ManifestOf` seeds that cache.
+- **Lifecycle safety.** The group publisher is stopped idempotently from
+  `OnForget`, unmount, and tests, and never holds `mu` while waiting for its
+  own stop signal. `go test -race ./...` is clean.
+- **Tests.** `store/group_test.go` (5): one commit per group, abort restores,
+  empty group, multi-range equivalence/one commit, overlap order, advisory
+  cache. `fusefs/writeback_test.go` (4): buffered read-back and fsync
+  durability against an independent read-only store, release publish,
+  group-commit tree, combined mode. Court: `go test -race ./...` all packages
+  pass; `go vet` and `CGO_ENABLED=0 go build` clean.
+- **Measurement and crash proxy.** The shared receipt
+  `bench/receipts/fuse-writeback-20261105T200833Z.json` (parent repo) covers both
+  frontends: Go merkle write p50 26.7 ms → 11.0 µs with `--write-back`, create
+  384 → 7,314 ops/s with `--group-commit`, and the same 8/8 old-or-new crash
+  proxy results. Single host, synthetic, buffered I/O; no device claim.
+- **Gaps.** Group publication of content writes is still one durable blob per
+  touched chunk, so grouping helps metadata far more than range writes. There is
+  no shared multi-mount daemon.

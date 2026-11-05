@@ -78,6 +78,10 @@ var (
 	representationMode  = store.RepresentationModeRaw
 	codecMinBytes       = store.DefaultCodecMinBytes
 	contentIdentityMode = model.ContentIdentityWholeFile
+	// contentIdentityExplicit records whether --content-identity was supplied.
+	// `mount` defaults to Merkle identity when it was not; every other command
+	// keeps the frozen whole-file default so existing fixtures stay v1.
+	contentIdentityExplicit bool
 	// quotaBudgets are the --quota/--quota-file budgets supplied on this
 	// invocation. They install (or replace) the persisted policy on a writable
 	// open; an empty slice enforces the persisted policy unchanged.
@@ -159,6 +163,7 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			contentIdentityMode = identity
+			contentIdentityExplicit = true
 			i++
 		case strings.HasPrefix(args[i], "--content-identity="):
 			identity, parseErr := store.ParseContentIdentity(strings.TrimPrefix(args[i], "--content-identity="))
@@ -166,6 +171,7 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			contentIdentityMode = identity
+			contentIdentityExplicit = true
 		case args[i] == "--quota" || args[i] == "-quota":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--quota requires a value")
@@ -1964,6 +1970,8 @@ func cmdMount(args []string, storeDir string) error {
 	gcWatch := fs.Bool("gc-watch", false, "run online background GC on a writable live mount (disabled by default)")
 	gcInterval := fs.Duration("gc-interval", time.Duration(store.DefaultGCIntervalSecs)*time.Second, "background GC pass interval")
 	gcMaxDeletes := fs.Int("gc-max-deletes", int(store.DefaultGCWatchMaxDeletes), "maximum blobs deleted per background GC pass")
+	writeBack := fs.Bool("write-back", false, "buffer each handle's writes and commit at flush/fsync/release (off by default)")
+	groupCommit := fs.Bool("group-commit", false, "batch independent mutations within a short window into one durable commit (off by default)")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -1994,6 +2002,17 @@ func cmdMount(args []string, storeDir string) error {
 	if *gcWatch && *gcMaxDeletes <= 0 {
 		return werr.Newf(werr.InvalidArgument, "--gc-max-deletes must be >= 1")
 	}
+	if mode != store.ReadWrite && (*writeBack || *groupCommit) {
+		return werr.Newf(werr.InvalidArgument, "--write-back and --group-commit require a writable live mount")
+	}
+	// The mount default is Merkle identity; an explicit flag always wins and
+	// non-mount commands keep whole-file.
+	if !contentIdentityExplicit {
+		if representationMode == store.RepresentationModeCodecAuto {
+			return werr.Newf(werr.InvalidArgument, "--representation codec-auto requires an explicit --content-identity whole-file (a v3 Merkle manifest carries a raw representation only)")
+		}
+		contentIdentityMode = model.ContentIdentityMerkleV1
+	}
 	mountOpts := store.DefaultOptions()
 	applyRepresentationPolicy(&mountOpts)
 	if fixedTimestampNS != nil {
@@ -2015,7 +2034,7 @@ func cmdMount(args []string, storeDir string) error {
 	}
 	opts := fusefs.Options{
 		Mountpoint: *mountpoint, ReadOnly: *readOnly || capability != nil, AllowOther: *allowOther, Debug: *debug,
-		Capability: capability,
+		Capability: capability, WriteBack: *writeBack, GroupCommit: *groupCommit,
 	}
 	switch {
 	case *contextName != "":
@@ -2068,6 +2087,7 @@ func cmdMount(args []string, storeDir string) error {
 		return err
 	}
 	defer srv.StopBackgroundGC()
+	defer srv.StopGroupCommit()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

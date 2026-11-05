@@ -102,27 +102,96 @@ func (s *Store) WriteFile(id model.Hash32, offset uint64, data []byte) (model.Ha
 	return s.WriteFileCausal(id, offset, data, nil)
 }
 
+// RangeWrite is one byte range to apply in a single range-write commit.
+type RangeWrite struct {
+	Offset uint64
+	Data   []byte
+}
+
+// WriteOutcome reports the new version, manifest id, and logical size of a
+// range write. Callers keeping a ManifestCache refresh it from these fields.
+type WriteOutcome struct {
+	Version model.Hash32
+	Content model.Hash32
+	Size    uint64
+}
+
+// ManifestCache is a manifest a caller already holds for one object version.
+// WriteFileCached uses it only when it still names the object's current
+// content id and size; a stale cache is ignored, never trusted.
+type ManifestCache struct {
+	Content  model.Hash32
+	Manifest model.Manifest
+}
+
 // WriteFileCausal replaces a byte range with optional causal_exact ancestry.
 // An empty causal slice preserves an existing causal_exact closure (the mode is
 // sticky) and keeps bytes_only objects byte-identical to v1.
 func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, causal []model.Hash32) (model.Hash32, error) {
-	if err := s.requireWritable(); err != nil {
+	outcome, err := s.writeFileRangesCausal(id, []RangeWrite{{Offset: offset, Data: data}}, causal, nil)
+	if err != nil {
 		return model.Hash32{}, err
+	}
+	return outcome.Version, nil
+}
+
+// WriteFileCached replaces a byte range, reusing a manifest the caller already
+// holds. The cache is advisory: it is used only when it still matches the
+// object's current content id and size, so it can never change a result.
+func (s *Store) WriteFileCached(id model.Hash32, offset uint64, data []byte, cached *ManifestCache) (WriteOutcome, error) {
+	return s.writeFileRangesCausal(id, []RangeWrite{{Offset: offset, Data: data}}, nil, cached)
+}
+
+// WriteFileRanges applies several byte ranges with one manifest read, one
+// manifest write, and one commit. Ranges are applied in the order given, so
+// overlapping writes have the same last-writer-wins result as separate calls.
+// Empty ranges are ignored; an all-empty input publishes nothing.
+func (s *Store) WriteFileRanges(id model.Hash32, ranges []RangeWrite) (WriteOutcome, error) {
+	return s.writeFileRangesCausal(id, ranges, nil, nil)
+}
+
+func (s *Store) writeFileRangesCausal(id model.Hash32, ranges []RangeWrite, causal []model.Hash32, cached *ManifestCache) (WriteOutcome, error) {
+	if err := s.requireWritable(); err != nil {
+		return WriteOutcome{}, err
 	}
 	old, ok := s.state.Objects[id]
 	if !ok {
-		return model.Hash32{}, werr.Newf(werr.NotFound, "no such object")
+		return WriteOutcome{}, werr.Newf(werr.NotFound, "no such object")
 	}
 	if old.Kind != model.KindFile {
-		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "write_file requires a file object")
+		return WriteOutcome{}, werr.Newf(werr.InvalidArgument, "write_file requires a file object")
 	}
-	end := offset + uint64(len(data))
-	if end < offset || end > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
+	applied := make([]RangeWrite, 0, len(ranges))
+	for _, r := range ranges {
+		if len(r.Data) > 0 {
+			applied = append(applied, r)
+		}
 	}
-	oldManifest, err := ReadManifest(s.root, old.Content)
-	if err != nil {
-		return model.Hash32{}, err
+	if len(applied) == 0 {
+		return WriteOutcome{Version: old.Version, Content: old.Content, Size: old.Size}, nil
+	}
+	end := old.Size
+	for _, r := range applied {
+		rEnd := r.Offset + uint64(len(r.Data))
+		if rEnd < r.Offset || rEnd > MaxFileBytes {
+			return WriteOutcome{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
+		}
+		if rEnd > end {
+			end = rEnd
+		}
+	}
+	var oldManifest model.Manifest
+	var err error
+	if cached != nil && cached.Content == old.Content && cached.Manifest.Size == old.Size {
+		oldManifest = cached.Manifest
+	} else {
+		oldManifest, err = ReadManifest(s.root, old.Content)
+		if err != nil {
+			return WriteOutcome{}, err
+		}
+	}
+	if oldManifest.Size != old.Size {
+		return WriteOutcome{}, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 	}
 	identity := s.options.ContentIdentity
 	if oldManifest.Identity == model.ContentIdentityMerkleV1 {
@@ -134,14 +203,14 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	// re-hashed and re-stored, and the root is folded from the manifest's
 	// stored chunk hashes. A v3 file is never implicitly downgraded.
 	if identity == model.ContentIdentityMerkleV1 && !frameBacked {
-		return s.writeFileMerkle(id, old, oldManifest, offset, data, causal)
+		return s.writeFileMerkleRanges(id, old, oldManifest, applied, causal)
 	}
 	current, err := s.ReadObject(id)
 	if err != nil {
-		return model.Hash32{}, err
+		return WriteOutcome{}, err
 	}
 	if uint64(len(current)) != old.Size {
-		return model.Hash32{}, werr.Newf(werr.Corrupt, "file size changed while writing")
+		return WriteOutcome{}, werr.Newf(werr.Corrupt, "file size changed while writing")
 	}
 	newSize := end
 	if old.Size > newSize {
@@ -149,24 +218,26 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	}
 	sizeInt, err := checkedSize(newSize)
 	if err != nil {
-		return model.Hash32{}, err
-	}
-	offsetInt, err := checkedSize(offset)
-	if err != nil {
-		return model.Hash32{}, err
-	}
-	endInt, err := checkedSize(end)
-	if err != nil {
-		return model.Hash32{}, err
+		return WriteOutcome{}, err
 	}
 	buffer := make([]byte, sizeInt)
 	copy(buffer, current)
-	copy(buffer[offsetInt:endInt], data)
+	for _, r := range applied {
+		offsetInt, err := checkedSize(r.Offset)
+		if err != nil {
+			return WriteOutcome{}, err
+		}
+		endInt, err := checkedSize(r.Offset + uint64(len(r.Data)))
+		if err != nil {
+			return WriteOutcome{}, err
+		}
+		copy(buffer[offsetInt:endInt], r.Data)
+	}
 	parentVersions := causal
 	if len(parentVersions) == 0 {
 		closure, err := model.ObjectCausalClosure(old)
 		if err != nil {
-			return model.Hash32{}, err
+			return WriteOutcome{}, err
 		}
 		if closure != nil {
 			parentVersions = closure.Parents
@@ -174,13 +245,17 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	}
 	base, err := s.deltaBaseFor(parentVersions)
 	if err != nil {
-		return model.Hash32{}, err
+		return WriteOutcome{}, err
 	}
 	manifestID, _, _, err := s.storeFileContentWithBase(buffer, base)
 	if err != nil {
-		return model.Hash32{}, err
+		return WriteOutcome{}, err
 	}
-	return s.publishFileWrite(id, old, manifestID, newSize, causal)
+	version, err := s.publishFileWrite(id, old, manifestID, newSize, causal)
+	if err != nil {
+		return WriteOutcome{}, err
+	}
+	return WriteOutcome{Version: version, Content: manifestID, Size: newSize}, nil
 }
 
 // publishFileWrite derives the new version and publishes one commit. Shared by
@@ -229,40 +304,56 @@ func (s *Store) publishFileWrite(id model.Hash32, old model.ObjectRecord, manife
 	return version, nil
 }
 
-// writeFileMerkle applies a range write to a `weft.manifest.v3` file.
+// writeFileMerkleRanges applies range writes to a `weft.manifest.v3` file.
 //
-// Only chunks intersecting the write are read and re-hashed; untouched chunk
+// Only chunks intersecting a range are read and re-hashed; untouched chunk
 // references are reused verbatim and their blobs are never read. The root is
 // recomputed from the resulting chunk table with no whole-file read.
-func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldManifest model.Manifest, offset uint64, data []byte, causal []model.Hash32) (model.Hash32, error) {
+func (s *Store) writeFileMerkleRanges(id model.Hash32, old model.ObjectRecord, oldManifest model.Manifest, ranges []RangeWrite, causal []model.Hash32) (WriteOutcome, error) {
 	chunkSize := oldManifest.ChunkSize
 	if chunkSize == 0 || chunkSize > model.MaxChunkSize {
-		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
+		return WriteOutcome{}, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
 	}
-	end := offset + uint64(len(data))
-	if end < offset || end > MaxFileBytes {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
-	}
-	newSize := end
-	if old.Size > newSize {
-		newSize = old.Size
+	newSize := old.Size
+	for _, r := range ranges {
+		end := r.Offset + uint64(len(r.Data))
+		if end < r.Offset || end > MaxFileBytes {
+			return WriteOutcome{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
+		}
+		if end > newSize {
+			newSize = end
+		}
 	}
 	var declared uint64
 	for _, chunk := range oldManifest.Chunks {
 		if declared > ^uint64(0)-chunk.Len {
-			return model.Hash32{}, werr.Newf(werr.Corrupt, "manifest size overflows")
+			return WriteOutcome{}, werr.Newf(werr.Corrupt, "manifest size overflows")
 		}
 		declared += chunk.Len
 	}
 	if declared != oldManifest.Size || oldManifest.Size != old.Size {
-		return model.Hash32{}, werr.Newf(werr.Corrupt, "manifest chunk lengths disagree with its size")
+		return WriteOutcome{}, werr.Newf(werr.Corrupt, "manifest chunk lengths disagree with its size")
 	}
 	chunkCount := newSize / chunkSize
 	if newSize%chunkSize != 0 {
 		chunkCount++
 	}
 	if chunkCount > model.MaxChunksPerFile {
-		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+		return WriteOutcome{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+	}
+	// Which ranges touch each chunk, so the walk stays linear in the chunk
+	// count rather than quadratic in the range list.
+	touched := make(map[uint64][]int)
+	for index, r := range ranges {
+		end := r.Offset + uint64(len(r.Data))
+		if end > newSize {
+			return WriteOutcome{}, werr.Newf(werr.InvalidArgument, "range write exceeds the target file size")
+		}
+		first := r.Offset / chunkSize
+		last := (end - 1) / chunkSize
+		for chunk := first; chunk <= last; chunk++ {
+			touched[chunk] = append(touched[chunk], index)
+		}
 	}
 	chunks := make([]model.ChunkRef, 0, chunkCount)
 	for index := uint64(0); index < chunkCount; index++ {
@@ -275,8 +366,8 @@ func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldMani
 		if index < uint64(len(oldManifest.Chunks)) {
 			oldRef = &oldManifest.Chunks[index]
 		}
-		touchesWrite := chunkStart < end && offset < chunkEnd
-		if oldRef != nil && chunkEnd <= oldManifest.Size && !touchesWrite {
+		overlapping := touched[index]
+		if oldRef != nil && chunkEnd <= oldManifest.Size && len(overlapping) == 0 {
 			chunks = append(chunks, *oldRef)
 			continue
 		}
@@ -290,26 +381,30 @@ func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldMani
 			if keep > 0 {
 				stored, err := ReadBlobVerified(s.root, BlobObject, oldRef.Hash, model.DomainChunk)
 				if err != nil {
-					return model.Hash32{}, err
+					return WriteOutcome{}, err
 				}
 				s.writeChunkReads.Add(1)
 				if uint64(len(stored)) != oldRef.Len {
-					return model.Hash32{}, werr.Newf(werr.Corrupt, "chunk length disagrees with manifest")
+					return WriteOutcome{}, werr.Newf(werr.Corrupt, "chunk length disagrees with manifest")
 				}
 				copy(assembled[:keep], stored[:keep])
 				oldBytes = stored
 			}
 		}
-		writeStart := offset
-		if chunkStart > writeStart {
-			writeStart = chunkStart
-		}
-		writeEnd := end
-		if chunkEnd < writeEnd {
-			writeEnd = chunkEnd
-		}
-		if writeStart < writeEnd {
-			copy(assembled[writeStart-chunkStart:writeEnd-chunkStart], data[writeStart-offset:writeEnd-offset])
+		for _, rangeIndex := range overlapping {
+			r := ranges[rangeIndex]
+			writeStart := r.Offset
+			if chunkStart > writeStart {
+				writeStart = chunkStart
+			}
+			writeEnd := r.Offset + uint64(len(r.Data))
+			if chunkEnd < writeEnd {
+				writeEnd = chunkEnd
+			}
+			if writeStart >= writeEnd {
+				continue
+			}
+			copy(assembled[writeStart-chunkStart:writeEnd-chunkStart], r.Data[writeStart-r.Offset:writeEnd-r.Offset])
 		}
 		if oldRef != nil && oldBytes != nil && oldRef.Len == chunkEnd-chunkStart && bytes.Equal(assembled, oldBytes) {
 			chunks = append(chunks, *oldRef)
@@ -317,7 +412,7 @@ func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldMani
 		}
 		hash, err := s.storeBlob(BlobObject, model.DomainChunk, assembled)
 		if err != nil {
-			return model.Hash32{}, err
+			return WriteOutcome{}, err
 		}
 		chunks = append(chunks, model.ChunkRef{Hash: hash, Len: uint64(len(assembled))})
 	}
@@ -328,9 +423,13 @@ func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldMani
 	}
 	manifestID, _, _, err := s.storeManifest(manifest)
 	if err != nil {
-		return model.Hash32{}, err
+		return WriteOutcome{}, err
 	}
-	return s.publishFileWrite(id, old, manifestID, newSize, causal)
+	version, err := s.publishFileWrite(id, old, manifestID, newSize, causal)
+	if err != nil {
+		return WriteOutcome{}, err
+	}
+	return WriteOutcome{Version: version, Content: manifestID, Size: newSize}, nil
 }
 
 // contentIdentityFor returns the identity a rewrite of record must keep: an

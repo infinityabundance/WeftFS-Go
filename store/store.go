@@ -178,6 +178,14 @@ type Store struct {
 	// Chunk blobs read by the most recent Merkle range write. Diagnostic only:
 	// it proves an overwrite does not stream the whole file.
 	writeChunkReads atomic.Uint64
+	// Group commit: while groupDepth > 0 mutations are applied to the live
+	// state and their ops buffered instead of published. Nothing is durable
+	// until CommitGroup publishes one commit; AbortGroup restores the
+	// pre-group state from the journal.
+	groupDepth           int
+	pendingOps           []model.Op
+	groupForceCheckpoint bool
+	groupUndo            groupJournal
 }
 
 // ResetWriteChunkReads resets the Merkle range-write chunk-read counter.
@@ -1078,6 +1086,21 @@ func (s *Store) writeGenesis() error {
 func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, error) {
 	if err := s.requireWritable(); err != nil {
 		return model.Hash32{}, err
+	}
+	if s.groupDepth > 0 {
+		// Buffer instead of publish. ApplyOps is atomic for this batch, and the
+		// journal keeps the pre-group value of every key so AbortGroup can
+		// restore it exactly.
+		s.journalOps(ops)
+		if forceCheckpoint {
+			s.groupForceCheckpoint = true
+		}
+		if err := s.state.ApplyOps(ops); err != nil {
+			return model.Hash32{}, err
+		}
+		s.pendingOps = append(s.pendingOps, ops...)
+		// Inside a group no commit exists yet; the pre-group head is returned.
+		return s.head, nil
 	}
 	newGeneration := s.nextGeneration
 	timestamp := s.nowNS()
