@@ -718,3 +718,35 @@ invokes Rust.
    root set.
 4. `ioctl`, `mmap` writeback, atime/ctime persistence, and a physical
    power-loss court remain out of scope for this pass.
+
+## P5a — write budgets and branching time travel
+
+Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
+
+- **Budgets.** `--quota uid:GID:BYTES:OBJECTS` / `--quota-file FILE` install a
+  persisted admission policy. Before `publishCommit`, `quotaPreflight` charges
+  new/changed object records plus manifest/frame/chunk blobs not already
+  reachable from committed state and refuses the commit with
+  `BudgetExceeded: write budget exceeded` when any budget would be exceeded.
+  Nothing is published; generation, head, and state are unchanged. Denial text
+  is fixed and never discloses usage, limits, or another principal.
+- **Usage storage.** The store-root `quota` file (`WFQ1 || u64le len || WCB ||
+  BLAKE3("weft/quota/v1", WCB)`) is byte-identical to the Rust record. It names
+  the committed generation/head; a mismatch or a decode failure makes writes
+  fail closed (`Corrupt`) and is reported by `verify`. `quota rebuild`
+  recomputes usage from the published commit chain, `quota reset` zeroes
+  counters, and `quota show` returns only the caller's own counters. If the
+  record is unusable and no policy is known, rebuild is refused (re-supply
+  `--quota`) instead of silently disabling enforcement.
+- **Branching.** `snapshot branch` adds a ref to an immutable commit;
+  `context branch` persists a Context Root pinned to the source root's fork
+  commit with `derived_from` lineage; `merge` is a union merge that fails with
+  `Conflict` naming the path when the same path has different content (or the
+  live head already has different content). It never overwrites the head.
+- **Tests.** `store/quota_test.go` (7) and `store/branch_test.go` (7, including
+  both cross-language directions with the Rust oracle). Full `go test -race
+  ./...` passes in the fuse court; `go vet` and `CGO_ENABLED=0 go build` pass in
+  the Go court.
+- **Limits.** Admission budgets do not return budget on deletion. Tenant
+  attribution requires the `weft.tenant` attribute (`create --tenant`); the
+  FUSE write path does not set it yet. Merge is not a three-way content merge.

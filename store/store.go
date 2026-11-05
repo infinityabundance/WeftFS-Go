@@ -94,6 +94,9 @@ type Options struct {
 	// CodecDeltaMarginPercent is the margin by which a DELTA frame must beat
 	// the ZSTD frame to be selected. 0 disables the margin.
 	CodecDeltaMarginPercent uint8
+	// Quotas installs (or replaces) write budgets on open. An empty slice
+	// leaves the persisted policy untouched.
+	Quotas []QuotaBudget
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -162,6 +165,11 @@ type Store struct {
 	notes          []string
 	pins           map[model.Hash32]uint64
 	contentPins    map[model.Hash32]uint64
+	// Write budgets and the committed blob set used to charge only genuinely
+	// new bytes. Both are derived from committed state.
+	quota          QuotaState
+	blobIndex      map[model.Hash32]uint64
+	blobIndexReady bool
 }
 
 var tmpCounter atomic.Uint64
@@ -199,6 +207,9 @@ func makeDir(path string) error {
 func validateOptions(opts Options) error {
 	if opts.ChunkSize == 0 || opts.ChunkSize > model.MaxChunkSize {
 		return werr.Newf(werr.InvalidArgument, "chunk_size must be 1..=16 MiB")
+	}
+	if _, err := NormalizeQuotaPolicy(opts.Quotas); err != nil {
+		return err
 	}
 	switch opts.Representation {
 	case RepresentationModeRaw, RepresentationModeCodecAuto:
@@ -361,10 +372,18 @@ func Init(path string, opts Options) (*Store, error) {
 		notes:       nil,
 		pins:        make(map[model.Hash32]uint64),
 		contentPins: make(map[model.Hash32]uint64),
+		quota:       newQuotaState(),
+		blobIndex:   map[model.Hash32]uint64{},
 	}
 	if err := store.writeGenesis(); err != nil {
 		lock.Close()
 		return nil, err
+	}
+	if len(opts.Quotas) > 0 {
+		if err := store.InstallQuotaPolicy(opts.Quotas); err != nil {
+			lock.Close()
+			return nil, err
+		}
 	}
 	if err := fsyncDir(path); err != nil {
 		lock.Close()
@@ -441,7 +460,7 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 		}
 		return nil, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
-	return &Store{
+	store := &Store{
 		root:           path,
 		mode:           mode,
 		options:        DefaultOptions(),
@@ -454,7 +473,11 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 		notes:          recovery.Notes,
 		pins:           make(map[model.Hash32]uint64),
 		contentPins:    make(map[model.Hash32]uint64),
-	}, nil
+		quota:          newQuotaState(),
+		blobIndex:      map[model.Hash32]uint64{},
+	}
+	store.loadQuotaRecord()
+	return store, nil
 }
 
 // OpenWithOptions opens with explicit runtime options.
@@ -465,6 +488,12 @@ func OpenWithOptions(path string, mode OpenMode, opts Options) (*Store, error) {
 	store, err := Open(path, mode)
 	if err != nil {
 		return nil, err
+	}
+	if len(opts.Quotas) > 0 {
+		if err := store.InstallQuotaPolicy(opts.Quotas); err != nil {
+			store.Close()
+			return nil, err
+		}
 	}
 	store.options = opts
 	return store, nil
@@ -1034,6 +1063,13 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 	}
 	nextState.Generation = newGeneration
 
+	// Write-budget admission happens before any commit bytes exist. A denial
+	// returns BudgetExceeded and leaves generation, head, and state untouched.
+	quotaCharges, quotaAdditions, quotaEnforced, err := s.quotaPreflight(ops, quotaPreMap(s.state, ops))
+	if err != nil {
+		return model.Hash32{}, err
+	}
+
 	interval := s.options.CheckpointInterval
 	wantsCheckpoint := forceCheckpoint || (interval > 0 && newGeneration%interval == 0)
 	var checkpoint *model.Hash32
@@ -1067,6 +1103,9 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
+	if quotaEnforced {
+		s.recordQuotaAfterCommit(quotaCharges, quotaAdditions)
+	}
 	return hash, nil
 }
 

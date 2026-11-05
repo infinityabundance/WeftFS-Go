@@ -53,6 +53,34 @@ func TestGlobalsRepresentationPolicy(t *testing.T) {
 	}
 }
 
+func TestGlobalsQuotaPolicy(t *testing.T) {
+	previous := quotaBudgets
+	t.Cleanup(func() { quotaBudgets = previous })
+	quotaBudgets = nil
+	rest, _, _, err := globals([]string{
+		"--store", "/tmp/store", "--quota", "0:0:1024:10",
+		"--quota", "tenant:acme:2048:20", "snapshot", "branch", "s1", "b1",
+	})
+	if err != nil {
+		t.Fatalf("globals: %v", err)
+	}
+	if len(rest) != 4 || rest[0] != "snapshot" {
+		t.Fatalf("rest = %v", rest)
+	}
+	if len(quotaBudgets) != 2 {
+		t.Fatalf("budgets = %d", len(quotaBudgets))
+	}
+	if quotaBudgets[0].Principal != store.PosixPrincipal(0, 0) || quotaBudgets[0].MaxNewBytes != 1024 {
+		t.Fatalf("posix budget = %+v", quotaBudgets[0])
+	}
+	if quotaBudgets[1].Principal != store.TenantPrincipal("acme") {
+		t.Fatalf("tenant budget = %+v", quotaBudgets[1])
+	}
+	if _, _, _, err := globals([]string{"--quota", "nonsense", "info"}); err == nil {
+		t.Fatal("invalid --quota was accepted")
+	}
+}
+
 func captureStdout(t *testing.T, fn func() error) string {
 	t.Helper()
 	previous := os.Stdout

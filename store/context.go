@@ -19,6 +19,85 @@ import (
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
 
+// Context lineage constants (identical to the Rust store).
+const (
+	ContextLineagePredicate     = "derived_from"
+	ContextLineageContextAttr   = "weft.context"
+	ContextLineageContextIDAttr = "weft.context_id"
+	ContextLineageSourceIDAttr  = "weft.source_context_id"
+)
+
+// BranchContextRoot pins a new Context Root to the source root's commit,
+// optionally narrowing it with task/model attribute equality, and records a
+// `derived_from` lineage relation. Two commits are published (root, lineage).
+func (s *Store) BranchContextRoot(source, name string, task, modelName *string, replace bool) (StoredContextRoot, error) {
+	if err := s.requireWritable(); err != nil {
+		return StoredContextRoot{}, err
+	}
+	if err := model.ValidateSnapshotName(name); err != nil {
+		return StoredContextRoot{}, err
+	}
+	stored, err := s.LoadContextRoot(source)
+	if err != nil {
+		return StoredContextRoot{}, err
+	}
+	parsed, err := stored.Root.Selector()
+	if err != nil {
+		return StoredContextRoot{}, werr.FromCodec(err)
+	}
+	if task != nil {
+		parsed.Predicate = conjoinAttribute(parsed.Predicate, "task", *task)
+	}
+	if modelName != nil {
+		parsed.Predicate = conjoinAttribute(parsed.Predicate, "model", *modelName)
+	}
+	root, err := weftcontext.NewContextRoot(
+		parsed, stored.Root.Snapshot, stored.Root.Resolver,
+		stored.Root.Causal, stored.Root.CapabilityHash, stored.Root.Budget,
+	)
+	if err != nil {
+		return StoredContextRoot{}, werr.FromCodec(err)
+	}
+	newID, err := root.ID()
+	if err != nil {
+		return StoredContextRoot{}, werr.FromCodec(err)
+	}
+	if _, err := s.SaveContextRoot(name, root, nil, replace); err != nil {
+		return StoredContextRoot{}, err
+	}
+	attrs := map[string]wcb.Value{
+		ContextLineageContextAttr:   wcb.TextValue(name),
+		ContextLineageContextIDAttr: wcb.TextValue(newID.Hex()),
+		ContextLineageSourceIDAttr:  wcb.TextValue(stored.ContextRootID.Hex()),
+	}
+	if _, err := s.RelationAdd(
+		model.RootID, ContextLineagePredicate,
+		model.ValueTarget(wcb.TextValue(stored.Name)), nil, attrs,
+	); err != nil {
+		return StoredContextRoot{}, err
+	}
+	return s.LoadContextRoot(name)
+}
+
+// conjoinAttribute adds `attrs.<field> == value`, flattening an existing And so
+// the selector stays canonical.
+func conjoinAttribute(predicate *selector.Expr, field, value string) *selector.Expr {
+	comparison := &selector.Expr{
+		Kind:  selector.ExprCompare,
+		Field: selector.Field{Segments: []string{"attrs", field}},
+		Op:    selector.OpEq,
+		Value: selector.StrLiteral(value),
+	}
+	if predicate == nil || predicate.Kind == selector.ExprTrue {
+		return comparison
+	}
+	if predicate.Kind == selector.ExprAnd {
+		items := append(append([]*selector.Expr(nil), predicate.Items...), comparison)
+		return &selector.Expr{Kind: selector.ExprAnd, Items: items}
+	}
+	return &selector.Expr{Kind: selector.ExprAnd, Items: []*selector.Expr{predicate, comparison}}
+}
+
 // StoredContextRoot is a Context Root persisted as a root-subject relation.
 type StoredContextRoot struct {
 	Name          string

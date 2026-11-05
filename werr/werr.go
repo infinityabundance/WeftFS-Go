@@ -34,7 +34,9 @@ const (
 	NonCanonical      Kind = Kind(werrors.NonCanonical)
 	Unsupported       Kind = Kind(werrors.UnsupportedVersion)
 	Parse             Kind = Kind(werrors.Parse)
-	UnknownSchema     Kind = Kind(werrors.UnknownSchema)
+	UnknownSchema     Kind = "UnknownSchema"
+	BudgetExceeded    Kind = "BudgetExceeded"
+	Conflict          Kind = "Conflict"
 	Io                Kind = Kind(werrors.Io)
 )
 

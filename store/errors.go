@@ -27,6 +27,10 @@ func Errno(err error) syscall.Errno {
 		return syscall.EINVAL
 	case werr.LimitExceeded:
 		return syscall.EFBIG
+	case werr.BudgetExceeded:
+		return syscall.EDQUOT
+	case werr.Conflict:
+		return syscall.EEXIST
 	case werr.Busy:
 		return syscall.EBUSY
 	case werr.Malformed, werr.Corrupt:

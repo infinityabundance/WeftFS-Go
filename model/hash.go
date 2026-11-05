@@ -53,6 +53,7 @@ const (
 // Reserved attribute keys and predicates (WEFT-MODEL.md §2.5, §9.3; F2).
 const (
 	AttrSymlinkTarget = "weft.symlink.target"
+	AttrTenant        = "weft.tenant"
 	AttrACLRead       = "weft.acl.read"
 	SavedContextPred  = "saved_context"
 	SavedContextAttr  = "selector_hex"

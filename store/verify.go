@@ -185,6 +185,16 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
+	// A present-but-unusable quota record is reported: enforcement fails closed,
+	// so verification must not claim the store is fully healthy.
+	if s.quota.RecordPresent && !s.quota.Valid {
+		detail := s.quota.Reason
+		if detail == "" {
+			detail = "no reason recorded"
+		}
+		report.problem(string(werr.Corrupt), "quota usage record is unusable: "+detail)
+	}
+
 	report.OK = len(report.Problems) == 0
 	return report, nil
 }

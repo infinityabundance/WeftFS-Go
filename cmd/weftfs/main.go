@@ -51,12 +51,12 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto]
-              [--codec-min-bytes N] <command> [args]
+              [--codec-min-bytes N] [--quota SPEC] [--quota-file FILE] <command> [args]
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
-  context causal uri tensor
+  context causal uri tensor quota merge
 `)
 }
 
@@ -76,11 +76,27 @@ var fixedTimestampNS *int64
 var (
 	representationMode = store.RepresentationModeRaw
 	codecMinBytes      = store.DefaultCodecMinBytes
+	// quotaBudgets are the --quota/--quota-file budgets supplied on this
+	// invocation. They install (or replace) the persisted policy on a writable
+	// open; an empty slice enforces the persisted policy unchanged.
+	quotaBudgets []store.QuotaBudget
 )
 
 func applyRepresentationPolicy(opts *store.Options) {
 	opts.Representation = representationMode
 	opts.CodecMinBytes = codecMinBytes
+}
+
+func readQuotaFile(path string) ([]store.QuotaBudget, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, werr.Wrap(werr.Io, err, "cannot read --quota-file %s", path)
+	}
+	return store.ParseQuotaFile(string(contents))
+}
+
+func applyQuotaPolicy(opts *store.Options) {
+	opts.Quotas = quotaBudgets
 }
 
 // globals extracts --store, --json, and the representation policy wherever
@@ -131,6 +147,38 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--codec-min-bytes must be a non-negative integer (got `%s`)", text)
 			}
 			codecMinBytes = value
+		case args[i] == "--quota" || args[i] == "-quota":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--quota requires a value")
+			}
+			budget, parseErr := store.ParseQuotaBudget(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			quotaBudgets = append(quotaBudgets, budget)
+			i++
+		case strings.HasPrefix(args[i], "--quota="):
+			budget, parseErr := store.ParseQuotaBudget(strings.TrimPrefix(args[i], "--quota="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			quotaBudgets = append(quotaBudgets, budget)
+		case args[i] == "--quota-file" || args[i] == "-quota-file":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--quota-file requires a path")
+			}
+			budgets, parseErr := readQuotaFile(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			quotaBudgets = append(quotaBudgets, budgets...)
+			i++
+		case strings.HasPrefix(args[i], "--quota-file="):
+			budgets, parseErr := readQuotaFile(strings.TrimPrefix(args[i], "--quota-file="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			quotaBudgets = append(quotaBudgets, budgets...)
 		case args[i] == "--fixed-timestamp-ns" || args[i] == "-fixed-timestamp-ns":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--fixed-timestamp-ns requires a value")
@@ -194,6 +242,10 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdQuery(args, storeDir, jsonOut)
 	case "snapshot":
 		return cmdSnapshot(args, storeDir, jsonOut)
+	case "quota":
+		return cmdQuota(args, storeDir, jsonOut)
+	case "merge":
+		return cmdMerge(args, storeDir, jsonOut)
 	case "verify":
 		return cmdVerify(args, storeDir, jsonOut)
 	case "gc":
@@ -230,6 +282,7 @@ func openStore(storeDir string, mode store.OpenMode) (*store.Store, error) {
 	}
 	opts := store.DefaultOptions()
 	applyRepresentationPolicy(&opts)
+	applyQuotaPolicy(&opts)
 	if fixedTimestampNS != nil {
 		opts.FixedTimestampNS = fixedTimestampNS
 	}
@@ -262,6 +315,7 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	opts.ChunkSize = *chunkSize
 	opts.CheckpointInterval = *checkpoint
 	applyRepresentationPolicy(&opts)
+	applyQuotaPolicy(&opts)
 	if fixedTimestampNS != nil {
 		opts.FixedTimestampNS = fixedTimestampNS
 	}
@@ -393,6 +447,7 @@ func cmdCreate(args []string, storeDir string) error {
 	gid := fs.Uint64("gid", uint64(os.Getgid()), "owner gid")
 	seed := fs.String("seed", "", "explicit ObjectId seed")
 	causal := fs.String("causal", "", "comma-separated causal parent ids")
+	tenant := fs.String("tenant", "", "attribute the object to a tenant write budget")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -422,6 +477,10 @@ func cmdCreate(args []string, storeDir string) error {
 		return err
 	}
 	var id model.Hash32
+	var attrs map[string]wcb.Value
+	if *tenant != "" {
+		attrs = map[string]wcb.Value{model.AttrTenant: wcb.TextValue(*tenant)}
+	}
 	causalIDs, err := parseCausalEntries(*causal)
 	if err != nil {
 		return err
@@ -434,11 +493,11 @@ func cmdCreate(args []string, storeDir string) error {
 			}
 			*seed = string(seedBytes)
 		}
-		id, err = s.CreateFileSeededCausal(parent, name, data, perm, *uid, *gid, nil, []byte(*seed), causalIDs)
+		id, err = s.CreateFileSeededCausal(parent, name, data, perm, *uid, *gid, attrs, []byte(*seed), causalIDs)
 	} else if *seed != "" {
-		id, err = s.CreateFileSeeded(parent, name, data, perm, *uid, *gid, nil, []byte(*seed))
+		id, err = s.CreateFileSeeded(parent, name, data, perm, *uid, *gid, attrs, []byte(*seed))
 	} else {
-		id, err = s.CreateFile(parent, name, data, perm, *uid, *gid, nil)
+		id, err = s.CreateFile(parent, name, data, perm, *uid, *gid, attrs)
 	}
 	if err != nil {
 		return err
@@ -1451,6 +1510,130 @@ func parseGroups(text string) []uint64 {
 	return out
 }
 
+// ---- write budgets -------------------------------------------------------
+
+func cmdQuota(args []string, storeDir string, jsonOut bool) error {
+	if len(args) == 0 {
+		return werr.Newf(werr.InvalidArgument, "quota requires show|reset|rebuild")
+	}
+	switch args[0] {
+	case "show":
+		fs := flag.NewFlagSet("quota show", flag.ContinueOnError)
+		uid := fs.Uint64("uid", 0, "caller uid")
+		gid := fs.Uint64("gid", 0, "caller gid")
+		tenant := fs.String("tenant", "", "tenant principal")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		s, err := openStore(storeDir, store.ReadOnly)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		if problem := s.QuotaProblem(); problem != "" {
+			return werr.Newf(werr.Corrupt, "quota usage record is unusable: %s", problem)
+		}
+		principal := store.PosixPrincipal(*uid, *gid)
+		if *tenant != "" {
+			principal = store.TenantPrincipal(*tenant)
+		}
+		usage := s.QuotaUsage(principal)
+		budget, configured := s.QuotaBudget(principal)
+		if jsonOut {
+			out := map[string]any{
+				"principal": principal.Display(), "configured": configured,
+				"used_bytes": usage.UsedBytes, "used_objects": usage.UsedObjects,
+			}
+			if configured {
+				out["max_new_bytes"] = budget.MaxNewBytes
+				out["max_objects"] = budget.MaxObjects
+			}
+			return printJSON(out)
+		}
+		fmt.Printf("principal=%s\nconfigured=%v\nused_bytes=%d\nused_objects=%d\n",
+			principal.Display(), configured, usage.UsedBytes, usage.UsedObjects)
+		if configured {
+			fmt.Printf("max_new_bytes=%d\nmax_objects=%d\n", budget.MaxNewBytes, budget.MaxObjects)
+		}
+		return nil
+	case "reset":
+		fs := flag.NewFlagSet("quota reset", flag.ContinueOnError)
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		if err := s.QuotaReset(); err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{"reset": true, "generation": s.Generation()})
+		}
+		fmt.Println("reset=true")
+		return nil
+	case "rebuild":
+		fs := flag.NewFlagSet("quota rebuild", flag.ContinueOnError)
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		commits, err := s.QuotaRebuild()
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{
+				"rebuilt": true, "commits": commits, "generation": s.Generation(),
+			})
+		}
+		fmt.Println("rebuilt=true")
+		fmt.Printf("commits=%d\n", commits)
+		return nil
+	default:
+		return werr.Newf(werr.InvalidArgument, "unknown quota action `%s`", args[0])
+	}
+}
+
+// ---- merge ---------------------------------------------------------------
+
+func cmdMerge(args []string, storeDir string, jsonOut bool) error {
+	fs := flag.NewFlagSet("merge", flag.ContinueOnError)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 2 {
+		return werr.Newf(werr.InvalidArgument, "merge requires <left> <right>")
+	}
+	s, err := openStore(storeDir, store.ReadWrite)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	report, err := s.MergeBranches(fs.Arg(0), fs.Arg(1))
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return printJSON(map[string]any{
+			"left": report.Left.Hex(), "right": report.Right.Hex(),
+			"paths": report.Paths, "added_objects": report.AddedObjects,
+			"added_entries": report.AddedEntries, "merged": report.Head.Hex(),
+			"generation": report.Generation,
+		})
+	}
+	fmt.Printf("left=%s\nright=%s\npaths=%d\nadded_objects=%d\nadded_entries=%d\nmerged=%s\ngeneration=%d\n",
+		report.Left.Hex(), report.Right.Hex(), report.Paths, report.AddedObjects,
+		report.AddedEntries, report.Head.Hex(), report.Generation)
+	return nil
+}
+
 // ---- snapshots / verify --------------------------------------------------
 
 func cmdSnapshot(args []string, storeDir string, jsonOut bool) error {
@@ -1474,6 +1657,31 @@ func cmdSnapshot(args []string, storeDir string, jsonOut bool) error {
 		commit, err := s.SnapshotCreate(fs.Arg(0))
 		if err != nil {
 			return err
+		}
+		fmt.Println(commit.Hex())
+		return nil
+	case "branch":
+		fs := flag.NewFlagSet("snapshot branch", flag.ContinueOnError)
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 {
+			return werr.Newf(werr.InvalidArgument, "snapshot branch requires <source> <name>")
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		commit, err := s.SnapshotBranch(fs.Arg(0), fs.Arg(1))
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{
+				"name": fs.Arg(1), "source": fs.Arg(0),
+				"snapshot_id": commit.Hex(), "generation": s.Generation(),
+			})
 		}
 		fmt.Println(commit.Hex())
 		return nil
@@ -1993,9 +2201,46 @@ func contextJSON(stored store.StoredContextRoot) (map[string]any, error) {
 
 func cmdContext(args []string, storeDir string, jsonOut bool) error {
 	if len(args) == 0 {
-		return werr.Newf(werr.InvalidArgument, "context requires create|list|show|resolve|materialize|uri|delete")
+		return werr.Newf(werr.InvalidArgument, "context requires create|branch|list|show|resolve|materialize|uri|delete")
 	}
 	switch args[0] {
+	case "branch":
+		fs := flag.NewFlagSet("context branch", flag.ContinueOnError)
+		task := fs.String("task", "", "additional attrs.task equality filter")
+		modelName := fs.String("model", "", "additional attrs.model equality filter")
+		replace := fs.Bool("replace", false, "replace an existing same-name root")
+		if err := parseFlags(fs, args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 2 {
+			return werr.Newf(werr.InvalidArgument, "context branch requires <source> <name>")
+		}
+		s, err := openStore(storeDir, store.ReadWrite)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		var taskPtr, modelPtr *string
+		if *task != "" {
+			taskPtr = task
+		}
+		if *modelName != "" {
+			modelPtr = modelName
+		}
+		stored, err := s.BranchContextRoot(fs.Arg(0), fs.Arg(1), taskPtr, modelPtr, *replace)
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return printJSON(map[string]any{
+				"name": stored.Name, "context_root_id": stored.ContextRootID.Hex(),
+				"uri": stored.URI, "snapshot_id": stored.Root.Snapshot.Hex(),
+				"derived_from": fs.Arg(0), "generation": s.Generation(),
+			})
+		}
+		fmt.Printf("context_root_id=%s\nuri=%s\nsnapshot_id=%s\nderived_from=%s\n",
+			stored.ContextRootID.Hex(), stored.URI, stored.Root.Snapshot.Hex(), fs.Arg(0))
+		return nil
 	case "create":
 		fs := flag.NewFlagSet("context create", flag.ContinueOnError)
 		name := fs.String("name", "", "context root name")

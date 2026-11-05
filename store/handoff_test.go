@@ -32,10 +32,17 @@ func rustBinary(t *testing.T) string {
 		}
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			abs, err := filepath.Abs(candidate)
-			if err == nil {
-				return abs
+			if err != nil {
+				abs = candidate
 			}
-			return candidate
+			// A binary built with --features fuse needs libfuse3. The minimal Go
+			// court does not have it, so an unloadable oracle is a skip, never a
+			// failure of the Go implementation.
+			probe := exec.Command(abs, "--version")
+			if output, probeErr := probe.CombinedOutput(); probeErr != nil {
+				t.Skipf("Rust oracle at %s is not runnable in this court: %v\n%s", abs, probeErr, output)
+			}
+			return abs
 		}
 	}
 	t.Skip("Rust oracle binary not found; build it in the Rust court with: " +
