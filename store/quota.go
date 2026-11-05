@@ -7,12 +7,14 @@ package store
 // limit is refused before the commit is published. Content already reachable
 // from committed state costs zero.
 //
-// The persisted `quota` record holds the policy plus cumulative usage counters
-// and the generation/commit they were computed for. Usage is only ever derived
-// from committed state, so it survives reopen; a record that does not name the
-// committed head fails closed until the explicit `quota rebuild` admin
-// operation recomputes it. The encoding and ordering are byte-identical to the
-// Rust store's record.
+// Usage is committed state: every policy-enabled commit carries one
+// `set_quota_usage` op describing the cumulative usage after its other ops.
+// The store-root `quota` file is policy-only (`WFQ2`); it is written only when
+// a policy is installed or a legacy record is migrated. There is no separate
+// durable usage write per commit. Older commits with no usage op replay
+// unchanged, and replay rejects an assertion that disagrees with the
+// recomputed admission totals as `Corrupt`. The encoding and ordering are
+// byte-identical to the Rust store.
 
 import (
 	"bytes"
@@ -30,17 +32,24 @@ import (
 )
 
 const (
-	// QuotaSchema is the quota record schema string.
+	// QuotaSchema is the legacy combined policy+usage record schema.
 	QuotaSchema = "weftfs.quota.v1"
-	// QuotaDomain separates the record digest.
+	// QuotaDomain separates the legacy record digest.
 	QuotaDomain = "weft/quota/v1"
+	// QuotaPolicySchema is the policy-only record schema.
+	QuotaPolicySchema = "weftfs.quota.v2"
+	// QuotaPolicyDomain separates the policy-only record digest.
+	QuotaPolicyDomain = "weft/quota/v2"
 	// MaxQuotaPrincipals bounds one store's policy.
 	MaxQuotaPrincipals = 4096
 	// MaxTenantBytes matches the capability envelope tenant bound.
 	MaxTenantBytes = 256
 )
 
-var quotaMagic = []byte("WFQ1")
+var (
+	quotaMagic       = []byte("WFQ1")
+	quotaPolicyMagic = []byte("WFQ2")
+)
 
 // QuotaPrincipal is the identity a budget is attached to.
 type QuotaPrincipal struct {
@@ -145,7 +154,12 @@ type QuotaState struct {
 	Commit        model.Hash32
 	Valid         bool
 	RecordPresent bool
-	Reason        string
+	// UsageCommitted is true when Usage came from a committed
+	// `set_quota_usage` op (or was just published as one).
+	UsageCommitted bool
+	// MigratedPresent records a preserved legacy `quota.migrated` file.
+	MigratedPresent bool
+	Reason          string
 }
 
 func newQuotaState() QuotaState {
@@ -319,6 +333,133 @@ func DecodeQuotaRecord(b []byte) (QuotaRecord, error) {
 	return quotaRecordFromValue(value)
 }
 
+// QuotaPolicyRecord is the policy-only `quota` file. Usage is intentionally
+// absent: it is committed to the commit log instead.
+type QuotaPolicyRecord struct {
+	Budgets []QuotaBudget
+}
+
+// NewQuotaPolicyRecord normalizes a policy.
+func NewQuotaPolicyRecord(budgets []QuotaBudget) (QuotaPolicyRecord, error) {
+	normalized, err := NormalizeQuotaPolicy(budgets)
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	return QuotaPolicyRecord{Budgets: normalized}, nil
+}
+
+// ToWCB returns the canonical policy value.
+func (r QuotaPolicyRecord) ToWCB() wcb.Value {
+	budgets := make([]wcb.Value, 0, len(r.Budgets))
+	for _, budget := range r.Budgets {
+		m := principalValue(budget.Principal)
+		m["max_new_bytes"] = wcb.U64Value(budget.MaxNewBytes)
+		m["max_objects"] = wcb.U64Value(budget.MaxObjects)
+		budgets = append(budgets, wcb.MapValue(m))
+	}
+	return wcb.MapValue(map[string]wcb.Value{
+		"schema":  wcb.TextValue(QuotaPolicySchema),
+		"budgets": wcb.ArrayValue(budgets),
+	})
+}
+
+// EncodeBytes renders `WFQ2 || u64le(len) || WCB || digest`.
+func (r QuotaPolicyRecord) EncodeBytes() ([]byte, error) {
+	encoded, err := model.EncodeWCB(r.ToWCB())
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > 64*1024*1024 {
+		return nil, werr.Newf(werr.LimitExceeded, "quota policy record is implausibly large")
+	}
+	digest := hash.Domain(QuotaPolicyDomain, encoded)
+	out := make([]byte, 0, 4+8+len(encoded)+32)
+	out = append(out, quotaPolicyMagic...)
+	var length [8]byte
+	binary.LittleEndian.PutUint64(length[:], uint64(len(encoded)))
+	out = append(out, length[:]...)
+	out = append(out, encoded...)
+	out = append(out, digest.Bytes()...)
+	return out, nil
+}
+
+// DecodeQuotaPolicy decodes and validates a policy-only record.
+func DecodeQuotaPolicy(b []byte) (QuotaPolicyRecord, error) {
+	if len(b) < 4+8+32 {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Corrupt, "quota policy record is truncated")
+	}
+	if string(b[0:4]) != string(quotaPolicyMagic) {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Corrupt, "quota policy record has the wrong magic")
+	}
+	length := binary.LittleEndian.Uint64(b[4:12])
+	if length > uint64(len(b)) {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Corrupt, "quota policy record length overflows")
+	}
+	if uint64(len(b)) != 12+length+32 {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Corrupt, "quota policy record length disagrees with its frame")
+	}
+	payload := b[12 : 12+length]
+	digest := b[12+length:]
+	if !bytes.Equal(hash.Domain(QuotaPolicyDomain, payload).Bytes(), digest) {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Corrupt, "quota policy record fails its digest check")
+	}
+	value, err := model.DecodeWCB(payload)
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	m, err := model.AsMap(value)
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	if err := model.CheckKeys(m, "schema", "budgets"); err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	schema, err := model.GetText(m, "schema")
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	if schema != QuotaPolicySchema {
+		return QuotaPolicyRecord{}, werr.Newf(werr.Unsupported, "quota policy schema `%s` is not `%s`", schema, QuotaPolicySchema)
+	}
+	budgetValues, err := model.GetArray(m, "budgets")
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	budgets := make([]QuotaBudget, 0, len(budgetValues))
+	for _, item := range budgetValues {
+		entry, err := model.AsMap(item)
+		if err != nil {
+			return QuotaPolicyRecord{}, err
+		}
+		if err := model.CheckKeys(entry, "kind", "uid", "gid", "tenant", "max_new_bytes", "max_objects"); err != nil {
+			return QuotaPolicyRecord{}, err
+		}
+		principal, err := principalFromMap(entry)
+		if err != nil {
+			return QuotaPolicyRecord{}, err
+		}
+		maxBytes, err := model.GetU64(entry, "max_new_bytes")
+		if err != nil {
+			return QuotaPolicyRecord{}, err
+		}
+		maxObjects, err := model.GetU64(entry, "max_objects")
+		if err != nil {
+			return QuotaPolicyRecord{}, err
+		}
+		budgets = append(budgets, QuotaBudget{Principal: principal, MaxNewBytes: maxBytes, MaxObjects: maxObjects})
+	}
+	record, err := NewQuotaPolicyRecord(budgets)
+	if err != nil {
+		return QuotaPolicyRecord{}, err
+	}
+	for i := range budgets {
+		if budgets[i] != record.Budgets[i] {
+			return QuotaPolicyRecord{}, werr.Newf(werr.NonCanonical, "quota budgets are not in canonical principal order")
+		}
+	}
+	return record, nil
+}
+
 func quotaRecordFromValue(value wcb.Value) (QuotaRecord, error) {
 	m, err := model.AsMap(value)
 	if err != nil {
@@ -479,60 +620,205 @@ func ParseQuotaFile(contents string) ([]QuotaBudget, error) {
 	return out, nil
 }
 
-func quotaPath(root string) string { return filepath.Join(root, "quota") }
+func quotaPath(root string) string         { return filepath.Join(root, "quota") }
+func quotaMigratedPath(root string) string { return filepath.Join(root, "quota.migrated") }
 
-// loadQuotaRecord loads the persisted record. A missing record means no policy.
-func (s *Store) loadQuotaRecord() {
-	b, err := os.ReadFile(quotaPath(s.root))
+func readStoreRecord(path string) ([]byte, bool, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			s.quota = newQuotaState()
-			return
+			return nil, false, nil
 		}
-		s.quota = newQuotaState()
-		s.quota.Valid = false
-		s.quota.Reason = fmt.Sprintf("cannot read the quota record: %v", err)
-		return
+		return nil, false, werr.Wrap(werr.Io, err, "cannot read %s", path)
 	}
-	record, err := DecodeQuotaRecord(b)
-	if err != nil {
-		s.quota = newQuotaState()
-		s.quota.RecordPresent = true
-		s.quota.Valid = false
-		s.quota.Reason = fmt.Sprintf("quota record is unusable: %v", err)
-		return
-	}
-	state := newQuotaState()
-	state.RecordPresent = true
-	for _, budget := range record.Budgets {
-		state.Policy[budget.Principal.SortKey()] = budget
-	}
-	for _, entry := range record.Usage {
-		state.Usage[entry.Principal.SortKey()] = entry.Counters
-	}
-	state.Generation = record.Generation
-	state.Commit = record.Commit
-	if record.Generation != s.generation || record.Commit != s.head {
-		state.Valid = false
-		state.Reason = fmt.Sprintf(
-			"quota record names generation %d (%s), committed head is generation %d (%s)",
-			record.Generation, record.Commit.Hex(), s.generation, s.head.Hex())
-	}
-	s.quota = state
+	return b, true, nil
 }
 
-func (s *Store) persistQuotaRecord() error {
-	record := QuotaRecord{
-		Generation: s.quota.Generation,
-		Commit:     s.quota.Commit,
+// loadQuotaRecord loads the policy-only file and the committed usage. A legacy
+// combined record is imported once on a writable open.
+func (s *Store) loadQuotaRecord() {
+	if err := s.loadQuotaRecordInner(); err != nil {
+		s.quota.RecordPresent = true
+		s.quota.Valid = false
+		s.quota.Reason = fmt.Sprintf("quota state is unusable: %v", err)
 	}
+}
+
+func (s *Store) loadQuotaRecordInner() error {
+	current, currentPresent, err := readStoreRecord(quotaPath(s.root))
+	if err != nil {
+		return err
+	}
+	migrated, migratedPresent, err := readStoreRecord(quotaMigratedPath(s.root))
+	if err != nil {
+		return err
+	}
+	s.quota.MigratedPresent = migratedPresent
+
+	state := newQuotaState()
+	var legacy *QuotaRecord
+	var legacyRaw []byte
+	currentIsLegacy := false
+
+	if currentPresent {
+		state.RecordPresent = true
+		switch {
+		case bytes.HasPrefix(current, quotaPolicyMagic):
+			record, err := DecodeQuotaPolicy(current)
+			if err != nil {
+				return err
+			}
+			for _, budget := range record.Budgets {
+				state.Policy[budget.Principal.SortKey()] = budget
+			}
+		case bytes.HasPrefix(current, quotaMagic):
+			record, err := DecodeQuotaRecord(current)
+			if err != nil {
+				return err
+			}
+			for _, budget := range record.Budgets {
+				state.Policy[budget.Principal.SortKey()] = budget
+			}
+			legacy = &record
+			legacyRaw = current
+			currentIsLegacy = true
+		default:
+			return werr.Newf(werr.Corrupt, "quota record has an unknown magic")
+		}
+	} else if migratedPresent {
+		state.RecordPresent = true
+		if !bytes.HasPrefix(migrated, quotaMagic) {
+			return werr.Newf(werr.Corrupt, "quota.migrated has an unknown magic")
+		}
+		record, err := DecodeQuotaRecord(migrated)
+		if err != nil {
+			return err
+		}
+		for _, budget := range record.Budgets {
+			state.Policy[budget.Principal.SortKey()] = budget
+		}
+	}
+
+	if currentIsLegacy && migratedPresent && !bytes.Equal(legacyRaw, migrated) {
+		return werr.Newf(werr.Corrupt, "both quota and quota.migrated exist and disagree")
+	}
+
+	s.quota = state
+
+	usage, committed, err := s.committedUsageFromHead()
+	if err != nil {
+		s.quota.Valid = false
+		s.quota.Reason = fmt.Sprintf("committed quota usage is inconsistent: %v", err)
+		return nil
+	}
+	if committed {
+		s.quota.Usage = usage
+		s.quota.UsageCommitted = true
+	} else if s.quota.enforced() {
+		derived, blobs, _, err := s.replayQuotaUsageWithCount()
+		if err != nil {
+			s.quota.Valid = false
+			s.quota.Reason = fmt.Sprintf("committed quota usage is inconsistent: %v", err)
+			return nil
+		}
+		s.quota.Usage = derived
+		s.blobIndex = blobs
+		s.blobIndexReady = true
+		s.quota.UsageCommitted = false
+	}
+	s.quota.Generation = s.generation
+	s.quota.Commit = s.head
+
+	if migratedPresent {
+		record, err := DecodeQuotaRecord(migrated)
+		if err != nil {
+			return err
+		}
+		if record.Generation == s.generation && record.Commit == s.head &&
+			(s.quota.UsageCommitted || s.quota.enforced()) {
+			recorded := map[string]QuotaCounters{}
+			for _, entry := range record.Usage {
+				recorded[entry.Principal.SortKey()] = entry.Counters
+			}
+			if !quotaUsageEqual(recorded, s.quota.Usage) {
+				s.quota.Valid = false
+				s.quota.Reason = "quota.migrated usage disagrees with committed usage"
+				return nil
+			}
+		}
+	}
+
+	if legacy != nil && currentIsLegacy && s.mode == ReadWrite {
+		if err := s.migrateLegacyQuota(*legacy, legacyRaw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) migrateLegacyQuota(record QuotaRecord, raw []byte) error {
+	if record.Generation == s.generation && record.Commit == s.head {
+		recorded := map[string]QuotaCounters{}
+		for _, entry := range record.Usage {
+			recorded[entry.Principal.SortKey()] = entry.Counters
+		}
+		if !quotaUsageEqual(recorded, s.quota.Usage) {
+			return werr.Newf(werr.Corrupt, "legacy quota record usage disagrees with committed state")
+		}
+	} else {
+		s.notes = append(s.notes, fmt.Sprintf(
+			"legacy quota record named generation %d (%s); usage was recomputed from committed state",
+			record.Generation, record.Commit.Hex()))
+	}
+	if err := writeReplace(quotaMigratedPath(s.root), raw); err != nil {
+		return err
+	}
+	policy, err := NewQuotaPolicyRecord(record.Budgets)
+	if err != nil {
+		return err
+	}
+	policyBytes, err := policy.EncodeBytes()
+	if err != nil {
+		return err
+	}
+	if err := writeReplace(quotaPath(s.root), policyBytes); err != nil {
+		return err
+	}
+	s.quota.MigratedPresent = true
+	s.quota.RecordPresent = true
+	if len(s.quota.Usage) != 0 && !s.quota.UsageCommitted {
+		op := quotaUsageOpFromMap(s.quota.Usage)
+		if _, err := s.publishQuotaUsageOp(op); err != nil {
+			return err
+		}
+		s.quota.UsageCommitted = true
+	}
+	s.quota.Generation = s.generation
+	s.quota.Commit = s.head
+	s.quota.Valid = true
+	s.quota.Reason = ""
+	return nil
+}
+
+func quotaUsageEqual(a, b map[string]QuotaCounters) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) persistQuotaPolicy() error {
+	budgets := make([]QuotaBudget, 0, len(s.quota.Policy))
 	for _, budget := range s.quota.Policy {
-		record.Budgets = append(record.Budgets, budget)
+		budgets = append(budgets, budget)
 	}
-	for key, counters := range s.quota.Usage {
-		record.Usage = append(record.Usage, QuotaUsageEntry{Principal: principalForKey(key), Counters: counters})
-	}
-	if err := record.Normalize(); err != nil {
+	record, err := NewQuotaPolicyRecord(budgets)
+	if err != nil {
 		return err
 	}
 	b, err := record.EncodeBytes()
@@ -540,6 +826,56 @@ func (s *Store) persistQuotaRecord() error {
 		return err
 	}
 	return writeReplace(quotaPath(s.root), b)
+}
+
+func (s *Store) headUsageOp() (model.SetQuotaUsageOp, bool, error) {
+	if s.generation == 0 {
+		return model.SetQuotaUsageOp{}, false, nil
+	}
+	generation := s.generation
+	loaded, err := LoadCommitFile(CommitPath(s.root, generation), &generation)
+	if err != nil {
+		return model.SetQuotaUsageOp{}, false, err
+	}
+	for i := len(loaded.Commit.Ops) - 1; i >= 0; i-- {
+		if op, ok := loaded.Commit.Ops[i].(model.SetQuotaUsageOp); ok {
+			return op, true, nil
+		}
+	}
+	return model.SetQuotaUsageOp{}, false, nil
+}
+
+func (s *Store) committedUsageFromHead() (map[string]QuotaCounters, bool, error) {
+	op, ok, err := s.headUsageOp()
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	usage := map[string]QuotaCounters{}
+	if op.Reset {
+		return usage, true, nil
+	}
+	for _, entry := range op.Usage {
+		principal := QuotaPrincipal{Kind: entry.Kind, UID: entry.UID, GID: entry.GID, Tenant: entry.Tenant}
+		usage[principal.SortKey()] = QuotaCounters{UsedBytes: entry.UsedBytes, UsedObjects: entry.UsedObjects}
+	}
+	return usage, true, nil
+}
+
+func quotaUsageOpFromMap(usage map[string]QuotaCounters) model.SetQuotaUsageOp {
+	entries := make([]model.QuotaUsageEntry, 0, len(usage))
+	for key, counters := range usage {
+		principal := principalForKey(key)
+		entries = append(entries, model.QuotaUsageEntry{
+			Kind: principal.Kind, UID: principal.UID, GID: principal.GID, Tenant: principal.Tenant,
+			UsedBytes: counters.UsedBytes, UsedObjects: counters.UsedObjects,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		left := QuotaPrincipal{Kind: entries[i].Kind, UID: entries[i].UID, GID: entries[i].GID, Tenant: entries[i].Tenant}
+		right := QuotaPrincipal{Kind: entries[j].Kind, UID: entries[j].UID, GID: entries[j].GID, Tenant: entries[j].Tenant}
+		return left.SortKey() < right.SortKey()
+	})
+	return model.SetQuotaUsageOp{Usage: entries}
 }
 
 func principalForKey(key string) QuotaPrincipal {
@@ -579,6 +915,9 @@ func (s *Store) QuotaBudget(principal QuotaPrincipal) (QuotaBudget, bool) {
 func (s *Store) QuotaProblem() string { return s.quota.Reason }
 
 // InstallQuotaPolicy installs or replaces the budget policy (admin operation).
+// The policy file is written only here, never per commit. Usage is committed
+// state; when the head does not carry it, it is recomputed and published as
+// one corrective op.
 func (s *Store) InstallQuotaPolicy(budgets []QuotaBudget) error {
 	if err := s.requireWritable(); err != nil {
 		return err
@@ -587,12 +926,11 @@ func (s *Store) InstallQuotaPolicy(budgets []QuotaBudget) error {
 	if err != nil {
 		return err
 	}
-	needsReplay := !s.quota.Valid || !s.quota.RecordPresent
 	s.quota.Policy = make(map[string]QuotaBudget, len(normalized))
 	for _, budget := range normalized {
 		s.quota.Policy[budget.Principal.SortKey()] = budget
 	}
-	if needsReplay {
+	if !s.quota.Valid || !s.quota.UsageCommitted {
 		usage, blobs, err := s.replayQuotaUsage()
 		if err != nil {
 			return err
@@ -600,36 +938,44 @@ func (s *Store) InstallQuotaPolicy(budgets []QuotaBudget) error {
 		s.quota.Usage = usage
 		s.blobIndex = blobs
 		s.blobIndexReady = true
+		s.quota.Valid = true
+		s.quota.Reason = ""
 	}
-	s.quota.Generation = s.generation
-	s.quota.Commit = s.head
-	s.quota.Valid = true
-	s.quota.Reason = ""
-	if err := s.persistQuotaRecord(); err != nil {
+	if err := s.persistQuotaPolicy(); err != nil {
 		return err
 	}
 	s.quota.RecordPresent = true
+	if !s.quota.UsageCommitted && len(s.quota.Usage) != 0 {
+		if _, err := s.publishQuotaUsageOp(quotaUsageOpFromMap(s.quota.Usage)); err != nil {
+			return err
+		}
+		s.quota.UsageCommitted = true
+	}
+	s.quota.Generation = s.generation
+	s.quota.Commit = s.head
 	return nil
 }
 
-// QuotaReset zeroes every usage counter (explicit admin operation).
+// QuotaReset zeroes every usage counter (explicit admin operation). It
+// publishes exactly one `set_quota_usage` reset op.
 func (s *Store) QuotaReset() error {
 	if err := s.requireWritable(); err != nil {
 		return err
 	}
+	if _, err := s.publishQuotaUsageOp(model.SetQuotaUsageOp{Reset: true}); err != nil {
+		return err
+	}
 	s.quota.Usage = make(map[string]QuotaCounters)
+	s.quota.UsageCommitted = true
 	s.quota.Generation = s.generation
 	s.quota.Commit = s.head
 	s.quota.Valid = true
 	s.quota.Reason = ""
-	if err := s.persistQuotaRecord(); err != nil {
-		return err
-	}
-	s.quota.RecordPresent = true
 	return nil
 }
 
-// QuotaRebuild recomputes usage from the published commit chain.
+// QuotaRebuild recomputes and validates usage from the published commit chain,
+// then publishes a corrective usage op.
 func (s *Store) QuotaRebuild() (uint64, error) {
 	if err := s.requireWritable(); err != nil {
 		return 0, err
@@ -642,18 +988,75 @@ func (s *Store) QuotaRebuild() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if _, err := s.publishQuotaUsageOp(quotaUsageOpFromMap(usage)); err != nil {
+		return 0, err
+	}
 	s.quota.Usage = usage
 	s.blobIndex = blobs
 	s.blobIndexReady = true
+	s.quota.UsageCommitted = true
 	s.quota.Generation = s.generation
 	s.quota.Commit = s.head
 	s.quota.Valid = true
 	s.quota.Reason = ""
-	if err := s.persistQuotaRecord(); err != nil {
-		return 0, err
-	}
-	s.quota.RecordPresent = true
 	return commits, nil
+}
+
+// PublishQuotaUsageForTest publishes an arbitrary usage assertion without
+// enforcing admission. Used by the court that proves replay rejects an
+// inconsistent assertion.
+func (s *Store) PublishQuotaUsageForTest(op model.SetQuotaUsageOp) (model.Hash32, error) {
+	return s.publishQuotaUsageOp(op)
+}
+
+// publishQuotaUsageOp publishes exactly one commit containing one
+// `set_quota_usage` op.
+func (s *Store) publishQuotaUsageOp(op model.SetQuotaUsageOp) (model.Hash32, error) {
+	if err := s.requireWritable(); err != nil {
+		return model.Hash32{}, err
+	}
+	if s.groupDepth != 0 {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument,
+			"a quota admin operation cannot run inside a group commit")
+	}
+	ops := []model.Op{op}
+	newGeneration := s.nextGeneration
+	timestamp := s.nowNS()
+	nextState := s.state.Clone()
+	if err := nextState.ApplyOps(ops); err != nil {
+		return model.Hash32{}, err
+	}
+	nextState.Generation = newGeneration
+	interval := s.options.CheckpointInterval
+	wantsCheckpoint := interval > 0 && newGeneration%interval == 0
+	var checkpoint *model.Hash32
+	if wantsCheckpoint {
+		encoded, err := model.EncodeState(nextState, newGeneration)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		id, err := s.storeBlob(BlobManifest, model.DomainManifest, encoded)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		checkpoint = &id
+	}
+	commit := model.Commit{
+		Generation: newGeneration, Parent: hashPtr(s.head), TimestampNS: timestamp,
+		Ops: ops, Checkpoint: checkpoint,
+	}
+	hash, err := s.publishCommit(commit)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	s.state = nextState
+	s.head = hash
+	s.generation = newGeneration
+	if newGeneration == ^uint64(0) {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
+	}
+	s.nextGeneration = newGeneration + 1
+	return hash, nil
 }
 
 func (s *Store) replayQuotaUsage() (map[string]QuotaCounters, map[model.Hash32]uint64, error) {
@@ -701,6 +1104,32 @@ func (s *Store) replayQuotaUsageWithCount() (map[string]QuotaCounters, map[model
 				return nil, nil, 0, err
 			}
 			usage[key] = current
+		}
+		// A committed assertion must equal the totals derived from the object
+		// ops of this commit and every earlier commit.
+		for _, op := range commit.Ops {
+			declared, ok := op.(model.SetQuotaUsageOp)
+			if !ok {
+				continue
+			}
+			if declared.Reset {
+				if len(commit.Ops) != 1 || len(declared.Usage) != 0 {
+					return nil, nil, 0, werr.Newf(werr.Corrupt,
+						"quota usage reset must be the only op and declare an empty map")
+				}
+				usage = map[string]QuotaCounters{}
+			} else {
+				declaredMap := map[string]QuotaCounters{}
+				for _, entry := range declared.Usage {
+					principal := QuotaPrincipal{Kind: entry.Kind, UID: entry.UID, GID: entry.GID, Tenant: entry.Tenant}
+					declaredMap[principal.SortKey()] = QuotaCounters{UsedBytes: entry.UsedBytes, UsedObjects: entry.UsedObjects}
+				}
+				if !quotaUsageEqual(declaredMap, usage) {
+					return nil, nil, 0, werr.Newf(werr.Corrupt,
+						"commit %d quota usage disagrees with the recomputed admission totals", commit.Generation)
+				}
+			}
+			break
 		}
 		for blob, size := range additions {
 			blobs[blob] = size
@@ -885,67 +1314,64 @@ func (s *Store) computeQuotaCharges(
 	return charges, additions, nil
 }
 
-// quotaPreflight enforces every budget before a commit is published.
-func (s *Store) quotaPreflight(ops []model.Op, pre map[model.Hash32]*model.ObjectRecord) (map[string]QuotaCounters, map[model.Hash32]uint64, bool, error) {
+// quotaPlan is the accepted outcome for one commit. usageAfter is the
+// cumulative admitted usage the commit's `set_quota_usage` op will carry.
+type quotaPlan struct {
+	additions  map[model.Hash32]uint64
+	usageAfter map[string]QuotaCounters
+}
+
+// quotaPreflight enforces every budget before a commit is published and
+// computes the usage snapshot the commit will carry. A nil plan means no
+// policy is configured.
+func (s *Store) quotaPreflight(ops []model.Op, pre map[model.Hash32]*model.ObjectRecord) (*quotaPlan, error) {
 	if !s.quota.enforced() {
 		if s.quota.RecordPresent && !s.quota.Valid {
-			return nil, nil, false, werr.Newf(werr.Corrupt,
-				"quota usage record is unusable; re-run with `--quota` to install a policy")
+			return nil, werr.Newf(werr.Corrupt,
+				"quota state is unusable; re-run with `--quota` to install a policy")
 		}
-		return nil, nil, false, nil
+		return nil, nil
 	}
 	if !s.quota.Valid {
-		return nil, nil, false, werr.Newf(werr.Corrupt,
-			"quota usage record is inconsistent with committed state; run `quota rebuild`")
+		return nil, werr.Newf(werr.Corrupt,
+			"quota usage is inconsistent with committed state; run `quota rebuild`")
 	}
 	if err := s.ensureBlobIndex(); err != nil {
-		return nil, nil, false, err
+		return nil, err
 	}
 	charges, additions, err := s.computeQuotaCharges(ops, pre, s.blobIndex)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, err
+	}
+	usageAfter := make(map[string]QuotaCounters, len(s.quota.Usage))
+	for key, counters := range s.quota.Usage {
+		usageAfter[key] = counters
+	}
+	for key, delta := range charges {
+		current := usageAfter[key]
+		if err := current.add(delta); err != nil {
+			return nil, err
+		}
+		usageAfter[key] = current
 	}
 	for key, budget := range s.quota.Policy {
-		delta := charges[key]
-		used := s.quota.Usage[key]
-		bytes, carry := addU64(used.UsedBytes, delta.UsedBytes)
-		if carry {
-			return nil, nil, false, werr.Newf(werr.LimitExceeded, "quota byte counter overflow")
-		}
-		objects, carry := addU64(used.UsedObjects, delta.UsedObjects)
-		if carry {
-			return nil, nil, false, werr.Newf(werr.LimitExceeded, "quota object counter overflow")
-		}
-		if bytes > budget.MaxNewBytes || objects > budget.MaxObjects {
+		after := usageAfter[key]
+		if after.UsedBytes > budget.MaxNewBytes || after.UsedObjects > budget.MaxObjects {
 			// Fixed, non-disclosing text: no usage, no limits, no principal.
-			return nil, nil, false, werr.Newf(werr.BudgetExceeded, "write budget exceeded")
+			return nil, werr.Newf(werr.BudgetExceeded, "write budget exceeded")
 		}
 	}
-	return charges, additions, true, nil
+	return &quotaPlan{additions: additions, usageAfter: usageAfter}, nil
 }
 
-func (s *Store) recordQuotaAfterCommit(charges map[string]QuotaCounters, additions map[model.Hash32]uint64) {
-	for key, counters := range charges {
-		current := s.quota.Usage[key]
-		if err := current.add(counters); err != nil {
-			s.quota.Valid = false
-			s.quota.Reason = fmt.Sprintf("quota usage overflow: %v", err)
-			return
-		}
-		s.quota.Usage[key] = current
-	}
-	for blob, size := range additions {
+func (s *Store) recordQuotaAfterCommit(plan *quotaPlan) {
+	s.quota.Usage = plan.usageAfter
+	s.quota.UsageCommitted = true
+	for blob, size := range plan.additions {
 		s.blobIndex[blob] = size
 	}
 	s.quota.Generation = s.generation
 	s.quota.Commit = s.head
-	if err := s.persistQuotaRecord(); err != nil {
-		s.quota.Valid = false
-		s.quota.Reason = fmt.Sprintf("cannot persist the quota record: %v", err)
-		s.notes = append(s.notes, fmt.Sprintf(
-			"commit %s published but the quota record was not updated: %v (writes fail closed until `quota rebuild`)",
-			s.head.Hex(), err))
-	}
 }
 
 // writeReplace atomically replaces a mutable record.

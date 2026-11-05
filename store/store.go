@@ -1112,9 +1112,13 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 
 	// Write-budget admission happens before any commit bytes exist. A denial
 	// returns BudgetExceeded and leaves generation, head, and state untouched.
-	quotaCharges, quotaAdditions, quotaEnforced, err := s.quotaPreflight(ops, quotaPreMap(s.state, ops))
+	quotaPlan, err := s.quotaPreflight(ops, quotaPreMap(s.state, ops))
 	if err != nil {
 		return model.Hash32{}, err
+	}
+	if quotaPlan != nil {
+		// The usage snapshot travels in the same commit; no second durable write.
+		ops = append(ops, quotaUsageOpFromMap(quotaPlan.usageAfter))
 	}
 
 	interval := s.options.CheckpointInterval
@@ -1150,8 +1154,8 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
-	if quotaEnforced {
-		s.recordQuotaAfterCommit(quotaCharges, quotaAdditions)
+	if quotaPlan != nil {
+		s.recordQuotaAfterCommit(quotaPlan)
 	}
 	return hash, nil
 }

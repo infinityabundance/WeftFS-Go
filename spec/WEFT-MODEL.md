@@ -136,9 +136,21 @@ Ops (maps with `"op"` text):
 | `del_relation` | `id:bytes32` |
 | `set_snapshot` | `name:text`, `commit:bytes32` |
 | `set_tip` | `object:bytes32`, `version:bytes32` |
+| `set_quota_usage` | `reset:bool`, `usage:[{kind:text, uid:u64?, gid:u64?, tenant:text?, used_bytes:u64, used_objects:u64}, ...]` |
 
 Ops apply in array order. A commit whose ops cannot be applied (missing parent,
 duplicate entry name, dangling target) is invalid; it is not partially applied.
+
+`set_quota_usage` is an **accounting assertion**, not namespace state. It
+MUST be the last op in its commit and MUST describe the cumulative admitted
+usage after every other op in that commit. A reset (`reset: true`) MUST be the
+only op in its commit and MUST declare an empty `usage` array; it establishes a
+new accounting baseline. The `usage` array is sorted by principal key
+(`p:%020u:%020u` before `t:<name>`) with no duplicates. The commit schema stays
+`weftfs.commit.v1`; older commits contain no usage op and replay unchanged.
+Replay recomputes the admission totals from the object ops and rejects an
+assertion that disagrees as `Corrupt`. A commit that carries no assertion is
+valid: replay derives usage from its ops.
 
 ### 2.3 File content manifests
 

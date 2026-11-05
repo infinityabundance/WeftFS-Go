@@ -64,6 +64,25 @@ func (s *State) Clone() *State {
 
 // ApplyOps applies a list atomically: all or nothing.
 func (s *State) ApplyOps(ops []Op) error {
+	// `set_quota_usage` describes the state after the other ops, so it must be
+	// last; a reset must stand alone.
+	usageSeen := false
+	for i, op := range ops {
+		usage, ok := op.(SetQuotaUsageOp)
+		if !ok {
+			continue
+		}
+		if usageSeen {
+			return werr.Newf(werr.Malformed, "a commit may contain at most one set_quota_usage op")
+		}
+		usageSeen = true
+		if i+1 != len(ops) {
+			return werr.Newf(werr.Malformed, "set_quota_usage must be the last op in its commit")
+		}
+		if usage.Reset && len(ops) != 1 {
+			return werr.Newf(werr.Malformed, "a quota usage reset must be the only op in its commit")
+		}
+	}
 	next := s.Clone()
 	for _, op := range ops {
 		if op == nil {

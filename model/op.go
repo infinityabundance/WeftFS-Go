@@ -195,6 +195,8 @@ func OpFromWCB(v wcb.Value) (Op, error) {
 			return nil, err
 		}
 		return SetTipOp{Object: object, Version: version}, nil
+	case "set_quota_usage":
+		return setQuotaUsageFromMap(without)
 	default:
 		return nil, werr.Newf(werr.Malformed, "unknown commit op `%s`", name)
 	}

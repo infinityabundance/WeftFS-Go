@@ -36,8 +36,11 @@ type VerifyReport struct {
 	// re-hashed by Verify(true).
 	CheckedRepresentations uint64
 	CheckedCapabilities    uint64
-	RejectedGenerations    []uint64
-	Problems               []VerifyProblem
+	// CheckedQuotaCommits counts commits replayed by Verify(true)'s quota
+	// assertion check.
+	CheckedQuotaCommits uint64
+	RejectedGenerations []uint64
+	Problems            []VerifyProblem
 }
 
 func (r *VerifyReport) problem(class, detail string) {
@@ -192,7 +195,21 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		if detail == "" {
 			detail = "no reason recorded"
 		}
-		report.problem(string(werr.Corrupt), "quota usage record is unusable: "+detail)
+		report.problem(string(werr.Corrupt), "quota state is unusable: "+detail)
+	}
+
+	// Full verification replays the chain and validates every committed usage
+	// assertion against the recomputed admission totals.
+	if full && (s.quota.enforced() || s.quota.UsageCommitted) {
+		usage, _, commits, err := s.replayQuotaUsageWithCount()
+		if err != nil {
+			report.problem(string(werr.ClassOf(err)), "quota replay: "+err.Error())
+		} else {
+			report.CheckedQuotaCommits = commits
+			if !quotaUsageEqual(usage, s.quota.Usage) {
+				report.problem(string(werr.Corrupt), "committed quota usage disagrees with in-memory counters")
+			}
+		}
 	}
 
 	report.OK = len(report.Problems) == 0

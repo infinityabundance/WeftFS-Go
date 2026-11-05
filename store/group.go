@@ -282,9 +282,12 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 			}
 		}
 	}
-	quotaCharges, quotaAdditions, quotaEnforced, err := s.quotaPreflight(ops, pre)
+	quotaPlan, err := s.quotaPreflight(ops, pre)
 	if err != nil {
 		return model.Hash32{}, err
+	}
+	if quotaPlan != nil {
+		ops = append(ops, quotaUsageOpFromMap(quotaPlan.usageAfter))
 	}
 	interval := s.options.CheckpointInterval
 	wantsCheckpoint := forceCheckpoint || (interval > 0 && newGeneration%interval == 0)
@@ -316,8 +319,8 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
-	if quotaEnforced {
-		s.recordQuotaAfterCommit(quotaCharges, quotaAdditions)
+	if quotaPlan != nil {
+		s.recordQuotaAfterCommit(quotaPlan)
 	}
 	return hash, nil
 }
