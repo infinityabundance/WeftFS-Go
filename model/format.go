@@ -254,17 +254,39 @@ func RepresentationFromWCB(v wcb.Value) (Representation, error) {
 // Representation is nil for the frozen v1 schema and non-nil for the
 // experimental v2 representation schema. A v1 manifest must never contain a
 // representation key; a v2 manifest must always contain one.
+//
+// Identity selects the schema. The zero value is WholeFileV1, so every
+// existing construction stays byte-identical to v1/v2. MerkleV3 writes
+// `weft.manifest.v3` and stores the Merkle root in ContentHash (the wire field
+// is `content_root`).
 type Manifest struct {
 	Size           uint64
 	ChunkSize      uint64
 	Chunks         []ChunkRef
 	ContentHash    Hash32
 	Representation *Representation
+	Identity       ContentIdentity
 }
+
+// ContentIdentity selects the content root construction of a file manifest.
+type ContentIdentity string
+
+const (
+	// ContentIdentityWholeFile is the frozen v1/v2 H("weft/chunk/v1", bytes)
+	// identity. It is the zero value and the default.
+	ContentIdentityWholeFile ContentIdentity = ""
+	// ContentIdentityMerkleV1 is the `weft.manifest.v3` Merkle root. Its wire
+	// spelling is `merkle-v1`.
+	ContentIdentityMerkleV1 ContentIdentity = "merkle-v1"
+)
 
 var manifestKeys = []string{"schema", "size", "chunk_size", "chunks", "content_hash"}
 
 var manifestKeysV2 = []string{"schema", "size", "chunk_size", "chunks", "content_hash", "representation"}
+
+var manifestKeysV3 = []string{"schema", "size", "chunk_size", "chunks", "content_root", "content_identity"}
+
+var manifestKeysV3Representation = []string{"schema", "size", "chunk_size", "chunks", "content_root", "content_identity", "representation"}
 
 // MaxChunksPerFile is the maximum number of chunk references in one manifest
 // (16 Mi, i.e. exactly the 1 TiB file bound at the default 64 KiB chunk size).
@@ -283,6 +305,20 @@ func (m Manifest) ToWCB() wcb.Value {
 			"hash": HashValue(chunk.Hash),
 			"len":  wcb.U64Value(chunk.Len),
 		}))
+	}
+	if m.Identity == ContentIdentityMerkleV1 {
+		fields := map[string]wcb.Value{
+			"schema":           wcb.TextValue(ManifestSchemaV3),
+			"size":             wcb.U64Value(m.Size),
+			"chunk_size":       wcb.U64Value(m.ChunkSize),
+			"chunks":           wcb.ArrayValue(chunks),
+			"content_root":     HashValue(m.ContentHash),
+			"content_identity": wcb.TextValue(string(ContentIdentityMerkleV1)),
+		}
+		if m.Representation != nil {
+			fields["representation"] = m.Representation.ToWCB()
+		}
+		return Map(fields)
 	}
 	if m.Representation == nil {
 		return Map(map[string]wcb.Value{
@@ -327,8 +363,10 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 	}
 	// The normative v1 spelling is `weft.manifest.v1`; the earlier
 	// `weftfs.manifest.v1` spelling is accepted on read. The experimental v2
-	// schema has exactly one spelling, `weft.manifest.v2`. Any other schema is
+	// schema has exactly one spelling, `weft.manifest.v2`, and the Merkle v3
+	// schema exactly one, `weft.manifest.v3`. Any other schema is
 	// UnsupportedVersion, matching the Rust reader.
+	identity := ContentIdentityWholeFile
 	v2 := false
 	switch schema {
 	case ManifestSchema, LegacyManifest:
@@ -340,8 +378,24 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 		if err := CheckKeys(m, manifestKeysV2...); err != nil {
 			return Manifest{}, err
 		}
+	case ManifestSchemaV3:
+		identity = ContentIdentityMerkleV1
+		keys := manifestKeysV3
+		if _, present := m["representation"]; present {
+			keys = manifestKeysV3Representation
+		}
+		if err := CheckKeys(m, keys...); err != nil {
+			return Manifest{}, err
+		}
+		name, err := GetText(m, "content_identity")
+		if err != nil {
+			return Manifest{}, err
+		}
+		if name != string(ContentIdentityMerkleV1) {
+			return Manifest{}, werr.Newf(werr.Malformed, "unknown manifest content_identity `%s`", name)
+		}
 	default:
-		return Manifest{}, werr.Newf(werr.Unsupported, "manifest schema `%s` is not a supported v1/v2 schema", schema)
+		return Manifest{}, werr.Newf(werr.Unsupported, "manifest schema `%s` is not a supported v1/v2/v3 schema", schema)
 	}
 	size, err := GetU64(m, "size")
 	if err != nil {
@@ -355,16 +409,19 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 		return Manifest{}, werr.Newf(werr.Malformed, "manifest chunk_size is out of range")
 	}
 	var representation *Representation
-	if v2 {
-		value, err := Field(m, "representation")
-		if err != nil {
-			return Manifest{}, err
+	if v2 || identity == ContentIdentityMerkleV1 {
+		if value, present := m["representation"]; present {
+			parsed, err := RepresentationFromWCB(value)
+			if err != nil {
+				return Manifest{}, err
+			}
+			representation = &parsed
+		} else if v2 {
+			return Manifest{}, werr.Newf(werr.Malformed, "weft.manifest.v2 is missing its representation map")
 		}
-		parsed, err := RepresentationFromWCB(value)
-		if err != nil {
-			return Manifest{}, err
-		}
-		representation = &parsed
+	}
+	if identity == ContentIdentityMerkleV1 && representation != nil && representation.Kind != RepresentationRaw {
+		return Manifest{}, werr.Newf(werr.Corrupt, "a Merkle v3 manifest may only carry a raw representation")
 	}
 	// A codec or tensor representation carries bytes only inside its frame and
 	// lists no chunk references; raw (and v1) manifests list them.
@@ -440,19 +497,32 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 			}
 		}
 	}
-	contentHash, err := GetHash(m, "content_hash")
-	if err != nil {
-		return Manifest{}, err
-	}
-	if size == 0 && contentHash != ContentHash(nil) {
-		return Manifest{}, werr.Newf(werr.Corrupt, "empty manifest content hash mismatch")
+	var contentHash Hash32
+	if identity == ContentIdentityMerkleV1 {
+		declared, err := GetHash(m, "content_root")
+		if err != nil {
+			return Manifest{}, err
+		}
+		computed := MerkleRootChunks(chunks)
+		if declared != computed {
+			return Manifest{}, werr.Newf(werr.Corrupt, "merkle content_root does not match the manifest chunk hashes")
+		}
+		contentHash = declared
+	} else {
+		contentHash, err = GetHash(m, "content_hash")
+		if err != nil {
+			return Manifest{}, err
+		}
+		if size == 0 && contentHash != ContentHash(nil) {
+			return Manifest{}, werr.Newf(werr.Corrupt, "empty manifest content hash mismatch")
+		}
 	}
 	if representation != nil && representation.DecodedSize != size {
 		return Manifest{}, werr.Newf(werr.Corrupt, "representation decoded_size %d differs from manifest size %d", representation.DecodedSize, size)
 	}
 	return Manifest{
 		Size: size, ChunkSize: chunkSize, Chunks: chunks, ContentHash: contentHash,
-		Representation: representation,
+		Representation: representation, Identity: identity,
 	}, nil
 }
 

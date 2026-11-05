@@ -51,7 +51,8 @@ func main() {
 
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto]
-              [--codec-min-bytes N] [--quota SPEC] [--quota-file FILE] <command> [args]
+              [--content-identity whole-file|merkle] [--codec-min-bytes N]
+              [--quota SPEC] [--quota-file FILE] <command> [args]
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
@@ -74,8 +75,9 @@ var fixedTimestampNS *int64
 // CLI: read-only commands accept and ignore them, invalid values fail before
 // any command runs, and every writable open applies them to new content.
 var (
-	representationMode = store.RepresentationModeRaw
-	codecMinBytes      = store.DefaultCodecMinBytes
+	representationMode  = store.RepresentationModeRaw
+	codecMinBytes       = store.DefaultCodecMinBytes
+	contentIdentityMode = model.ContentIdentityWholeFile
 	// quotaBudgets are the --quota/--quota-file budgets supplied on this
 	// invocation. They install (or replace) the persisted policy on a writable
 	// open; an empty slice enforces the persisted policy unchanged.
@@ -85,6 +87,7 @@ var (
 func applyRepresentationPolicy(opts *store.Options) {
 	opts.Representation = representationMode
 	opts.CodecMinBytes = codecMinBytes
+	opts.ContentIdentity = contentIdentityMode
 }
 
 func readQuotaFile(path string) ([]store.QuotaBudget, error) {
@@ -147,6 +150,22 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--codec-min-bytes must be a non-negative integer (got `%s`)", text)
 			}
 			codecMinBytes = value
+		case args[i] == "--content-identity" || args[i] == "-content-identity":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--content-identity requires a value")
+			}
+			identity, parseErr := store.ParseContentIdentity(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			contentIdentityMode = identity
+			i++
+		case strings.HasPrefix(args[i], "--content-identity="):
+			identity, parseErr := store.ParseContentIdentity(strings.TrimPrefix(args[i], "--content-identity="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			contentIdentityMode = identity
 		case args[i] == "--quota" || args[i] == "-quota":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--quota requires a value")
@@ -354,6 +373,7 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 			"relations":            len(state.Relations),
 			"snapshots":            snapshots,
 			"representation":       representationMode.AsString(),
+			"content_identity":     store.ContentIdentityString(contentIdentityMode),
 			"codec_min_bytes":      codecMinBytes,
 			"rejected_generations": s.RejectedGenerations(),
 			"recovery_notes":       s.RecoveryNotes(),
@@ -362,7 +382,7 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 	fmt.Printf("format=weftfs-store 1\ngeneration=%d\nsnapshot_root=%s\n", s.Generation(), s.Head().Hex())
 	fmt.Printf("objects=%d\nentries=%d\nrelations=%d\nsnapshots=%d\n",
 		len(state.Objects), len(state.Entries), len(state.Relations), len(state.Snapshots))
-	fmt.Printf("representation=%s\ncodec_min_bytes=%d\n", representationMode.AsString(), codecMinBytes)
+	fmt.Printf("representation=%s\ncontent_identity=%s\ncodec_min_bytes=%d\n", representationMode.AsString(), store.ContentIdentityString(contentIdentityMode), codecMinBytes)
 	for _, generation := range s.RejectedGenerations() {
 		fmt.Printf("rejected_generation=%d\n", generation)
 	}
@@ -832,6 +852,7 @@ func cmdStat(args []string, storeDir string, jsonOut bool) error {
 	if record.Kind == model.KindFile {
 		if manifest, err := store.ReadManifest(storeDir, record.Content); err == nil {
 			info["content_hash"] = manifest.ContentHash.Hex()
+			info["content_identity"] = store.ContentIdentityString(manifest.Identity)
 			info["chunk_size"] = manifest.ChunkSize
 			info["chunks"] = len(manifest.Chunks)
 		}

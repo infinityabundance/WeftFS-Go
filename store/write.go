@@ -120,6 +120,22 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	if end < offset || end > MaxFileBytes {
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
+	oldManifest, err := ReadManifest(s.root, old.Content)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	identity := s.options.ContentIdentity
+	if oldManifest.Identity == model.ContentIdentityMerkleV1 {
+		identity = model.ContentIdentityMerkleV1
+	}
+	frameBacked := oldManifest.Representation != nil &&
+		(oldManifest.Representation.Kind == model.RepresentationCodec || oldManifest.Representation.Kind == model.RepresentationTensor)
+	// A Merkle file is rewritten chunk-granularly: only changed chunks are
+	// re-hashed and re-stored, and the root is folded from the manifest's
+	// stored chunk hashes. A v3 file is never implicitly downgraded.
+	if identity == model.ContentIdentityMerkleV1 && !frameBacked {
+		return s.writeFileMerkle(id, old, oldManifest, offset, data, causal)
+	}
 	current, err := s.ReadObject(id)
 	if err != nil {
 		return model.Hash32{}, err
@@ -160,13 +176,20 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 	if err != nil {
 		return model.Hash32{}, err
 	}
-	manifestID, _, size, err := s.storeFileContentWithBase(buffer, base)
+	manifestID, _, _, err := s.storeFileContentWithBase(buffer, base)
 	if err != nil {
 		return model.Hash32{}, err
 	}
+	return s.publishFileWrite(id, old, manifestID, newSize, causal)
+}
+
+// publishFileWrite derives the new version and publishes one commit. Shared by
+// the whole-file write path and the Merkle chunk-granular path.
+func (s *Store) publishFileWrite(id model.Hash32, old model.ObjectRecord, manifestID model.Hash32, newSize uint64, causal []model.Hash32) (model.Hash32, error) {
 	var attrs map[string]wcb.Value
 	var identityMode weftcontext.IdentityMode
 	var causalHash *model.Hash32
+	var err error
 	if len(causal) == 0 {
 		identityMode, causalHash, err = model.IdentityFromAttrs(old)
 		if err != nil {
@@ -186,7 +209,7 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 		}
 	}
 	mtime := s.nowNS()
-	version, err := model.DeriveVersionIDWithIdentity(id, manifestID, size, mtime, hashPtr(old.Version), identityMode, causalHash)
+	version, err := model.DeriveVersionIDWithIdentity(id, manifestID, newSize, mtime, hashPtr(old.Version), identityMode, causalHash)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -204,6 +227,137 @@ func (s *Store) WriteFileCausal(id model.Hash32, offset uint64, data []byte, cau
 		return model.Hash32{}, err
 	}
 	return version, nil
+}
+
+// writeFileMerkle applies a range write to a `weft.manifest.v3` file.
+//
+// Only chunks intersecting the write are read and re-hashed; untouched chunk
+// references are reused verbatim and their blobs are never read. The root is
+// recomputed from the resulting chunk table with no whole-file read.
+func (s *Store) writeFileMerkle(id model.Hash32, old model.ObjectRecord, oldManifest model.Manifest, offset uint64, data []byte, causal []model.Hash32) (model.Hash32, error) {
+	chunkSize := oldManifest.ChunkSize
+	if chunkSize == 0 || chunkSize > model.MaxChunkSize {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
+	}
+	end := offset + uint64(len(data))
+	if end < offset || end > MaxFileBytes {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
+	}
+	newSize := end
+	if old.Size > newSize {
+		newSize = old.Size
+	}
+	var declared uint64
+	for _, chunk := range oldManifest.Chunks {
+		if declared > ^uint64(0)-chunk.Len {
+			return model.Hash32{}, werr.Newf(werr.Corrupt, "manifest size overflows")
+		}
+		declared += chunk.Len
+	}
+	if declared != oldManifest.Size || oldManifest.Size != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "manifest chunk lengths disagree with its size")
+	}
+	chunkCount := newSize / chunkSize
+	if newSize%chunkSize != 0 {
+		chunkCount++
+	}
+	if chunkCount > model.MaxChunksPerFile {
+		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+	}
+	chunks := make([]model.ChunkRef, 0, chunkCount)
+	for index := uint64(0); index < chunkCount; index++ {
+		chunkStart := index * chunkSize
+		chunkEnd := chunkStart + chunkSize
+		if chunkEnd > newSize {
+			chunkEnd = newSize
+		}
+		var oldRef *model.ChunkRef
+		if index < uint64(len(oldManifest.Chunks)) {
+			oldRef = &oldManifest.Chunks[index]
+		}
+		touchesWrite := chunkStart < end && offset < chunkEnd
+		if oldRef != nil && chunkEnd <= oldManifest.Size && !touchesWrite {
+			chunks = append(chunks, *oldRef)
+			continue
+		}
+		assembled := make([]byte, chunkEnd-chunkStart)
+		var oldBytes []byte
+		if oldRef != nil {
+			keep := chunkEnd - chunkStart
+			if oldRef.Len < keep {
+				keep = oldRef.Len
+			}
+			if keep > 0 {
+				stored, err := ReadBlobVerified(s.root, BlobObject, oldRef.Hash, model.DomainChunk)
+				if err != nil {
+					return model.Hash32{}, err
+				}
+				s.writeChunkReads.Add(1)
+				if uint64(len(stored)) != oldRef.Len {
+					return model.Hash32{}, werr.Newf(werr.Corrupt, "chunk length disagrees with manifest")
+				}
+				copy(assembled[:keep], stored[:keep])
+				oldBytes = stored
+			}
+		}
+		writeStart := offset
+		if chunkStart > writeStart {
+			writeStart = chunkStart
+		}
+		writeEnd := end
+		if chunkEnd < writeEnd {
+			writeEnd = chunkEnd
+		}
+		if writeStart < writeEnd {
+			copy(assembled[writeStart-chunkStart:writeEnd-chunkStart], data[writeStart-offset:writeEnd-offset])
+		}
+		if oldRef != nil && oldBytes != nil && oldRef.Len == chunkEnd-chunkStart && bytes.Equal(assembled, oldBytes) {
+			chunks = append(chunks, *oldRef)
+			continue
+		}
+		hash, err := s.storeBlob(BlobObject, model.DomainChunk, assembled)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		chunks = append(chunks, model.ChunkRef{Hash: hash, Len: uint64(len(assembled))})
+	}
+	manifest := model.Manifest{
+		Size: newSize, ChunkSize: chunkSize, Chunks: chunks,
+		ContentHash: model.MerkleRootChunks(chunks),
+		Identity:    model.ContentIdentityMerkleV1,
+	}
+	manifestID, _, _, err := s.storeManifest(manifest)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	return s.publishFileWrite(id, old, manifestID, newSize, causal)
+}
+
+// contentIdentityFor returns the identity a rewrite of record must keep: an
+// existing v3 file stays v3; a v1/v2 file adopts the store-wide option.
+func (s *Store) contentIdentityFor(record model.ObjectRecord) model.ContentIdentity {
+	if record.Kind == model.KindFile {
+		if manifest, err := ReadManifest(s.root, record.Content); err == nil && manifest.Identity == model.ContentIdentityMerkleV1 {
+			return model.ContentIdentityMerkleV1
+		}
+	}
+	return s.options.ContentIdentity
+}
+
+// storeFileContentAs stores a whole buffer under an explicit identity.
+func (s *Store) storeFileContentAs(data []byte, identity model.ContentIdentity) (model.Hash32, model.Hash32, uint64, error) {
+	if identity == model.ContentIdentityMerkleV1 {
+		chunkSize := s.options.ChunkSize
+		if chunkSize == 0 || chunkSize > model.MaxChunkSize {
+			return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
+		}
+		manifest, err := s.buildMerkleManifest(data, chunkSize)
+		if err != nil {
+			return model.Hash32{}, model.Hash32{}, 0, err
+		}
+		return s.storeManifest(manifest)
+	}
+	return s.storeFileContent(data)
 }
 
 // Truncate resizes a file, zero-filling when growing.
@@ -235,7 +389,7 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 		copied = len(buffer)
 	}
 	copy(buffer, current[:copied])
-	manifestID, _, _, err := s.storeFileContent(buffer)
+	manifestID, _, _, err := s.storeFileContentAs(buffer, s.contentIdentityFor(old))
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -272,7 +426,7 @@ func (s *Store) commitFileBuffer(id model.Hash32, old model.ObjectRecord, buffer
 	if uint64(len(buffer)) > MaxFileBytes {
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
-	manifestID, _, size, err := s.storeFileContent(buffer)
+	manifestID, _, size, err := s.storeFileContentAs(buffer, s.contentIdentityFor(old))
 	if err != nil {
 		return model.Hash32{}, err
 	}

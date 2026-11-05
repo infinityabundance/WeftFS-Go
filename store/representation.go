@@ -70,6 +70,27 @@ func ParseRepresentationMode(text string) (RepresentationMode, error) {
 // AsString returns the canonical CLI spelling.
 func (m RepresentationMode) AsString() string { return string(m) }
 
+// ParseContentIdentity parses `whole-file` or `merkle`.
+func ParseContentIdentity(text string) (model.ContentIdentity, error) {
+	switch text {
+	case "whole-file":
+		return model.ContentIdentityWholeFile, nil
+	case "merkle":
+		return model.ContentIdentityMerkleV1, nil
+	default:
+		return "", werr.Newf(werr.InvalidArgument,
+			"--content-identity must be `whole-file` or `merkle` (got `%s`)", text)
+	}
+}
+
+// ContentIdentityString returns the canonical CLI spelling.
+func ContentIdentityString(identity model.ContentIdentity) string {
+	if identity == model.ContentIdentityMerkleV1 {
+		return "merkle"
+	}
+	return "whole-file"
+}
+
 // codecChunkSize returns the codec frame chunk size for a store chunk size,
 // clamped to the Rust bounds.
 func codecChunkSize(storeChunkSize uint64) uint64 {

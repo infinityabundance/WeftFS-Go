@@ -359,21 +359,100 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 			report.problem(string(werr.ClassOf(err)), "object "+id.Hex()+": "+err.Error())
 			continue
 		}
-		assembled := make([]byte, 0, capacity)
-		for _, chunk := range manifest.Chunks {
+		merkle := manifest.Identity == model.ContentIdentityMerkleV1
+		var assembled []byte
+		if !merkle {
+			assembled = make([]byte, 0, capacity)
+		}
+		leaves := make([]model.ChunkRef, 0, len(manifest.Chunks))
+		for index, chunk := range manifest.Chunks {
 			report.CheckedChunks++
 			bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)
 			if err != nil {
-				report.problem(string(werr.ClassOf(err)), "chunk "+chunk.Hash.Hex()+": "+err.Error())
+				report.problem(string(werr.ClassOf(err)), "chunk "+itoa(uint64(index))+" ("+chunk.Hash.Hex()+"): "+err.Error())
 				continue
 			}
 			if uint64(len(bytesValue)) != chunk.Len {
-				report.problem(string(werr.Corrupt), "chunk "+chunk.Hash.Hex()+" length disagrees with manifest")
+				report.problem(string(werr.Corrupt), "chunk "+itoa(uint64(index))+" length disagrees with manifest")
 			}
-			assembled = append(assembled, bytesValue...)
+			if merkle {
+				leaves = append(leaves, model.ChunkRef{Hash: chunk.Hash, Len: chunk.Len})
+			} else {
+				assembled = append(assembled, bytesValue...)
+			}
 		}
-		if uint64(len(assembled)) == manifest.Size && model.ContentHash(assembled) != manifest.ContentHash {
+		if merkle {
+			if model.MerkleRootChunks(leaves) != manifest.ContentHash {
+				report.problem(string(werr.Corrupt), "object "+id.Hex()+" merkle content root mismatch")
+			}
+		} else if uint64(len(assembled)) == manifest.Size && model.ContentHash(assembled) != manifest.ContentHash {
 			report.problem(string(werr.Corrupt), "object "+id.Hex()+" whole-content hash mismatch")
 		}
 	}
+}
+
+// RegionVerification reports the outcome of VerifyContentRegion.
+type RegionVerification struct {
+	ContentRoot    model.Hash32
+	ChunksVerified int
+	BytesVerified  uint64
+}
+
+// VerifyContentRegion verifies only the chunks a range touches for a
+// `weft.manifest.v3` file.
+//
+// contentRoot is the store's content root (the manifest id stored in
+// ObjectRecord.Content), matching every other ReadContent entry point. The
+// manifest's ContentHash is the Merkle root and is returned in the report.
+// The touched blobs are re-hashed from their bytes, their lengths are checked,
+// and the root is recomputed from all manifest chunk hashes. No explicit
+// sibling table is needed: the manifest carries every leaf preimage.
+//
+// A whole-file (v1/v2) content root is rejected with InvalidArgument; use
+// Verify with full=true for those. A tampered blob or hash names the chunk
+// index.
+func (s *Store) VerifyContentRegion(contentRoot model.Hash32, offset, length uint64) (RegionVerification, error) {
+	manifest, err := ReadManifest(s.root, contentRoot)
+	if err != nil {
+		return RegionVerification{}, err
+	}
+	if manifest.Identity != model.ContentIdentityMerkleV1 {
+		return RegionVerification{}, werr.Newf(werr.InvalidArgument,
+			"verify_region requires a weft.manifest.v3 Merkle content root")
+	}
+	declared := model.MerkleRootChunks(manifest.Chunks)
+	if declared != manifest.ContentHash {
+		return RegionVerification{}, werr.Newf(werr.Corrupt,
+			"merkle content_root does not match the manifest chunk hashes")
+	}
+	if offset >= manifest.Size || length == 0 {
+		return RegionVerification{ContentRoot: declared}, nil
+	}
+	end := offset + length
+	if end < offset || end > manifest.Size {
+		end = manifest.Size
+	}
+	var cursor uint64
+	report := RegionVerification{ContentRoot: declared}
+	for index, chunk := range manifest.Chunks {
+		chunkStart := cursor
+		chunkEnd := cursor + chunk.Len
+		if chunkEnd < cursor {
+			return RegionVerification{}, werr.Newf(werr.Corrupt, "chunk offset overflow")
+		}
+		cursor = chunkEnd
+		if chunkEnd <= offset || chunkStart >= end {
+			continue
+		}
+		bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)
+		if err != nil {
+			return RegionVerification{}, werr.Newf(werr.Corrupt, "chunk %d (%s): %s", index, chunk.Hash.Hex(), err.Error())
+		}
+		if uint64(len(bytesValue)) != chunk.Len {
+			return RegionVerification{}, werr.Newf(werr.Corrupt, "chunk %d length disagrees with manifest", index)
+		}
+		report.ChunksVerified++
+		report.BytesVerified += chunk.Len
+	}
+	return report, nil
 }

@@ -120,7 +120,7 @@ func TestManifestSchemaRules(t *testing.T) {
 	}
 
 	unknownSchema := Map(map[string]wcb.Value{
-		"schema":       wcb.TextValue("weft.manifest.v3"),
+		"schema":       wcb.TextValue("weft.manifest.v9"),
 		"size":         wcb.U64Value(0),
 		"chunk_size":   wcb.U64Value(65536),
 		"chunks":       wcb.ArrayValue(nil),
@@ -128,6 +128,17 @@ func TestManifestSchemaRules(t *testing.T) {
 	})
 	if _, err := ManifestFromWCB(unknownSchema); werr.ClassOf(err) != werr.Unsupported {
 		t.Fatalf("unknown schema = %v, want UnsupportedVersion", err)
+	}
+
+	v3WithV1Keys := Map(map[string]wcb.Value{
+		"schema":       wcb.TextValue(ManifestSchemaV3),
+		"size":         wcb.U64Value(0),
+		"chunk_size":   wcb.U64Value(65536),
+		"chunks":       wcb.ArrayValue(nil),
+		"content_hash": HashValue(ContentHash(nil)),
+	})
+	if _, err := ManifestFromWCB(v3WithV1Keys); werr.ClassOf(err) != werr.Malformed {
+		t.Fatalf("v3 with v1 keys = %v, want Malformed", err)
 	}
 }
 

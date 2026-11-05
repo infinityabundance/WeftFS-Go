@@ -53,7 +53,7 @@ func readRawRange(root string, manifest model.Manifest, offset, length uint64, v
 	}
 	out := make([]byte, 0, capacity)
 	var cursor uint64
-	for _, chunk := range manifest.Chunks {
+	for index, chunk := range manifest.Chunks {
 		chunkStart := cursor
 		chunkEnd := cursor + chunk.Len
 		if chunkEnd < cursor {
@@ -65,10 +65,10 @@ func readRawRange(root string, manifest model.Manifest, offset, length uint64, v
 		}
 		bytesValue, err := ReadBlobVerified(root, BlobObject, chunk.Hash, model.DomainChunk)
 		if err != nil {
-			return nil, err
+			return nil, werr.Newf(werr.Corrupt, "chunk %d (%s): %s", index, chunk.Hash.Hex(), err.Error())
 		}
 		if uint64(len(bytesValue)) != chunk.Len {
-			return nil, werr.Newf(werr.Corrupt, "chunk length disagrees with manifest")
+			return nil, werr.Newf(werr.Corrupt, "chunk %d length disagrees with manifest", index)
 		}
 		localStart := uint64(0)
 		if offset > chunkStart {
@@ -84,7 +84,11 @@ func readRawRange(root string, manifest model.Manifest, offset, length uint64, v
 		return nil, werr.Newf(werr.Corrupt, "assembled range length mismatch")
 	}
 	if verifyWhole && offset == 0 && end == manifest.Size {
-		if model.ContentHash(out) != manifest.ContentHash {
+		if manifest.Identity == model.ContentIdentityMerkleV1 {
+			if model.MerkleRootChunks(manifest.Chunks) != manifest.ContentHash {
+				return nil, werr.Newf(werr.Corrupt, "merkle content root mismatch for a fully read file")
+			}
+		} else if model.ContentHash(out) != manifest.ContentHash {
 			return nil, werr.Newf(werr.Corrupt, "whole-content hash mismatch")
 		}
 	}

@@ -88,6 +88,10 @@ type Options struct {
 	// `raw` (the frozen v1 writer, the default) or `codec-auto` (experimental
 	// v2 manifests).
 	Representation RepresentationMode
+	// ContentIdentity selects the content root for newly written chunk
+	// manifests. The zero value writes the frozen v1 whole-file ContentId;
+	// `merkle-v1` writes `weft.manifest.v3`. Existing v3 files stay v3.
+	ContentIdentity model.ContentIdentity
 	// CodecMinBytes leaves files smaller than this on the raw path under
 	// `codec-auto`.
 	CodecMinBytes uint64
@@ -110,6 +114,7 @@ func DefaultOptions() Options {
 		GCIntervalSecs:          DefaultGCIntervalSecs,
 		GCWatchMaxDeletes:       DefaultGCWatchMaxDeletes,
 		Representation:          RepresentationModeRaw,
+		ContentIdentity:         model.ContentIdentityWholeFile,
 		CodecMinBytes:           DefaultCodecMinBytes,
 		CodecDeltaMarginPercent: DefaultCodecDeltaMarginPercent,
 	}
@@ -170,7 +175,17 @@ type Store struct {
 	quota          QuotaState
 	blobIndex      map[model.Hash32]uint64
 	blobIndexReady bool
+	// Chunk blobs read by the most recent Merkle range write. Diagnostic only:
+	// it proves an overwrite does not stream the whole file.
+	writeChunkReads atomic.Uint64
 }
+
+// ResetWriteChunkReads resets the Merkle range-write chunk-read counter.
+func (s *Store) ResetWriteChunkReads() { s.writeChunkReads.Store(0) }
+
+// WriteChunkReads returns the chunk blobs read by the most recent Merkle range
+// write. It is a test/receipt hook, not a format feature.
+func (s *Store) WriteChunkReads() uint64 { return s.writeChunkReads.Load() }
 
 var tmpCounter atomic.Uint64
 
@@ -215,6 +230,15 @@ func validateOptions(opts Options) error {
 	case RepresentationModeRaw, RepresentationModeCodecAuto:
 	default:
 		return werr.Newf(werr.InvalidArgument, "representation must be `raw` or `codec-auto` (got `%s`)", opts.Representation)
+	}
+	switch opts.ContentIdentity {
+	case model.ContentIdentityWholeFile:
+	case model.ContentIdentityMerkleV1:
+		if opts.Representation == RepresentationModeCodecAuto {
+			return werr.Newf(werr.InvalidArgument, "content_identity `merkle` cannot be combined with representation `codec-auto`")
+		}
+	default:
+		return werr.Newf(werr.InvalidArgument, "content_identity must be `whole-file` or `merkle` (got `%s`)", opts.ContentIdentity)
 	}
 	if opts.CheckpointInterval > 1_000_000 {
 		return werr.Newf(werr.InvalidArgument, "checkpoint_interval must be at most 1,000,000")
@@ -1193,6 +1217,16 @@ func (s *Store) storeFileContentWithBase(data []byte, base *deltaBase) (manifest
 	if chunkSize == 0 || chunkSize > model.MaxChunkSize {
 		return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.InvalidArgument, "chunk size is out of range")
 	}
+	if s.options.ContentIdentity == model.ContentIdentityMerkleV1 {
+		if s.options.Representation == RepresentationModeCodecAuto {
+			return model.Hash32{}, model.Hash32{}, 0, werr.Newf(werr.InvalidArgument, "content_identity `merkle` cannot be combined with codec-auto")
+		}
+		manifest, err := s.buildMerkleManifest(data, chunkSize)
+		if err != nil {
+			return model.Hash32{}, model.Hash32{}, 0, err
+		}
+		return s.storeManifest(manifest)
+	}
 	contentHash = model.ContentHash(data)
 	codecAuto := s.options.Representation == RepresentationModeCodecAuto
 
@@ -1230,9 +1264,32 @@ func (s *Store) storeFileContentWithBase(data []byte, base *deltaBase) (manifest
 	return s.storeManifest(manifest)
 }
 
+// buildMerkleManifest writes the chunk blobs for a raw layout and returns a
+// `weft.manifest.v3` value whose ContentHash is the Merkle root. No whole-file
+// digest is computed.
+func (s *Store) buildMerkleManifest(data []byte, chunkSize uint64) (model.Manifest, error) {
+	chunks, err := s.writeChunks(data, chunkSize)
+	if err != nil {
+		return model.Manifest{}, err
+	}
+	return model.Manifest{
+		Size: uint64(len(data)), ChunkSize: chunkSize, Chunks: chunks,
+		ContentHash: model.MerkleRootChunks(chunks),
+		Identity:    model.ContentIdentityMerkleV1,
+	}, nil
+}
+
 // buildRawManifest writes the chunk blobs for a raw layout and returns a
 // v1-shaped manifest value (no representation).
 func (s *Store) buildRawManifest(data []byte, chunkSize uint64, contentHash model.Hash32) (model.Manifest, error) {
+	chunks, err := s.writeChunks(data, chunkSize)
+	if err != nil {
+		return model.Manifest{}, err
+	}
+	return model.Manifest{Size: uint64(len(data)), ChunkSize: chunkSize, Chunks: chunks, ContentHash: contentHash}, nil
+}
+
+func (s *Store) writeChunks(data []byte, chunkSize uint64) ([]model.ChunkRef, error) {
 	chunks := make([]model.ChunkRef, 0)
 	step := int(chunkSize)
 	for start := 0; start < len(data); start += step {
@@ -1242,15 +1299,15 @@ func (s *Store) buildRawManifest(data []byte, chunkSize uint64, contentHash mode
 		}
 		chunk := data[start:end]
 		if uint64(len(chunks)) >= model.MaxChunksPerFile {
-			return model.Manifest{}, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
+			return nil, werr.Newf(werr.LimitExceeded, "manifest exceeds the %d-chunk bound", model.MaxChunksPerFile)
 		}
 		hash, err := s.storeBlob(BlobObject, model.DomainChunk, chunk)
 		if err != nil {
-			return model.Manifest{}, err
+			return nil, err
 		}
 		chunks = append(chunks, model.ChunkRef{Hash: hash, Len: uint64(len(chunk))})
 	}
-	return model.Manifest{Size: uint64(len(data)), ChunkSize: chunkSize, Chunks: chunks, ContentHash: contentHash}, nil
+	return chunks, nil
 }
 
 func (s *Store) storeManifest(manifest model.Manifest) (model.Hash32, model.Hash32, uint64, error) {
