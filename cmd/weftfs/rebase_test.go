@@ -14,9 +14,9 @@ import (
 
 // rebaseFixture builds a store with a mode-9 base, a mode-11 weight-delta
 // child, twelve reads on the child, flushed access counters, and a snapshot.
-// It returns the store directory, the delta id, the target bytes, and the
-// pre-rebase logical root.
-func rebaseFixture(t *testing.T) (string, model.Hash32, []byte, model.Hash32) {
+// It returns the store directory, the delta id, the target bytes, the
+// pre-rebase logical root, and the pre-rebase version.
+func rebaseFixture(t *testing.T) (string, model.Hash32, []byte, model.Hash32, model.Hash32) {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store.Init(dir, store.DefaultOptions())
@@ -56,6 +56,10 @@ func rebaseFixture(t *testing.T) (string, model.Hash32, []byte, model.Hash32) {
 	if meta.Strategy != "weight-delta" {
 		t.Fatalf("delta strategy = %s, want weight-delta", meta.Strategy)
 	}
+	deltaRecord, err := s.ObjectMeta(deltaID)
+	if err != nil {
+		t.Fatalf("delta record: %v", err)
+	}
 	for index := 0; index < 12; index++ {
 		data, err := s.ReadTensor(deltaID)
 		if err != nil || !bytes.Equal(data, target) {
@@ -71,7 +75,7 @@ func rebaseFixture(t *testing.T) (string, model.Hash32, []byte, model.Hash32) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	return dir, deltaID, target, meta.LogicalRoot
+	return dir, deltaID, target, meta.LogicalRoot, deltaRecord.Version
 }
 
 // rustBinaryCLI locates the Rust reference binary. It is used only as a test
@@ -118,7 +122,7 @@ func runRustCLI(t *testing.T, bin string, args ...string) string {
 }
 
 func TestRebaseCLIDryRunDoesNotWrite(t *testing.T) {
-	dir, deltaID, _, _ := rebaseFixture(t)
+	dir, deltaID, _, _, _ := rebaseFixture(t)
 
 	before, err := store.Open(dir, store.ReadOnly)
 	if err != nil {
@@ -171,7 +175,7 @@ func TestRebaseCLIDryRunDoesNotWrite(t *testing.T) {
 
 func TestRebaseCLIAppliesAndRustAccepts(t *testing.T) {
 	bin := rustBinaryCLI(t)
-	dir, deltaID, target, logicalRoot := rebaseFixture(t)
+	dir, deltaID, target, logicalRoot, oldVersion := rebaseFixture(t)
 
 	out := captureStdout(t, func() error {
 		return run("rebase", []string{"--root", "/", "--threshold", "1000000"}, dir, false)
@@ -218,6 +222,17 @@ func TestRebaseCLIAppliesAndRustAccepts(t *testing.T) {
 	if err != nil || !bytes.Equal(data, target) {
 		t.Fatalf("post-rebase read: %v", err)
 	}
+	record, err := reopened.ObjectMeta(deltaID)
+	if err != nil {
+		t.Fatalf("post-rebase record: %v", err)
+	}
+	closure, err := model.ObjectCausalClosure(record)
+	if err != nil {
+		t.Fatalf("causal closure: %v", err)
+	}
+	if closure == nil || len(closure.Parents) != 1 || closure.Parents[0] != oldVersion {
+		t.Fatalf("new version causal parents = %+v, want [%s]", closure, oldVersion.Hex())
+	}
 	meta, err := reopened.TensorMetadata(deltaID)
 	if err != nil {
 		t.Fatalf("meta: %v", err)
@@ -231,7 +246,7 @@ func TestRebaseCLIAppliesAndRustAccepts(t *testing.T) {
 }
 
 func TestRebaseCLIIsIdempotent(t *testing.T) {
-	dir, deltaID, _, _ := rebaseFixture(t)
+	dir, deltaID, _, _, _ := rebaseFixture(t)
 	first := captureStdout(t, func() error {
 		return run("rebase", []string{"--root", "/", "--threshold", "1000000"}, dir, false)
 	})
@@ -252,7 +267,7 @@ func TestRebaseCLIIsIdempotent(t *testing.T) {
 }
 
 func TestRebaseCLIThresholdNotMet(t *testing.T) {
-	dir, _, _, _ := rebaseFixture(t)
+	dir, _, _, _, _ := rebaseFixture(t)
 	out := captureStdout(t, func() error {
 		return run("rebase", []string{"--root", "/", "--threshold", "1000000000000000"}, dir, false)
 	})
@@ -262,7 +277,7 @@ func TestRebaseCLIThresholdNotMet(t *testing.T) {
 }
 
 func TestRebaseCLIUnsupportedStrategyIsRefused(t *testing.T) {
-	dir, _, _, _ := rebaseFixture(t)
+	dir, _, _, _, _ := rebaseFixture(t)
 	err := run("rebase", []string{
 		"--root", "/", "--threshold", "1000000", "--strategy", "weight-delta",
 	}, dir, false)
@@ -282,7 +297,7 @@ func TestRebaseCLIUnsupportedStrategyIsRefused(t *testing.T) {
 
 func TestRustRebaseReadableByGo(t *testing.T) {
 	bin := rustBinaryCLI(t)
-	dir, deltaID, target, logicalRoot := rebaseFixture(t)
+	dir, deltaID, target, logicalRoot, _ := rebaseFixture(t)
 
 	out := runRustCLI(t, bin, "--store", dir, "rebase", "--root", "/", "--threshold", "1000000")
 	if !strings.Contains(out, "applied") {
