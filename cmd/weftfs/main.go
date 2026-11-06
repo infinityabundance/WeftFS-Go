@@ -91,12 +91,27 @@ var (
 	blobBackend   = store.PlaneLocal
 	commitBackend = store.PlaneLocal
 	blobRoot      string
+	// Pack-plane policy. `--pack` enables it; the bounds default to the Rust
+	// values and are always validated.
+	packing      bool
+	packTarget   = store.DefaultPackOptions().TargetBytes
+	packMember   = store.DefaultPackOptions().MemberThresholdBytes
+	packCatalog  = store.DefaultPackOptions().MaxCatalogBytes
+	packSegments = store.DefaultPackOptions().CatalogSegments
 )
 
 func applyPlanePolicy(opts *store.Options) {
 	opts.BlobBackend = blobBackend
 	opts.CommitBackend = commitBackend
 	opts.BlobRoot = blobRoot
+	opts.Packing = packing
+	opts.PackOptions = store.PackOptions{
+		TargetBytes:          packTarget,
+		MemberThresholdBytes: packMember,
+		MaxCatalogBytes:      packCatalog,
+		CatalogSegments:      packSegments,
+		MaxMembersPerPack:    store.DefaultPackOptions().MaxMembersPerPack,
+	}
 }
 
 func applyRepresentationPolicy(opts *store.Options) {
@@ -256,6 +271,78 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			i++
 		case strings.HasPrefix(args[i], "--blob-root="):
 			blobRoot = strings.TrimPrefix(args[i], "--blob-root=")
+		case args[i] == "--pack":
+			packing = true
+		case strings.HasPrefix(args[i], "--pack="):
+			value, parseErr := strconv.ParseBool(strings.TrimPrefix(args[i], "--pack="))
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack must be true or false")
+			}
+			packing = value
+		case args[i] == "--pack-target-bytes" || args[i] == "-pack-target-bytes":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-target-bytes requires a value")
+			}
+			value, parseErr := strconv.ParseUint(args[i+1], 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-target-bytes must be a non-negative integer")
+			}
+			packTarget = value
+			i++
+		case strings.HasPrefix(args[i], "--pack-target-bytes="):
+			value, parseErr := strconv.ParseUint(strings.TrimPrefix(args[i], "--pack-target-bytes="), 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-target-bytes must be a non-negative integer")
+			}
+			packTarget = value
+		case args[i] == "--pack-member-threshold" || args[i] == "-pack-member-threshold":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-member-threshold requires a value")
+			}
+			value, parseErr := strconv.ParseUint(args[i+1], 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-member-threshold must be a non-negative integer")
+			}
+			packMember = value
+			i++
+		case strings.HasPrefix(args[i], "--pack-member-threshold="):
+			value, parseErr := strconv.ParseUint(strings.TrimPrefix(args[i], "--pack-member-threshold="), 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-member-threshold must be a non-negative integer")
+			}
+			packMember = value
+		case args[i] == "--pack-catalog-bytes" || args[i] == "-pack-catalog-bytes":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-catalog-bytes requires a value")
+			}
+			value, parseErr := strconv.ParseUint(args[i+1], 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-catalog-bytes must be a non-negative integer")
+			}
+			packCatalog = value
+			i++
+		case strings.HasPrefix(args[i], "--pack-catalog-bytes="):
+			value, parseErr := strconv.ParseUint(strings.TrimPrefix(args[i], "--pack-catalog-bytes="), 10, 64)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-catalog-bytes must be a non-negative integer")
+			}
+			packCatalog = value
+		case args[i] == "--pack-segments" || args[i] == "-pack-segments":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-segments requires a value")
+			}
+			value, parseErr := strconv.ParseUint(args[i+1], 10, 32)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-segments must be a non-negative integer")
+			}
+			packSegments = uint32(value)
+			i++
+		case strings.HasPrefix(args[i], "--pack-segments="):
+			value, parseErr := strconv.ParseUint(strings.TrimPrefix(args[i], "--pack-segments="), 10, 32)
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--pack-segments must be a non-negative integer")
+			}
+			packSegments = uint32(value)
 		case args[i] == "--fixed-timestamp-ns" || args[i] == "-fixed-timestamp-ns":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--fixed-timestamp-ns requires a value")
@@ -440,6 +527,7 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 			"rejected_generations": s.RejectedGenerations(),
 			"recovery_notes":       s.RecoveryNotes(),
 			"planes":               s.Planes(),
+			"packs":                packStatsJSON(s),
 		})
 	}
 	fmt.Printf("format=weftfs-store 1\ngeneration=%d\nsnapshot_root=%s\n", s.Generation(), s.Head().Hex())
@@ -447,7 +535,11 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 		len(state.Objects), len(state.Entries), len(state.Relations), len(state.Snapshots))
 	fmt.Printf("representation=%s\ncontent_identity=%s\ncodec_min_bytes=%d\n", representationMode.AsString(), store.ContentIdentityString(contentIdentityMode), codecMinBytes)
 	planes := s.Planes()
-	fmt.Printf("blob_backend=%s\ncommit_backend=%s\nblob_root=%s\ncommit_root=%s\n", planes.Blobs.Backend, planes.Commits.Backend, planes.BlobRoot, planes.CommitRoot)
+	fmt.Printf("blob_backend=%s\ncommit_backend=%s\nblob_root=%s\ncommit_root=%s\npacking=%t\n", planes.Blobs.Backend, planes.Commits.Backend, planes.BlobRoot, planes.CommitRoot, planes.Packing)
+	if stats, ok := s.PackStats(); ok {
+		fmt.Printf("pack_sealed=%d\npack_members=%d\npack_bytes=%d\npack_flat_members=%d\npack_catalog_entries=%d\n",
+			stats.SealedPacks, stats.PackedMembers, stats.PackedBytes, stats.FlatMembers, stats.CatalogEntries)
+	}
 	for _, generation := range s.RejectedGenerations() {
 		fmt.Printf("rejected_generation=%d\n", generation)
 	}
@@ -2849,4 +2941,12 @@ func cmdURI(args []string, storeDir string, jsonOut bool) error {
 	default:
 		return werr.Newf(werr.InvalidArgument, "uri requires canonicalize|show")
 	}
+}
+
+func packStatsJSON(s *store.Store) any {
+	stats, ok, err := s.PackCatalogStats()
+	if err != nil || !ok {
+		return nil
+	}
+	return stats
 }

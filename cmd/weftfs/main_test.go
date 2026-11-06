@@ -387,3 +387,54 @@ func TestSplitCLIInfoReportsPlanes(t *testing.T) {
 		t.Fatalf("plane roots = %v/%v", planes["blob_root"], planes["commit_root"])
 	}
 }
+
+func TestPackCLIRoundTrip(t *testing.T) {
+	resetPlanePolicy(t)
+	previousPacking := packing
+	previousTarget, previousMember := packTarget, packMember
+	previousCatalog, previousSegments := packCatalog, packSegments
+	t.Cleanup(func() {
+		packing = previousPacking
+		packTarget, packMember = previousTarget, previousMember
+		packCatalog, packSegments = previousCatalog, previousSegments
+	})
+	packing = true
+	packTarget = store.DefaultPackOptions().TargetBytes
+	packMember = store.DefaultPackOptions().MemberThresholdBytes
+	packCatalog = store.DefaultPackOptions().MaxCatalogBytes
+	packSegments = store.DefaultPackOptions().CatalogSegments
+
+	dir := t.TempDir()
+	payloadPath := filepath.Join(t.TempDir(), "payload.bin")
+	payload := make([]byte, 200000)
+	for i := range payload {
+		payload[i] = byte((i * 7) % 251)
+	}
+	if err := os.WriteFile(payloadPath, payload, 0o644); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if err := run("init", nil, dir, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := run("create", []string{"/packed.bin", "--file", payloadPath, "--seed", "cli-pack"}, dir, false); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	output := captureStdout(t, func() error {
+		return run("info", nil, dir, true)
+	})
+	var info map[string]any
+	if err := json.Unmarshal([]byte(output), &info); err != nil {
+		t.Fatalf("info: %v\n%s", err, output)
+	}
+	planes, _ := info["planes"].(map[string]any)
+	if planes == nil || planes["packing"] != true {
+		t.Fatalf("info planes does not report packing: %s", output)
+	}
+	packs, _ := info["packs"].(map[string]any)
+	if packs == nil || packs["sealed_packs"].(float64) == 0 {
+		t.Fatalf("info packs did not report sealed packs: %s", output)
+	}
+	if err := run("verify", []string{"--full"}, dir, false); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}

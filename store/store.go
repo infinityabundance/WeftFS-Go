@@ -119,6 +119,11 @@ type Options struct {
 	// to another directory. Empty keeps it on the store root. Commit/control
 	// state always lives on the store root.
 	BlobRoot string
+	// Packing groups small immutable blobs into physical pack objects.
+	Packing bool
+	// PackOptions is the physical packing policy; zero fields take the
+	// DefaultPackOptions values before validation.
+	PackOptions PackOptions
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -139,6 +144,7 @@ func DefaultOptions() Options {
 		MaxOverlayBytes:         DefaultMaxOverlayBytes,
 		BlobBackend:             PlaneLocal,
 		CommitBackend:           PlaneLocal,
+		PackOptions:             DefaultPackOptions(),
 	}
 }
 
@@ -199,6 +205,8 @@ type Store struct {
 	blobRoot    string
 	blobs       BlobAccess
 	commits     *commitPlane
+	probeFlat   *flatBlobPlane
+	packed      *PackedBlobPlane
 	planeReport PlaneReport
 	// Write budgets and the committed blob set used to charge only genuinely
 	// new bytes. Both are derived from committed state.
@@ -290,6 +298,11 @@ func validateOptions(opts Options) error {
 		cleaned := filepath.Clean(opts.BlobRoot)
 		if cleaned == "." || cleaned == string(filepath.Separator) {
 			return werr.Newf(werr.InvalidArgument, "--blob-root must name a directory")
+		}
+	}
+	if opts.Packing && opts.PackOptions != (PackOptions{}) {
+		if err := opts.PackOptions.Validate(); err != nil {
+			return err
 		}
 	}
 	if opts.MaxOverlayDepth == 0 {
@@ -648,6 +661,24 @@ func (s *Store) BlobRoot() string { return s.blobRoot }
 // Planes reports the routed planes and their probe evidence.
 func (s *Store) Planes() PlaneReport { return s.planeReport }
 
+// PackStats reports this handle's pack-plane counters when packing is enabled.
+func (s *Store) PackStats() (PackStats, bool) {
+	if s.packed == nil {
+		return PackStats{}, false
+	}
+	return s.packed.PackStats(), true
+}
+
+// PackCatalogStats reports what the on-disk pack catalog names. Unlike
+// PackStats it is meaningful on a freshly opened read-only handle.
+func (s *Store) PackCatalogStats() (PackStats, bool, error) {
+	if s.packed == nil {
+		return PackStats{}, false, nil
+	}
+	stats, err := s.packed.PackCatalogStats()
+	return stats, true, err
+}
+
 // buildPlanes constructs the two planes from the open options.
 func (s *Store) buildPlanes() error {
 	blobKind := s.options.BlobBackend
@@ -674,14 +705,30 @@ func (s *Store) buildPlanes() error {
 	if err != nil {
 		return err
 	}
-	s.blobs = blobs
+	var access BlobAccess = blobs
+	var packed *PackedBlobPlane
+	if s.options.Packing {
+		packOptions := s.options.PackOptions
+		if packOptions == (PackOptions{}) {
+			packOptions = DefaultPackOptions()
+		}
+		packed, err = NewPackedBlobPlane(blobs, commits, packOptions)
+		if err != nil {
+			return err
+		}
+		access = packed
+	}
+	s.blobs = access
 	s.commits = commits
+	s.probeFlat = blobs
+	s.packed = packed
 	s.blobRoot = blobRoot
 	s.planeReport = PlaneReport{
-		Blobs:      blobs.Capabilities(),
+		Blobs:      access.Capabilities(),
 		Commits:    commits.Capabilities(),
 		BlobRoot:   blobRoot,
 		CommitRoot: s.root,
+		Packing:    s.options.Packing,
 	}
 	return nil
 }
@@ -689,10 +736,8 @@ func (s *Store) buildPlanes() error {
 // probePlanes proves both capabilities on a writable open. A probe may only
 // refute a declared capability, never upgrade one; a failure refuses the open.
 func (s *Store) probePlanes() error {
-	flat, ok := s.blobs.(*flatBlobPlane)
-	if !ok {
-		// A packed plane is probed through its inner flat plane before packing
-		// is constructed (stage 3); nothing else exists today.
+	flat := s.probeFlat
+	if flat == nil {
 		return werr.Newf(werr.Unsupported, "blob plane has no capability probe")
 	}
 	blobProbe, err := flat.probe()
@@ -1347,6 +1392,11 @@ func hashPtr(h model.Hash32) *model.Hash32 {
 // publishCommit writes the commit file, fsyncs it and its directory, publishes
 // the superblock slot, then fsyncs the store root.
 func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
+	// Every blob the commit names must be durable and visible before the
+	// commit record is published. A packed plane buffers the open pack.
+	if err := s.blobs.Flush(); err != nil {
+		return model.Hash32{}, err
+	}
 	wcbBytes, err := commit.Encode()
 	if err != nil {
 		return model.Hash32{}, err

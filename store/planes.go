@@ -121,6 +121,7 @@ type PlaneReport struct {
 	CommitProbe *CommitProbe       `json:"commit_probe,omitempty"`
 	BlobRoot    string             `json:"blob_root"`
 	CommitRoot  string             `json:"commit_root"`
+	Packing     bool               `json:"packing"`
 }
 
 const maxObjectBytes = uint64(1) << 30
@@ -311,9 +312,6 @@ func (p *flatBlobPlane) path(kind BlobKind, id model.Hash32) string {
 }
 
 func (p *flatBlobPlane) Get(kind BlobKind, id model.Hash32) ([]byte, error) {
-	if kind == BlobPackCatalog {
-		return nil, werr.Newf(werr.InvalidArgument, "pack catalog segments are not readable as members")
-	}
 	path := p.path(kind, id)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -360,9 +358,6 @@ func (p *flatBlobPlane) GetRange(kind BlobKind, id model.Hash32, offset, length 
 }
 
 func (p *flatBlobPlane) Put(kind BlobKind, id model.Hash32, data []byte) error {
-	if kind == BlobPackCatalog {
-		return werr.Newf(werr.InvalidArgument, "pack catalog segments use the catalog path")
-	}
 	path := p.path(kind, id)
 	if existing, err := os.ReadFile(path); err == nil {
 		if !overlayBytesSame(existing, data) {
@@ -622,6 +617,41 @@ func (p *flatBlobPlane) probe() (BlobProbe, error) {
 	return probe, nil
 }
 
+// ControlPlane is the compare-and-swap control-record contract a pack catalog
+// needs. commitPlane implements it; tests and future metadata engines can
+// provide another implementation without simulating POSIX files.
+type ControlPlane interface {
+	ReadControl(name string) ([]byte, string, bool, error)
+	CompareExchange(name string, expected *string, data []byte) (string, error)
+	Root() string
+}
+
+// OpenControlPlane opens a local control plane at root.
+func OpenControlPlane(root string, kind PlaneKind) (ControlPlane, error) {
+	return newCommitPlane(root, kind)
+}
+
+// OpenFlatBlobPlane opens a flat local/object blob plane. It is exported for
+// tests and embedders that compose planes directly; the store builds its own
+// through the open options.
+func OpenFlatBlobPlane(root string, kind PlaneKind) (BlobAccess, error) {
+	return newFlatBlobPlane(root, kind)
+}
+
+// OpenPackedBlobPlane opens a packed plane over a flat blob root and a control
+// plane at commitRoot.
+func OpenPackedBlobPlane(blobRoot, commitRoot string, options PackOptions) (*PackedBlobPlane, error) {
+	inner, err := newFlatBlobPlane(blobRoot, PlaneLocal)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := newCommitPlane(commitRoot, PlaneLocal)
+	if err != nil {
+		return nil, err
+	}
+	return NewPackedBlobPlane(inner, catalog, options)
+}
+
 // commitPlane stores the versioned control records under the store root.
 type commitPlane struct {
 	root string
@@ -665,6 +695,14 @@ func (c *commitPlane) path(name string) string {
 }
 
 // readControl returns (bytes, token, present, error).
+func (c *commitPlane) ReadControl(name string) ([]byte, string, bool, error) {
+	return c.readControl(name)
+}
+
+func (c *commitPlane) CompareExchange(name string, expected *string, data []byte) (string, error) {
+	return c.compareExchange(name, expected, data)
+}
+
 func (c *commitPlane) readControl(name string) ([]byte, string, bool, error) {
 	data, err := os.ReadFile(c.path(name))
 	if err != nil {

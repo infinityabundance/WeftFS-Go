@@ -212,6 +212,16 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
+	// The pack plane reports structural problems in its own metadata (the
+	// catalog root, segments, and pack extents). A flat plane reports none.
+	if packProblems, err := s.blobs.VerifyPacks(); err != nil {
+		report.problem(string(werr.ClassOf(err)), "pack verification: "+err.Error())
+	} else {
+		for _, detail := range packProblems {
+			report.problem(string(werr.Corrupt), detail)
+		}
+	}
+
 	report.OK = len(report.Problems) == 0
 	return report, nil
 }
