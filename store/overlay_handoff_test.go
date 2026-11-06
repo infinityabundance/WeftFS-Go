@@ -104,6 +104,21 @@ func mustOverlayHash(t *testing.T, text string) model.Hash32 {
 	return id
 }
 
+func overlayExpectedByPath(t *testing.T, fixture overlayFixture, path string) []byte {
+	t.Helper()
+	for _, object := range fixture.Objects {
+		if object.Path == path {
+			bytesValue, err := hex.DecodeString(object.ExpectedHex)
+			if err != nil {
+				t.Fatalf("decode expected %s: %v", path, err)
+			}
+			return bytesValue
+		}
+	}
+	t.Fatalf("fixture has no object %s", path)
+	return nil
+}
+
 func TestOverlayHandoffRustFixtureGoReads(t *testing.T) {
 	src := overlayFixtureDir(t)
 	fixture, _ := loadOverlayFixture(t, src)
@@ -259,6 +274,106 @@ func TestOverlayRangeReadsOnlyIntersectingChunks(t *testing.T) {
 	removeBlob(fixture.NestedChunks[3])
 	if _, err := s.ReadRange(nested, 24, 8); err == nil {
 		t.Fatalf("range [24,32) succeeded with its chunk missing")
+	}
+}
+
+func TestOverlayGCRetainsBaseChainAndCollectsUnreferencedChunks(t *testing.T) {
+	src := overlayFixtureDir(t)
+	fixture, _ := loadOverlayFixture(t, src)
+	dir := t.TempDir()
+	copyOverlayTree(t, src, dir)
+
+	opts := store.DefaultOptions()
+	opts.GCGraceSecs = 0
+	s, err := store.OpenWithOptions(dir, store.ReadWrite, opts)
+	if err != nil {
+		t.Fatalf("open writable fixture: %v", err)
+	}
+	defer s.Close()
+	root, err := s.ResolvePath("/")
+	if err != nil {
+		t.Fatalf("resolve root: %v", err)
+	}
+
+	baseID := mustOverlayHash(t, fixture.BaseManifest)
+	overlayID := mustOverlayHash(t, fixture.OverlayManifest)
+	nestedID := mustOverlayHash(t, fixture.NestedManifest)
+	exists := func(kind store.BlobKind, hexText string) bool {
+		info, err := os.Stat(store.BlobPath(dir, kind, mustOverlayHash(t, hexText)))
+		return err == nil && !info.IsDir()
+	}
+	manifestExists := func(id model.Hash32) bool {
+		info, err := os.Stat(store.BlobPath(dir, store.BlobManifest, id))
+		return err == nil && !info.IsDir()
+	}
+
+	// An unreferenced chunk must be collected.
+	dead := hash.Domain(model.DomainChunk, []byte("unreferenced overlay chunk"))
+	deadPath := store.BlobPath(dir, store.BlobObject, dead)
+	if err := os.MkdirAll(filepath.Dir(deadPath), 0o755); err != nil {
+		t.Fatalf("mkdir dead chunk: %v", err)
+	}
+	if err := os.WriteFile(deadPath, []byte("unreferenced overlay chunk"), 0o644); err != nil {
+		t.Fatalf("write dead chunk: %v", err)
+	}
+
+	// /base is not needed as an object once /overlay exists, but its manifest
+	// and chunks are still referenced through the overlay base chain.
+	if err := s.Unlink(root, []byte("base")); err != nil {
+		t.Fatalf("unlink /base: %v", err)
+	}
+	if _, err := s.GC(true); err != nil {
+		t.Fatalf("gc 1: %v", err)
+	}
+	if !manifestExists(baseID) || !manifestExists(overlayID) || !manifestExists(nestedID) {
+		t.Fatalf("GC deleted a live overlay/base manifest")
+	}
+	for _, chunk := range append(append([]string{}, fixture.BaseChunks...), fixture.NestedChunks...) {
+		if !exists(store.BlobObject, chunk) {
+			t.Fatalf("GC deleted live chunk %s", chunk)
+		}
+	}
+	if _, err := os.Stat(deadPath); err == nil {
+		t.Fatalf("GC retained an unreferenced chunk")
+	}
+	overlayObject, err := s.ResolvePath("/nested")
+	if err != nil {
+		t.Fatalf("resolve /nested after gc: %v", err)
+	}
+	got, err := s.ReadObject(overlayObject)
+	if err != nil {
+		t.Fatalf("read /nested after gc: %v", err)
+	}
+	want := overlayExpectedByPath(t, fixture, "/nested")
+	if string(got) != string(want) {
+		t.Fatalf("/nested after gc = %x, want %x", got, want)
+	}
+
+	// Drop the outer object: /overlay is now reachable only as /nested's base.
+	if err := s.Unlink(root, []byte("overlay")); err != nil {
+		t.Fatalf("unlink /overlay: %v", err)
+	}
+	if _, err := s.GC(true); err != nil {
+		t.Fatalf("gc 2: %v", err)
+	}
+	if !manifestExists(baseID) || !manifestExists(overlayID) || !manifestExists(nestedID) {
+		t.Fatalf("GC deleted a base-only manifest")
+	}
+
+	// Drop the last root: the whole chain is collectable.
+	if err := s.Unlink(root, []byte("nested")); err != nil {
+		t.Fatalf("unlink /nested: %v", err)
+	}
+	if _, err := s.GC(true); err != nil {
+		t.Fatalf("gc 3: %v", err)
+	}
+	if manifestExists(baseID) || manifestExists(overlayID) || manifestExists(nestedID) {
+		t.Fatalf("GC retained an unreachable overlay manifest")
+	}
+	for _, chunk := range append(append([]string{}, fixture.BaseChunks...), fixture.NestedChunks...) {
+		if exists(store.BlobObject, chunk) {
+			t.Fatalf("GC retained unreachable chunk %s", chunk)
+		}
 	}
 }
 
