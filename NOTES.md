@@ -791,3 +791,44 @@ Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
 - **Gaps.** Group publication of content writes is still one durable blob per
   touched chunk, so grouping helps metadata far more than range writes. There is
   no shared multi-mount daemon.
+
+## R20 — storage-surface parity with Rust R9–R12 (2026-11-06)
+
+- **`weft.manifest.v4` writer and compaction.** `store/overlay_write.go` ports
+  the Rust write path: previous version as an immutable base plus one merged
+  extent, chunk-grid widening for misaligned edits, coalescing up to 64 extents
+  per layer, the writer's depth/byte bounds, and the double derivation check
+  (previous table + edit vs the manifest the reader resolves) that refuses
+  `Corrupt` unless both tables are identical. `Store.Compact` re-reads and
+  re-hashes every chunk, requires the pre-compaction Merkle root, and publishes
+  a canonical v3 table. `Truncate` (grow), `ZeroRange`, and range writes publish
+  layers; shrinking truncate, `collapse_range`, and `insert_range` are refused.
+  CLI: `compact`, `--representation overlay` (requires `--content-identity
+  merkle`). Tests: `overlay_write_test.go` 17 + `overlay_write_handoff_test.go`
+  4; fixed clock/seed gives the same manifest id, manifest bytes, and head as
+  Rust.
+- **Blob/commit plane split.** `store/planes.go` routes immutable blobs
+  (objects, manifests, indexes, packs, pack-catalog) separately from control
+  state. `local` publishes with rename(2), `object` with link(2). Capabilities
+  are measured on every writable open (blob: create-once visibility, exact
+  length, ranged read, delete observed; commit: create-once CAS, matching CAS,
+  stale CAS refused with `Busy`). The explicit `posix` plane is refused for
+  writing and read-only opens never probe. CLI: `--blob-backend`,
+  `--commit-backend`, `--blob-root`; `info` reports the planes. Tests:
+  `planes_test.go` 8; the four layouts publish the same head, generation, and
+  manifest id, and Rust/Go read and verify each other's split stores.
+- **Physical packs.** `store/packs.go` implements the identical pack format
+  (`WPS1` segments, `WPR1` root, member digests) over a `BlobAccess` and the
+  commit plane, including the crash ordering (pack before catalog), catalog
+  bound fallback to flat, delete-many/touched-segment republication, reclaim,
+  and verify. CLI: `--pack` and its four bounds. Tests: `packs_test.go` 10 +
+  `packs_handoff_test.go` 3; Rust reads and verifies Go packs and vice versa.
+- **Calibration.** `store/calibration.go` accepts `weft.calibration.v1` with
+  exact schema/key/row/sample/bound/monotonic/digest validation and no fallback;
+  `--calibration` (requires `--planner-cost-model measured`) overrides the baked
+  table in tensor planning and rebase. Tests: `calibration_test.go` 3 (32-case
+  rejection matrix) + `calibration_handoff_test.go` 1; a Rust-written document
+  loads with the identical digest.
+- **Gaps.** No Go S3/GCS backend (the split is filesystem-only), no Go
+  `calibrate` measurement command, packs are never rewritten, overlay refuses
+  shrinking/collapse/insert, and there is still no on-disk selector index.
