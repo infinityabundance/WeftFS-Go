@@ -27,6 +27,9 @@ func readManifestRange(root string, rootID *model.Hash32, manifest model.Manifes
 }
 
 func readManifestRangeInner(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool, depth int, seen []model.Hash32) ([]byte, error) {
+	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationOverlay {
+		return readOverlayRange(root, manifest, manifest.Representation, offset, length, verifyWhole)
+	}
 	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationCodec {
 		return readCodecRange(root, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
 	}
@@ -36,16 +39,200 @@ func readManifestRangeInner(root string, manifest model.Manifest, offset, length
 	return readRawRange(root, manifest, offset, length, verifyWhole)
 }
 
+// readOverlayRange resolves a `weft.manifest.v4` base chain to a canonical
+// chunk table without fetching any content chunk, then reads only the chunks
+// intersecting the requested range.
+func readOverlayRange(root string, manifest model.Manifest, rep *model.Representation, offset, length uint64, verifyWhole bool) ([]byte, error) {
+	if rep == nil || rep.Overlay == nil {
+		return nil, werr.Newf(werr.Corrupt, "overlay representation is missing its overlay map")
+	}
+	if rep.DecodedSize != manifest.Size {
+		return nil, werr.Newf(werr.Corrupt, "overlay representation decoded_size disagrees with manifest size")
+	}
+	manifestID, err := manifest.ID()
+	if err != nil {
+		return nil, err
+	}
+	seenSet := make(map[model.Hash32]struct{})
+	table, err := overlayChunkTable(root, manifestID, manifest, rep.Overlay, 0, seenSet)
+	if err != nil {
+		return nil, err
+	}
+	return readChunkTableRange(root, table, manifest.Size, manifest.ContentHash,
+		model.ContentIdentityMerkleV1, offset, length, verifyWhole)
+}
+
+// overlayChunkTable resolves and validates the canonical chunk table of one
+// immutable overlay layer over its base chain. Only manifest blobs are read.
+func overlayChunkTable(root string, manifestID model.Hash32, manifest model.Manifest,
+	overlay *model.OverlayRepresentation, depth int, seen map[model.Hash32]struct{}) ([]model.ChunkRef, error) {
+	if depth > int(model.MaxOverlayChainDepth) {
+		return nil, werr.Newf(werr.LimitExceeded,
+			"overlay chain exceeds the hard bound %d", model.MaxOverlayChainDepth)
+	}
+	if _, ok := seen[manifestID]; ok {
+		return nil, werr.Newf(werr.Corrupt, "overlay base chain participates in a cycle")
+	}
+	seen[manifestID] = struct{}{}
+	if overlay == nil {
+		return nil, werr.Newf(werr.Corrupt, "overlay representation is missing its overlay map")
+	}
+	if err := overlay.ValidateShape(manifest.ChunkSize, manifest.Size); err != nil {
+		return nil, err
+	}
+	baseManifest, err := ReadManifest(root, overlay.Base)
+	if err != nil {
+		return nil, err
+	}
+	if baseManifest.ContentHash != overlay.BaseContentRoot {
+		return nil, werr.Newf(werr.Corrupt,
+			"overlay base %s content root %s disagrees with the declared %s",
+			overlay.Base.Hex(), baseManifest.ContentHash.Hex(), overlay.BaseContentRoot.Hex())
+	}
+	if baseManifest.Size != overlay.BaseSize {
+		return nil, werr.Newf(werr.Corrupt,
+			"overlay base %s size %d disagrees with the declared %d",
+			overlay.Base.Hex(), baseManifest.Size, overlay.BaseSize)
+	}
+	if baseManifest.ChunkSize != manifest.ChunkSize {
+		return nil, werr.Newf(werr.Corrupt, "overlay base chunk_size differs from the new manifest")
+	}
+	if baseManifest.Identity != model.ContentIdentityMerkleV1 {
+		return nil, werr.Newf(werr.Corrupt, "overlay base must use the Merkle content identity")
+	}
+	if manifest.Size < baseManifest.Size {
+		return nil, werr.Newf(werr.Corrupt, "an overlay extent cannot make the file smaller than its base")
+	}
+
+	baseOverlayBytes := uint64(0)
+	var baseTable []model.ChunkRef
+	baseIsOverlay := baseManifest.Representation != nil &&
+		baseManifest.Representation.Kind == model.RepresentationOverlay
+	if baseIsOverlay {
+		baseOverlay := baseManifest.Representation.Overlay
+		if baseOverlay == nil {
+			return nil, werr.Newf(werr.Corrupt, "overlay base is missing its overlay map")
+		}
+		if baseOverlay.Depth+1 != overlay.Depth {
+			return nil, werr.Newf(werr.Corrupt,
+				"overlay depth %d does not follow the base depth %d", overlay.Depth, baseOverlay.Depth)
+		}
+		baseOverlayBytes = baseOverlay.OverlayBytes
+		baseTable, err = overlayChunkTable(root, overlay.Base, baseManifest, baseOverlay, depth+1, seen)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if baseManifest.Representation != nil && baseManifest.Representation.Kind != model.RepresentationRaw {
+			return nil, werr.Newf(werr.Corrupt,
+				"overlay base must be a chunk table, not a frame-backed representation")
+		}
+		if overlay.Depth != 1 {
+			return nil, werr.Newf(werr.Corrupt,
+				"overlay depth %d does not follow a non-overlay base", overlay.Depth)
+		}
+		baseTable = baseManifest.Chunks
+	}
+	var baseTotal uint64
+	for _, chunk := range baseTable {
+		var ok bool
+		baseTotal, ok = addNoOverflow(baseTotal, chunk.Len)
+		if !ok {
+			return nil, werr.Newf(werr.Corrupt, "overlay base table length overflows")
+		}
+	}
+	if baseTotal != baseManifest.Size {
+		return nil, werr.Newf(werr.Corrupt, "overlay base chunk table length disagrees with its size")
+	}
+
+	table := append([]model.ChunkRef(nil), baseTable...)
+	var extentTotal uint64
+	var previousEnd *uint64
+	for _, extent := range overlay.Extents {
+		if previousEnd != nil && extent.Offset < *previousEnd {
+			return nil, werr.Newf(werr.Corrupt, "overlay extents are not canonically ordered or overlap")
+		}
+		end, ok := addNoOverflow(extent.Offset, extent.Length)
+		if !ok {
+			return nil, werr.Newf(werr.Corrupt, "overlay extent end overflows")
+		}
+		previousEnd = &end
+		extentTotal, ok = addNoOverflow(extentTotal, extent.Length)
+		if !ok {
+			return nil, werr.Newf(werr.Corrupt, "overlay byte total overflows")
+		}
+		if extent.Offset%manifest.ChunkSize != 0 {
+			return nil, werr.Newf(werr.Malformed, "overlay extent offset is not chunk-aligned")
+		}
+		start := extent.Offset / manifest.ChunkSize
+		if start > uint64(len(table)) {
+			return nil, werr.Newf(werr.Corrupt,
+				"overlay extent at %d leaves a gap after the base table", extent.Offset)
+		}
+		startIndex := int(start)
+		endIndex := startIndex + len(extent.Chunks)
+		if endIndex > len(table) {
+			endIndex = len(table)
+		}
+		next := make([]model.ChunkRef, 0, startIndex+len(extent.Chunks)+len(table)-endIndex)
+		next = append(next, table[:startIndex]...)
+		next = append(next, extent.Chunks...)
+		next = append(next, table[endIndex:]...)
+		table = next
+	}
+	expectedOverlayBytes, ok := addNoOverflow(baseOverlayBytes, extentTotal)
+	if !ok {
+		return nil, werr.Newf(werr.Corrupt, "overlay byte accounting overflows")
+	}
+	if overlay.OverlayBytes != expectedOverlayBytes {
+		return nil, werr.Newf(werr.Corrupt,
+			"overlay_bytes is %d, expected %d", overlay.OverlayBytes, expectedOverlayBytes)
+	}
+	if uint64(len(table)) > model.MaxChunksPerFile {
+		return nil, werr.Newf(werr.LimitExceeded,
+			"resolved overlay table exceeds the %d-chunk bound", model.MaxChunksPerFile)
+	}
+	var total uint64
+	for _, chunk := range table {
+		total, ok = addNoOverflow(total, chunk.Len)
+		if !ok {
+			return nil, werr.Newf(werr.Corrupt, "resolved overlay table length overflows")
+		}
+	}
+	if total != manifest.Size {
+		return nil, werr.Newf(werr.Corrupt,
+			"resolved overlay table sums to %d, manifest size is %d", total, manifest.Size)
+	}
+	if model.MerkleRootChunks(table) != manifest.ContentHash {
+		return nil, werr.Newf(werr.Corrupt,
+			"resolved overlay table does not reproduce the manifest content root")
+	}
+	for index, chunk := range table {
+		if index+1 < len(table) && chunk.Len != manifest.ChunkSize {
+			return nil, werr.Newf(werr.Corrupt, "resolved overlay table has a short interior chunk")
+		}
+	}
+	return table, nil
+}
+
 // readRawRange assembles a byte range from the manifest's chunk references,
 // verifying every chunk it touches. v1 manifests and v2 `kind:"raw"`
 // manifests share this path byte for byte.
 func readRawRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
-	if offset >= manifest.Size {
+	return readChunkTableRange(root, manifest.Chunks, manifest.Size, manifest.ContentHash,
+		manifest.Identity, offset, length, verifyWhole)
+}
+
+// readChunkTableRange assembles a range from an explicit canonical chunk table.
+// It is shared by the raw path and the resolved overlay path.
+func readChunkTableRange(root string, chunks []model.ChunkRef, size uint64, contentHash model.Hash32,
+	identity model.ContentIdentity, offset, length uint64, verifyWhole bool) ([]byte, error) {
+	if offset >= size {
 		return []byte{}, nil
 	}
 	end := offset + length
-	if end < offset || end > manifest.Size {
-		end = manifest.Size
+	if end < offset || end > size {
+		end = size
 	}
 	capacity, err := checkedSize(end - offset)
 	if err != nil {
@@ -53,7 +240,7 @@ func readRawRange(root string, manifest model.Manifest, offset, length uint64, v
 	}
 	out := make([]byte, 0, capacity)
 	var cursor uint64
-	for index, chunk := range manifest.Chunks {
+	for index, chunk := range chunks {
 		chunkStart := cursor
 		chunkEnd := cursor + chunk.Len
 		if chunkEnd < cursor {
@@ -83,12 +270,12 @@ func readRawRange(root string, manifest model.Manifest, offset, length uint64, v
 	if uint64(len(out)) != end-offset {
 		return nil, werr.Newf(werr.Corrupt, "assembled range length mismatch")
 	}
-	if verifyWhole && offset == 0 && end == manifest.Size {
-		if manifest.Identity == model.ContentIdentityMerkleV1 {
-			if model.MerkleRootChunks(manifest.Chunks) != manifest.ContentHash {
+	if verifyWhole && offset == 0 && end == size {
+		if identity == model.ContentIdentityMerkleV1 {
+			if model.MerkleRootChunks(chunks) != contentHash {
 				return nil, werr.Newf(werr.Corrupt, "merkle content root mismatch for a fully read file")
 			}
-		} else if model.ContentHash(out) != manifest.ContentHash {
+		} else if model.ContentHash(out) != contentHash {
 			return nil, werr.Newf(werr.Corrupt, "whole-content hash mismatch")
 		}
 	}
@@ -229,4 +416,11 @@ func containsHash(haystack []model.Hash32, needle model.Hash32) bool {
 		}
 	}
 	return false
+}
+
+// addNoOverflow returns the sum and whether it is representable. It differs
+// from quota's addU64, whose second result reports carry-out.
+func addNoOverflow(a, b uint64) (uint64, bool) {
+	sum := a + b
+	return sum, sum >= a
 }

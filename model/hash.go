@@ -43,12 +43,19 @@ const (
 	ManifestSchema   = "weft.manifest.v1"
 	ManifestSchemaV2 = "weft.manifest.v2"
 	ManifestSchemaV3 = "weft.manifest.v3"
+	ManifestSchemaV4 = "weft.manifest.v4"
 	StateSchema      = "weftfs.state.v1"
 	VersionSchema    = "weftfs.version.v1"
 	LegacyManifest   = "weftfs.manifest.v1"
 	MaxNameBytes     = 255
 	MaxChunkSize     = 16 * 1024 * 1024
 	DefaultChunkSize = 65536
+
+	// MaxOverlayChainDepth is the hard reader bound on chained
+	// `weft.manifest.v4` overlay manifests (WEFT-MODEL.md §2.3.3).
+	MaxOverlayChainDepth uint64 = 256
+	// MaxOverlayExtentsPerManifest is the most extents one v4 manifest may list.
+	MaxOverlayExtentsPerManifest = 64
 )
 
 // Reserved attribute keys and predicates (WEFT-MODEL.md §2.5, §9.3; F2).

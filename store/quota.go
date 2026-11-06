@@ -1172,8 +1172,8 @@ func (s *Store) collectManifestBlobs(
 	seen map[model.Hash32]bool,
 	depth int,
 ) (uint64, error) {
-	if depth > 8 {
-		return 0, werr.Newf(werr.Corrupt, "manifest tree exceeds the codec dependency depth bound")
+	if depth > int(model.MaxOverlayChainDepth) {
+		return 0, werr.Newf(werr.Corrupt, "manifest tree exceeds the manifest-chain depth bound")
 	}
 	if seen[manifestID] {
 		return 0, nil
@@ -1201,6 +1201,9 @@ func (s *Store) collectManifestBlobs(
 		return 0, err
 	}
 	if rep := manifest.Representation; rep != nil && (rep.Kind == model.RepresentationCodec || rep.Kind == model.RepresentationTensor) {
+		if depth > MaxCodecDependencyDepth {
+			return 0, werr.Newf(werr.Corrupt, "manifest tree exceeds the codec dependency depth bound")
+		}
 		if rep.Frame != nil {
 			if _, ok := index[*rep.Frame]; !ok {
 				if _, ok := additions[*rep.Frame]; !ok {
@@ -1222,6 +1225,28 @@ func (s *Store) collectManifestBlobs(
 			total += added
 		}
 		return total, nil
+	}
+	if rep := manifest.Representation; rep != nil && rep.Kind == model.RepresentationOverlay {
+		if rep.Overlay == nil {
+			return 0, werr.Newf(werr.Corrupt, "overlay representation is missing its overlay map")
+		}
+		for _, extent := range rep.Overlay.Extents {
+			for _, chunk := range extent.Chunks {
+				if _, ok := index[chunk.Hash]; ok {
+					continue
+				}
+				if _, ok := additions[chunk.Hash]; ok {
+					continue
+				}
+				additions[chunk.Hash] = chunk.Len
+				total += chunk.Len
+			}
+		}
+		added, err := s.collectManifestBlobs(rep.Overlay.Base, index, additions, seen, depth+1)
+		if err != nil {
+			return 0, err
+		}
+		return total + added, nil
 	}
 	for _, chunk := range manifest.Chunks {
 		if _, ok := index[chunk.Hash]; ok {

@@ -112,6 +112,10 @@ const (
 	// RepresentationTensor means a WeftTensor frame (modes 10-14) decodes to
 	// the content. It is additive within v2; raw and codec are unchanged.
 	RepresentationTensor RepresentationKind = "tensor"
+	// RepresentationOverlay means a `weft.manifest.v4` immutable-overlay
+	// representation: an immutable base manifest plus ordered extents. It has
+	// no top-level chunk table; the canonical table is derived from the chain.
+	RepresentationOverlay RepresentationKind = "overlay"
 )
 
 // Representation strategies carried by a v2 manifest. The strategy is
@@ -147,12 +151,309 @@ type Representation struct {
 	DecodedSize  uint64
 	// Tensor is non-nil exactly when Kind is RepresentationTensor.
 	Tensor *TensorRepresentation
+	// Overlay is non-nil exactly when Kind is RepresentationOverlay.
+	Overlay *OverlayRepresentation
+}
+
+// OverlayExtent is one immutable extent of a `weft.manifest.v4` overlay.
+type OverlayExtent struct {
+	Offset uint64
+	Length uint64
+	Chunks []ChunkRef
+}
+
+// OverlayRepresentation is the `kind:"overlay"` representation payload.
+type OverlayRepresentation struct {
+	Base            Hash32
+	BaseContentRoot Hash32
+	BaseSize        uint64
+	Depth           uint64
+	OverlayBytes    uint64
+	Extents         []OverlayExtent
+}
+
+var overlayRepresentationKeys = []string{
+	"kind", "base", "base_content_root", "base_size", "depth",
+	"overlay_bytes", "decoded_size", "extents", "strategy",
+}
+
+func chunkRefToWCB(chunk ChunkRef) wcb.Value {
+	return Map(map[string]wcb.Value{
+		"hash": HashValue(chunk.Hash),
+		"len":  wcb.U64Value(chunk.Len),
+	})
+}
+
+func overlayRepresentationToWCB(r Representation) wcb.Value {
+	overlay := OverlayRepresentation{}
+	if r.Overlay != nil {
+		overlay = *r.Overlay
+	}
+	extents := make([]wcb.Value, 0, len(overlay.Extents))
+	for _, extent := range overlay.Extents {
+		chunks := make([]wcb.Value, 0, len(extent.Chunks))
+		for _, chunk := range extent.Chunks {
+			chunks = append(chunks, chunkRefToWCB(chunk))
+		}
+		extents = append(extents, Map(map[string]wcb.Value{
+			"offset": wcb.U64Value(extent.Offset),
+			"length": wcb.U64Value(extent.Length),
+			"chunks": wcb.ArrayValue(chunks),
+		}))
+	}
+	return Map(map[string]wcb.Value{
+		"kind":              wcb.TextValue(string(RepresentationOverlay)),
+		"base":              HashValue(overlay.Base),
+		"base_content_root": HashValue(overlay.BaseContentRoot),
+		"base_size":         wcb.U64Value(overlay.BaseSize),
+		"depth":             wcb.U64Value(overlay.Depth),
+		"overlay_bytes":     wcb.U64Value(overlay.OverlayBytes),
+		"decoded_size":      wcb.U64Value(r.DecodedSize),
+		"extents":           wcb.ArrayValue(extents),
+		"strategy":          wcb.TextValue(r.Strategy),
+	})
+}
+
+func overlayRepresentationFromWCB(m map[string]wcb.Value) (Representation, error) {
+	var representation Representation
+	if err := CheckKeys(m, overlayRepresentationKeys...); err != nil {
+		return representation, err
+	}
+	base, err := GetHash(m, "base")
+	if err != nil {
+		return representation, err
+	}
+	if base == ZeroHash {
+		return representation, werr.Newf(werr.Malformed, "overlay base must be a non-zero manifest id")
+	}
+	baseContentRoot, err := GetHash(m, "base_content_root")
+	if err != nil {
+		return representation, err
+	}
+	if baseContentRoot == ZeroHash {
+		return representation, werr.Newf(werr.Malformed, "overlay base_content_root must be non-zero")
+	}
+	baseSize, err := GetU64(m, "base_size")
+	if err != nil {
+		return representation, err
+	}
+	depth, err := GetU64(m, "depth")
+	if err != nil {
+		return representation, err
+	}
+	if depth == 0 {
+		return representation, werr.Newf(werr.Malformed, "overlay depth must be positive")
+	}
+	if depth > MaxOverlayChainDepth {
+		return representation, werr.Newf(werr.LimitExceeded,
+			"overlay depth %d exceeds the hard bound %d", depth, MaxOverlayChainDepth)
+	}
+	overlayBytes, err := GetU64(m, "overlay_bytes")
+	if err != nil {
+		return representation, err
+	}
+	if overlayBytes == 0 {
+		return representation, werr.Newf(werr.Malformed, "overlay_bytes must be positive")
+	}
+	decodedSize, err := GetU64(m, "decoded_size")
+	if err != nil {
+		return representation, err
+	}
+	strategy, err := GetText(m, "strategy")
+	if err != nil {
+		return representation, err
+	}
+	if strategy != "overlay" {
+		return representation, werr.Newf(werr.Malformed, "overlay representation strategy must be `overlay`")
+	}
+	items, err := GetArray(m, "extents")
+	if err != nil {
+		return representation, err
+	}
+	if len(items) == 0 {
+		return representation, werr.Newf(werr.Malformed, "overlay representation has no extents")
+	}
+	if len(items) > MaxOverlayExtentsPerManifest {
+		return representation, werr.Newf(werr.LimitExceeded,
+			"overlay manifest lists more than %d extents", MaxOverlayExtentsPerManifest)
+	}
+	extents := make([]OverlayExtent, 0, len(items))
+	for _, item := range items {
+		extentMap, err := AsMap(item)
+		if err != nil {
+			return representation, err
+		}
+		if err := CheckKeys(extentMap, "offset", "length", "chunks"); err != nil {
+			return representation, err
+		}
+		offset, err := GetU64(extentMap, "offset")
+		if err != nil {
+			return representation, err
+		}
+		length, err := GetU64(extentMap, "length")
+		if err != nil {
+			return representation, err
+		}
+		if length == 0 {
+			return representation, werr.Newf(werr.Malformed, "overlay extent length must be positive")
+		}
+		chunks, err := overlayChunksFromWCB(extentMap)
+		if err != nil {
+			return representation, err
+		}
+		if len(chunks) == 0 {
+			return representation, werr.Newf(werr.Malformed, "overlay extent has no chunks")
+		}
+		extents = append(extents, OverlayExtent{Offset: offset, Length: length, Chunks: chunks})
+	}
+	representation = Representation{
+		Kind:        RepresentationOverlay,
+		Strategy:    strategy,
+		DecodedSize: decodedSize,
+		Overlay: &OverlayRepresentation{
+			Base: base, BaseContentRoot: baseContentRoot, BaseSize: baseSize,
+			Depth: depth, OverlayBytes: overlayBytes, Extents: extents,
+		},
+	}
+	return representation, nil
+}
+
+func overlayChunksFromWCB(extentMap map[string]wcb.Value) ([]ChunkRef, error) {
+	items, err := GetArray(extentMap, "chunks")
+	if err != nil {
+		return nil, err
+	}
+	chunks := make([]ChunkRef, 0, len(items))
+	for _, item := range items {
+		chunkMap, err := AsMap(item)
+		if err != nil {
+			return nil, err
+		}
+		if err := CheckKeys(chunkMap, "hash", "len"); err != nil {
+			return nil, err
+		}
+		length, err := GetU64(chunkMap, "len")
+		if err != nil {
+			return nil, err
+		}
+		if length == 0 {
+			return nil, werr.Newf(werr.Corrupt, "overlay chunk has zero length")
+		}
+		hashValue, err := GetHash(chunkMap, "hash")
+		if err != nil {
+			return nil, err
+		}
+		if hashValue == ZeroHash {
+			return nil, werr.Newf(werr.Malformed, "overlay chunk hash must be non-zero")
+		}
+		chunks = append(chunks, ChunkRef{Hash: hashValue, Len: length})
+	}
+	return chunks, nil
+}
+
+// ValidateShape checks a v4 overlay against the manifest's chunk grid and size.
+// It is structural only; the base chain is resolved by the reader.
+func (o OverlayRepresentation) ValidateShape(chunkSize, size uint64) error {
+	if chunkSize == 0 || chunkSize > MaxChunkSize {
+		return werr.Newf(werr.Malformed, "overlay chunk_size is out of range")
+	}
+	if o.Base == ZeroHash {
+		return werr.Newf(werr.Malformed, "overlay base must be a non-zero manifest id")
+	}
+	if o.BaseContentRoot == ZeroHash {
+		return werr.Newf(werr.Malformed, "overlay base_content_root must be non-zero")
+	}
+	if o.Depth == 0 {
+		return werr.Newf(werr.Malformed, "overlay depth must be positive")
+	}
+	if o.Depth > MaxOverlayChainDepth {
+		return werr.Newf(werr.LimitExceeded,
+			"overlay depth %d exceeds the hard bound %d", o.Depth, MaxOverlayChainDepth)
+	}
+	if len(o.Extents) == 0 {
+		return werr.Newf(werr.Malformed, "overlay representation has no extents")
+	}
+	if len(o.Extents) > MaxOverlayExtentsPerManifest {
+		return werr.Newf(werr.LimitExceeded,
+			"overlay manifest lists more than %d extents", MaxOverlayExtentsPerManifest)
+	}
+	if o.OverlayBytes == 0 {
+		return werr.Newf(werr.Malformed, "overlay_bytes must be positive")
+	}
+	var extentTotal uint64
+	var previousEnd *uint64
+	for _, extent := range o.Extents {
+		if extent.Length == 0 {
+			return werr.Newf(werr.Malformed, "overlay extent length must be positive")
+		}
+		if extent.Offset%chunkSize != 0 {
+			return werr.Newf(werr.Malformed, "overlay extent offset %d is not chunk-aligned", extent.Offset)
+		}
+		end, ok := addChecked(extent.Offset, extent.Length)
+		if !ok {
+			return werr.Newf(werr.Malformed, "overlay extent end overflows")
+		}
+		if end > size {
+			return werr.Newf(werr.Corrupt, "overlay extent [%d, %d) lies past the %d-byte file", extent.Offset, end, size)
+		}
+		if previousEnd != nil && extent.Offset < *previousEnd {
+			return werr.Newf(werr.Malformed,
+				"overlay extents are not canonically ordered or overlap at %d", extent.Offset)
+		}
+		previousEnd = &end
+		expectedCount := extent.Length / chunkSize
+		if extent.Length%chunkSize != 0 {
+			expectedCount++
+		}
+		if uint64(len(extent.Chunks)) != expectedCount {
+			return werr.Newf(werr.Corrupt,
+				"overlay extent at %d has %d chunks, expected %d",
+				extent.Offset, len(extent.Chunks), expectedCount)
+		}
+		var sum uint64
+		for index, chunk := range extent.Chunks {
+			chunkStart, ok := addChecked(extent.Offset, uint64(index)*chunkSize)
+			if !ok {
+				return werr.Newf(werr.Corrupt, "overlay chunk offset overflows")
+			}
+			expectedLen := chunkSize
+			if size-chunkStart < chunkSize {
+				expectedLen = size - chunkStart
+			}
+			if chunk.Len != expectedLen {
+				return werr.Newf(werr.Corrupt,
+					"overlay chunk %d at %d is %d bytes, expected %d",
+					index, chunkStart, chunk.Len, expectedLen)
+			}
+			sum, ok = addChecked(sum, chunk.Len)
+			if !ok {
+				return werr.Newf(werr.Corrupt, "overlay extent length overflows")
+			}
+		}
+		if sum != extent.Length {
+			return werr.Newf(werr.Corrupt,
+				"overlay extent chunks sum to %d, declared length is %d", sum, extent.Length)
+		}
+		var okTotal bool
+		extentTotal, okTotal = addChecked(extentTotal, extent.Length)
+		if !okTotal {
+			return werr.Newf(werr.Corrupt, "overlay byte total overflows")
+		}
+	}
+	if o.OverlayBytes < extentTotal {
+		return werr.Newf(werr.Corrupt,
+			"overlay_bytes %d is smaller than this manifest's extents (%d)", o.OverlayBytes, extentTotal)
+	}
+	return nil
 }
 
 var representationKeys = []string{"kind", "frame", "dependencies", "strategy", "decoded_size"}
 
 // ToWCB returns the canonical representation map.
 func (r Representation) ToWCB() wcb.Value {
+	if r.Kind == RepresentationOverlay {
+		return overlayRepresentationToWCB(r)
+	}
 	if r.Kind == RepresentationTensor {
 		return tensorRepresentationToWCB(r)
 	}
@@ -181,6 +482,9 @@ func RepresentationFromWCB(v wcb.Value) (Representation, error) {
 		return representation, err
 	}
 	kind := RepresentationKind(kindText)
+	if kind == RepresentationOverlay {
+		return overlayRepresentationFromWCB(m)
+	}
 	if kind == RepresentationTensor {
 		return tensorRepresentationFromWCB(m)
 	}
@@ -290,6 +594,8 @@ var manifestKeysV3 = []string{"schema", "size", "chunk_size", "chunks", "content
 
 var manifestKeysV3Representation = []string{"schema", "size", "chunk_size", "chunks", "content_root", "content_identity", "representation"}
 
+var manifestKeysV4 = []string{"schema", "size", "chunk_size", "content_root", "content_identity", "representation"}
+
 // MaxChunksPerFile is the maximum number of chunk references in one manifest
 // (16 Mi, i.e. exactly the 1 TiB file bound at the default 64 KiB chunk size).
 // It mirrors the Rust store's MAX_CHUNKS_PER_FILE. A smaller configured
@@ -301,6 +607,16 @@ const MaxChunksPerFile uint64 = 16_777_216
 
 // ToWCB returns the canonical manifest map.
 func (m Manifest) ToWCB() wcb.Value {
+	if m.Representation != nil && m.Representation.Kind == RepresentationOverlay {
+		return Map(map[string]wcb.Value{
+			"schema":           wcb.TextValue(ManifestSchemaV4),
+			"size":             wcb.U64Value(m.Size),
+			"chunk_size":       wcb.U64Value(m.ChunkSize),
+			"content_root":     HashValue(m.ContentHash),
+			"content_identity": wcb.TextValue(string(ContentIdentityMerkleV1)),
+			"representation":   m.Representation.ToWCB(),
+		})
+	}
 	chunks := make([]wcb.Value, 0, len(m.Chunks))
 	for _, chunk := range m.Chunks {
 		chunks = append(chunks, Map(map[string]wcb.Value{
@@ -370,6 +686,7 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 	// UnsupportedVersion, matching the Rust reader.
 	identity := ContentIdentityWholeFile
 	v2 := false
+	v4 := false
 	switch schema {
 	case ManifestSchema, LegacyManifest:
 		if err := CheckKeys(m, manifestKeys...); err != nil {
@@ -396,8 +713,21 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 		if name != string(ContentIdentityMerkleV1) {
 			return Manifest{}, werr.Newf(werr.Malformed, "unknown manifest content_identity `%s`", name)
 		}
+	case ManifestSchemaV4:
+		identity = ContentIdentityMerkleV1
+		v4 = true
+		if err := CheckKeys(m, manifestKeysV4...); err != nil {
+			return Manifest{}, err
+		}
+		name, err := GetText(m, "content_identity")
+		if err != nil {
+			return Manifest{}, err
+		}
+		if name != string(ContentIdentityMerkleV1) {
+			return Manifest{}, werr.Newf(werr.Malformed, "unknown manifest content_identity `%s`", name)
+		}
 	default:
-		return Manifest{}, werr.Newf(werr.Unsupported, "manifest schema `%s` is not a supported v1/v2/v3 schema", schema)
+		return Manifest{}, werr.Newf(werr.Unsupported, "manifest schema `%s` is not a supported v1/v2/v3/v4 schema", schema)
 	}
 	size, err := GetU64(m, "size")
 	if err != nil {
@@ -418,9 +748,34 @@ func ManifestFromWCB(v wcb.Value) (Manifest, error) {
 				return Manifest{}, err
 			}
 			representation = &parsed
-		} else if v2 {
-			return Manifest{}, werr.Newf(werr.Malformed, "weft.manifest.v2 is missing its representation map")
+		} else if v2 || v4 {
+			return Manifest{}, werr.Newf(werr.Malformed, "%s is missing its representation map", schema)
 		}
+	}
+	if v2 && representation != nil && representation.Kind == RepresentationOverlay {
+		return Manifest{}, werr.Newf(werr.Malformed, "kind:\"overlay\" requires schema weft.manifest.v4")
+	}
+	if v4 {
+		if representation == nil || representation.Kind != RepresentationOverlay || representation.Overlay == nil {
+			return Manifest{}, werr.Newf(werr.Corrupt, "weft.manifest.v4 may only carry a kind:\"overlay\" representation")
+		}
+		if representation.DecodedSize != size {
+			return Manifest{}, werr.Newf(werr.Corrupt, "overlay decoded_size differs from manifest size")
+		}
+		if err := representation.Overlay.ValidateShape(chunkSize, size); err != nil {
+			return Manifest{}, err
+		}
+		declared, err := GetHash(m, "content_root")
+		if err != nil {
+			return Manifest{}, err
+		}
+		if declared == ZeroHash {
+			return Manifest{}, werr.Newf(werr.Malformed, "overlay content_root must be non-zero")
+		}
+		return Manifest{
+			Size: size, ChunkSize: chunkSize, Chunks: nil, ContentHash: declared,
+			Representation: representation, Identity: identity,
+		}, nil
 	}
 	if identity == ContentIdentityMerkleV1 && representation != nil && representation.Kind != RepresentationRaw {
 		return Manifest{}, werr.Newf(werr.Corrupt, "a Merkle v3 manifest may only carry a raw representation")

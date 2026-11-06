@@ -350,9 +350,9 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 	if err := checkCancel(ctx); err != nil {
 		return err
 	}
-	if depth > MaxCodecDependencyDepth {
+	if depth > int(model.MaxOverlayChainDepth) {
 		*problems = append(*problems,
-			"manifest "+manifestID.Hex()+" exceeds the codec dependency depth bound")
+			"manifest "+manifestID.Hex()+" exceeds the manifest-chain depth bound")
 		return nil
 	}
 	if _, ok := seen[manifestID]; ok {
@@ -370,6 +370,11 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 	}
 	if rep := manifest.Representation; rep != nil &&
 		(rep.Kind == model.RepresentationCodec || rep.Kind == model.RepresentationTensor) {
+		if depth > MaxCodecDependencyDepth {
+			*problems = append(*problems,
+				"manifest "+manifestID.Hex()+" exceeds the codec dependency depth bound")
+			return nil
+		}
 		if rep.Frame != nil {
 			manifests[*rep.Frame] = struct{}{}
 		}
@@ -379,6 +384,19 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 			}
 		}
 		return nil
+	}
+	if rep := manifest.Representation; rep != nil && rep.Kind == model.RepresentationOverlay {
+		if rep.Overlay == nil {
+			*problems = append(*problems,
+				"overlay manifest "+manifestID.Hex()+" is missing its overlay map")
+			return nil
+		}
+		for _, extent := range rep.Overlay.Extents {
+			for _, chunk := range extent.Chunks {
+				chunks[chunk.Hash] = struct{}{}
+			}
+		}
+		return markManifestTree(ctx, root, rep.Overlay.Base, manifests, chunks, problems, depth+1, seen)
 	}
 	for _, chunk := range manifest.Chunks {
 		chunks[chunk.Hash] = struct{}{}

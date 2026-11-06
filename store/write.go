@@ -199,6 +199,10 @@ func (s *Store) writeFileRangesCausal(id model.Hash32, ranges []RangeWrite, caus
 	}
 	frameBacked := oldManifest.Representation != nil &&
 		(oldManifest.Representation.Kind == model.RepresentationCodec || oldManifest.Representation.Kind == model.RepresentationTensor)
+	if oldManifest.Representation != nil && oldManifest.Representation.Kind == model.RepresentationOverlay {
+		return WriteOutcome{}, werr.Newf(werr.InvalidArgument,
+			"range write to a weft.manifest.v4 overlay is not implemented")
+	}
 	// A Merkle file is rewritten chunk-granularly: only changed chunks are
 	// re-hashed and re-stored, and the root is folded from the manifest's
 	// stored chunk hashes. A v3 file is never implicitly downgraded.

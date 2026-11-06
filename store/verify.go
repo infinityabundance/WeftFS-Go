@@ -349,6 +349,26 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		if manifest.Size != record.Size {
 			report.problem(string(werr.Corrupt), "object "+id.Hex()+" size disagrees with manifest")
 		}
+		if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationOverlay {
+			contentRoot := record.Content
+			table, tableErr := overlayChunkTable(s.root, record.Content, manifest,
+				manifest.Representation.Overlay, 0, make(map[model.Hash32]struct{}))
+			if tableErr != nil {
+				report.problem(string(werr.ClassOf(tableErr)),
+					"overlay representation for object "+id.Hex()+" manifest "+record.Content.Hex()+": "+tableErr.Error())
+				continue
+			}
+			if full {
+				if _, err := readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
+					report.problem(string(werr.ClassOf(err)),
+						"overlay representation for object "+id.Hex()+" manifest "+record.Content.Hex()+": "+err.Error())
+				} else {
+					report.CheckedRepresentations++
+					report.CheckedChunks += uint64(len(table))
+				}
+			}
+			continue
+		}
 		if manifest.Representation != nil &&
 			(manifest.Representation.Kind == model.RepresentationCodec ||
 				manifest.Representation.Kind == model.RepresentationTensor) {
