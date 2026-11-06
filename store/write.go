@@ -199,9 +199,27 @@ func (s *Store) writeFileRangesCausal(id model.Hash32, ranges []RangeWrite, caus
 	}
 	frameBacked := oldManifest.Representation != nil &&
 		(oldManifest.Representation.Kind == model.RepresentationCodec || oldManifest.Representation.Kind == model.RepresentationTensor)
-	if oldManifest.Representation != nil && oldManifest.Representation.Kind == model.RepresentationOverlay {
-		return WriteOutcome{}, werr.Newf(werr.InvalidArgument,
-			"range write to a weft.manifest.v4 overlay is not implemented")
+	if (oldManifest.Representation != nil && oldManifest.Representation.Kind == model.RepresentationOverlay) ||
+		s.options.Representation == RepresentationModeOverlay {
+		if frameBacked {
+			kind := "none"
+			if oldManifest.Representation != nil {
+				kind = string(oldManifest.Representation.Kind)
+			}
+			return WriteOutcome{}, werr.Newf(werr.InvalidArgument,
+				"range write to a %s representation cannot become an overlay layer; "+
+					"re-create the file with `--content-identity merkle --representation overlay` "+
+					"or write with `--representation raw`", kind)
+		}
+		newSize := end
+		if old.Size > newSize {
+			newSize = old.Size
+		}
+		edits := make([]overlayEdit, 0, len(applied))
+		for _, r := range applied {
+			edits = append(edits, overlayBytesEdit(r.Offset, r.Data))
+		}
+		return s.writeFileOverlay(id, old, oldManifest, edits, newSize, causal)
 	}
 	// A Merkle file is rewritten chunk-granularly: only changed chunks are
 	// re-hashed and re-stored, and the root is folded from the manifest's
@@ -478,6 +496,30 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	if old.Kind != model.KindFile {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "truncate requires a file object")
 	}
+	oldManifest, err := ReadManifest(s.root, old.Content)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if oldManifest.Size != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
+	}
+	if (oldManifest.Representation != nil && oldManifest.Representation.Kind == model.RepresentationOverlay) ||
+		s.options.Representation == RepresentationModeOverlay {
+		if size < old.Size {
+			return model.Hash32{}, werr.Newf(werr.InvalidArgument,
+				"truncate to a smaller size cannot be expressed as an immutable overlay "+
+					"extent; run `weftfs compact <path>` first or use `--representation raw`")
+		}
+		if size == old.Size {
+			return old.Version, nil
+		}
+		edit := overlayZeroEdit(old.Size, size-old.Size)
+		outcome, err := s.writeFileOverlay(id, old, oldManifest, []overlayEdit{edit}, size, nil)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		return outcome.Version, nil
+	}
 	current, err := s.ReadObject(id)
 	if err != nil {
 		return model.Hash32{}, err
@@ -599,6 +641,22 @@ func (s *Store) ZeroRange(id model.Hash32, offset, length uint64, extend bool) (
 	if zeroEnd <= offset {
 		return old.Version, nil
 	}
+	oldManifest, err := ReadManifest(s.root, old.Content)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if oldManifest.Size != old.Size {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
+	}
+	if (oldManifest.Representation != nil && oldManifest.Representation.Kind == model.RepresentationOverlay) ||
+		s.options.Representation == RepresentationModeOverlay {
+		edit := overlayZeroEdit(offset, zeroEnd-offset)
+		outcome, err := s.writeFileOverlay(id, old, oldManifest, []overlayEdit{edit}, newSize, nil)
+		if err != nil {
+			return model.Hash32{}, err
+		}
+		return outcome.Version, nil
+	}
 	current, err := s.ReadObject(id)
 	if err != nil {
 		return model.Hash32{}, err
@@ -642,6 +700,16 @@ func (s *Store) CollapseRange(id model.Hash32, offset, length uint64) (model.Has
 	if offset > old.Size || length > old.Size-offset {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "collapse range lies past EOF")
 	}
+	collapseManifest, err := ReadManifest(s.root, old.Content)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if (collapseManifest.Representation != nil && collapseManifest.Representation.Kind == model.RepresentationOverlay) ||
+		s.options.Representation == RepresentationModeOverlay {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument,
+			"collapse_range on an overlay object would shorten the file and shift every "+
+				"following byte; run `weftfs compact <path>` first or use `--representation raw`")
+	}
 	current, err := s.ReadObject(id)
 	if err != nil {
 		return model.Hash32{}, err
@@ -684,6 +752,16 @@ func (s *Store) InsertRange(id model.Hash32, offset, length uint64) (model.Hash3
 	}
 	if offset > old.Size {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "insert offset lies past EOF")
+	}
+	insertManifest, err := ReadManifest(s.root, old.Content)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if (insertManifest.Representation != nil && insertManifest.Representation.Kind == model.RepresentationOverlay) ||
+		s.options.Representation == RepresentationModeOverlay {
+		return model.Hash32{}, werr.Newf(werr.InvalidArgument,
+			"insert_range on an overlay object rewrites every byte after the insert point; "+
+				"run `weftfs compact <path>` first or use `--representation raw`")
 	}
 	newSize := old.Size + length
 	if newSize < old.Size || newSize > MaxFileBytes {

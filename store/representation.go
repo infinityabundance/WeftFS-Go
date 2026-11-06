@@ -52,6 +52,9 @@ const (
 	// RepresentationModeCodecAuto writes experimental v2 manifests, selecting
 	// ZSTD or DELTA when the frame is smaller.
 	RepresentationModeCodecAuto RepresentationMode = "codec-auto"
+	// RepresentationModeOverlay writes a v3 Merkle base and publishes every
+	// later range write as a `weft.manifest.v4` immutable-overlay layer.
+	RepresentationModeOverlay RepresentationMode = "overlay"
 )
 
 // ParseRepresentationMode parses the canonical CLI spelling.
@@ -61,9 +64,11 @@ func ParseRepresentationMode(text string) (RepresentationMode, error) {
 		return RepresentationModeRaw, nil
 	case string(RepresentationModeCodecAuto):
 		return RepresentationModeCodecAuto, nil
+	case string(RepresentationModeOverlay):
+		return RepresentationModeOverlay, nil
 	default:
 		return "", werr.Newf(werr.InvalidArgument,
-			"--representation must be `raw` or `codec-auto` (got `%s`)", text)
+			"--representation must be `raw`, `codec-auto`, or `overlay` (got `%s`)", text)
 	}
 }
 

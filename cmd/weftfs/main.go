@@ -50,14 +50,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto]
+	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto|overlay]
               [--content-identity whole-file|merkle] [--codec-min-bytes N]
               [--quota SPEC] [--quota-file FILE] <command> [args]
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
-  context causal uri tensor quota merge rebase
+  context causal uri tensor quota merge rebase compact
 `)
 }
 
@@ -291,6 +291,8 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdTensor(args, storeDir, jsonOut)
 	case "rebase":
 		return cmdRebase(args, storeDir, jsonOut)
+	case "compact":
+		return cmdCompact(args, storeDir, jsonOut)
 	default:
 		return werr.Newf(werr.InvalidArgument, "unknown command `%s`", command)
 	}
@@ -618,6 +620,52 @@ func cmdWrite(args []string, storeDir string) error {
 		return err
 	}
 	fmt.Println(version.Hex())
+	return nil
+}
+
+func cmdCompact(args []string, storeDir string, jsonOut bool) error {
+	fs := flag.NewFlagSet("compact", flag.ContinueOnError)
+	if err := parseFlags(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return werr.Newf(werr.InvalidArgument, "compact requires exactly one path")
+	}
+	s, err := openStore(storeDir, store.ReadWrite)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	id, err := resolveObject(s, fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	report, err := s.Compact(id)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return printJSON(map[string]any{
+			"object_id":        report.Object.Hex(),
+			"previous_content": report.PreviousContent.Hex(),
+			"content":          report.Content.Hex(),
+			"version_id":       report.Version.Hex(),
+			"size":             report.Size,
+			"content_root":     report.ContentRoot.Hex(),
+			"chunks":           report.Chunks,
+			"overlay_depth":    report.OverlayDepth,
+			"overlay_bytes":    report.OverlayBytes,
+			"verified_bytes":   report.VerifiedBytes,
+			"generation":       s.Generation(),
+		})
+	}
+	fmt.Println(report.Content.Hex())
+	fmt.Printf("version=%s\n", report.Version.Hex())
+	fmt.Printf("content_root=%s\n", report.ContentRoot.Hex())
+	fmt.Printf("chunks=%d\n", report.Chunks)
+	fmt.Printf("overlay_depth=%d\n", report.OverlayDepth)
+	fmt.Printf("overlay_bytes=%d\n", report.OverlayBytes)
+	fmt.Printf("verified_bytes=%d\n", report.VerifiedBytes)
 	return nil
 }
 

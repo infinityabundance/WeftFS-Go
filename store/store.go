@@ -101,6 +101,13 @@ type Options struct {
 	// Quotas installs (or replaces) write budgets on open. An empty slice
 	// leaves the persisted policy untouched.
 	Quotas []QuotaBudget
+	// MaxOverlayDepth bounds the chained `weft.manifest.v4` layers a range
+	// write may create. Zero selects DefaultMaxOverlayDepth. It can never
+	// exceed the normative reader bound model.MaxOverlayChainDepth.
+	MaxOverlayDepth uint64
+	// MaxOverlayBytes bounds the total logical bytes carried by an overlay
+	// chain. Zero selects DefaultMaxOverlayBytes.
+	MaxOverlayBytes uint64
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -117,6 +124,8 @@ func DefaultOptions() Options {
 		ContentIdentity:         model.ContentIdentityWholeFile,
 		CodecMinBytes:           DefaultCodecMinBytes,
 		CodecDeltaMarginPercent: DefaultCodecDeltaMarginPercent,
+		MaxOverlayDepth:         DefaultMaxOverlayDepth,
+		MaxOverlayBytes:         DefaultMaxOverlayBytes,
 	}
 }
 
@@ -237,9 +246,23 @@ func validateOptions(opts Options) error {
 		return err
 	}
 	switch opts.Representation {
-	case RepresentationModeRaw, RepresentationModeCodecAuto:
+	case RepresentationModeRaw, RepresentationModeCodecAuto, RepresentationModeOverlay:
 	default:
-		return werr.Newf(werr.InvalidArgument, "representation must be `raw` or `codec-auto` (got `%s`)", opts.Representation)
+		return werr.Newf(werr.InvalidArgument, "representation must be `raw`, `codec-auto`, or `overlay` (got `%s`)", opts.Representation)
+	}
+	if opts.MaxOverlayDepth == 0 {
+		opts.MaxOverlayDepth = DefaultMaxOverlayDepth
+	}
+	if opts.MaxOverlayBytes == 0 {
+		opts.MaxOverlayBytes = DefaultMaxOverlayBytes
+	}
+	if opts.MaxOverlayDepth > model.MaxOverlayChainDepth {
+		return werr.Newf(werr.InvalidArgument,
+			"max_overlay_depth must be 1..=%d (the normative reader bound)", model.MaxOverlayChainDepth)
+	}
+	if opts.Representation == RepresentationModeOverlay && opts.ContentIdentity != model.ContentIdentityMerkleV1 {
+		return werr.Newf(werr.InvalidArgument,
+			"`--representation overlay` requires the Merkle content identity; pass `--content-identity merkle`")
 	}
 	switch opts.ContentIdentity {
 	case model.ContentIdentityWholeFile:

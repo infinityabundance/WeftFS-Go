@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/store"
 )
 
@@ -225,5 +226,82 @@ func TestInfoJSONReportsRepresentationPolicy(t *testing.T) {
 	}
 	if parsed["codec_min_bytes"] != float64(8192) {
 		t.Fatalf("info codec_min_bytes = %v", parsed["codec_min_bytes"])
+	}
+}
+
+func TestOverlayCompactCLIReportsUnchangedRoot(t *testing.T) {
+	resetRepresentationPolicy(t)
+	previousIdentity := contentIdentityMode
+	previousExplicit := contentIdentityExplicit
+	t.Cleanup(func() {
+		contentIdentityMode = previousIdentity
+		contentIdentityExplicit = previousExplicit
+	})
+	representationMode = store.RepresentationModeOverlay
+	contentIdentityMode = model.ContentIdentityMerkleV1
+	contentIdentityExplicit = true
+
+	dir := t.TempDir()
+	opts := store.DefaultOptions()
+	opts.Representation = store.RepresentationModeOverlay
+	opts.ContentIdentity = model.ContentIdentityMerkleV1
+	s, err := store.Init(dir, opts)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	base := make([]byte, 8*1024)
+	for i := range base {
+		base[i] = byte(i % 251)
+	}
+	id, err := s.CreateFile(model.RootID, []byte("cli.bin"), base, 0o644, 0, 0, nil)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.WriteFile(id, 10, []byte("overlay-layer")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	record, err := s.ObjectMeta(id)
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	before, err := store.ReadManifest(dir, record.Content)
+	if err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	if before.Representation == nil || before.Representation.Kind != model.RepresentationOverlay {
+		t.Fatalf("setup is not an overlay representation")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	output := captureStdout(t, func() error {
+		return run("compact", []string{"/cli.bin"}, dir, true)
+	})
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("compact JSON: %v\n%s", err, output)
+	}
+	if parsed["content_root"] != before.ContentHash.Hex() {
+		t.Fatalf("compact reported content_root=%v, want %s", parsed["content_root"], before.ContentHash.Hex())
+	}
+	reader, err := store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reader.Close()
+	afterRecord, err := reader.ObjectMeta(id)
+	if err != nil {
+		t.Fatalf("meta after: %v", err)
+	}
+	after, err := store.ReadManifest(dir, afterRecord.Content)
+	if err != nil {
+		t.Fatalf("manifest after: %v", err)
+	}
+	if after.Representation != nil {
+		t.Fatalf("compact left a representation: %+v", after.Representation)
+	}
+	if after.ContentHash != before.ContentHash {
+		t.Fatalf("compact changed the content root")
 	}
 }
