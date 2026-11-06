@@ -144,12 +144,14 @@ func TestOverlayWriterMatchesRustByteForByte(t *testing.T) {
 	if !bytes.Equal(goManifestBytes, rustManifestBytes) {
 		t.Fatalf("overlay manifest bytes differ (%d vs %d bytes)", len(goManifestBytes), len(rustManifestBytes))
 	}
+	t.Logf("byte-equal overlay manifest=%s bytes=%d head=%s", record.Content.Hex(), len(goManifestBytes), s.Head().Hex())
 	manifest := manifestOf(t, s, id)
 	if manifest.Representation == nil || manifest.Representation.Kind != model.RepresentationOverlay {
 		t.Fatalf("go result is not an overlay representation")
 	}
 
 	// The Rust verifier accepts the Go store and reads the same bytes.
+	t.Logf("rust verify --full accepted the Go store after an identical history")
 	s.Close()
 	runRust(t, bin, "--store", goDir, "verify", "--full")
 	reader := reopenOverlayReadOnly(t, goDir)

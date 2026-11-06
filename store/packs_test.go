@@ -298,6 +298,8 @@ func TestPackedStoreRoundTripVerifyReopenAndGC(t *testing.T) {
 	if !ok || stats.SealedPacks == 0 {
 		t.Fatalf("no packs were sealed: %+v", stats)
 	}
+	t.Logf("packs: sealed=%d members=%d bytes=%d catalog_segments=%d",
+		stats.SealedPacks, stats.PackedMembers, stats.PackedBytes, stats.CatalogSegmentPublishes)
 	for id, want := range payloads {
 		got, err := s.ReadObject(id)
 		if err != nil || !bytes.Equal(got, want) {

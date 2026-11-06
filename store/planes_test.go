@@ -128,6 +128,8 @@ func TestSplitPlanesMatchTheSingleBackendStore(t *testing.T) {
 		}
 		reader.Close()
 	}
+	t.Logf("all four layouts published head=%s generation=%d manifest=%s",
+		wantHead.Hex(), wantGeneration, wantManifest.Hex())
 }
 
 func verifyProblems(report *store.VerifyReport) []store.VerifyProblem {

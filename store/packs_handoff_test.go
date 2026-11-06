@@ -53,6 +53,8 @@ func TestGoPacksRustReadsAndVerifies(t *testing.T) {
 	if !ok || stats.SealedPacks == 0 || stats.PackedMembers == 0 {
 		t.Fatalf("Go wrote no packs: %+v", stats)
 	}
+	t.Logf("go packs: sealed=%d members=%d bytes=%d flat_members=%d head=%s manifest=%s",
+		stats.SealedPacks, stats.PackedMembers, stats.PackedBytes, stats.FlatMembers, head.Hex(), record.Content.Hex())
 	s.Close()
 	want := append([]byte(nil), payload...)
 	copy(want[150_000:], []byte("go-packed-write"))
