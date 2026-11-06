@@ -125,6 +125,7 @@ const (
 	// Tensor strategies; the spelling is fixed by the tensor mode (WEFT-MODEL
 	// §2.3.1).
 	StrategyTensorSharded = "tensor-sharded"
+	StrategyFloatTensor   = "float-tensor"
 	StrategyWeightDelta   = "weight-delta"
 	StrategyKvCache       = "kv-cache"
 	StrategyActivation    = "activation"

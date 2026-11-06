@@ -48,6 +48,8 @@ const (
 	TensorStrategyRaw TensorStrategy = "raw"
 	// TensorStrategyZstd is one WeftCodec ZSTD frame (v2 kind:"codec").
 	TensorStrategyZstd TensorStrategy = "zstd"
+	// TensorStrategyFloatTensor is one mode-9 FLOAT_TENSOR frame.
+	TensorStrategyFloatTensor TensorStrategy = "float-tensor"
 	// TensorStrategySharded is one mode-10 TENSOR_SHARDED frame.
 	TensorStrategySharded TensorStrategy = "tensor-sharded"
 	// TensorStrategyWeightDelta is one mode-11 frame against the causal parent.
@@ -64,9 +66,9 @@ const (
 // ParseTensorStrategy parses a canonical planner strategy spelling.
 func ParseTensorStrategy(text string) (TensorStrategy, error) {
 	switch TensorStrategy(text) {
-	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategySharded,
-		TensorStrategyWeightDelta, TensorStrategySemanticDelta,
-		TensorStrategyKvCache, TensorStrategyActivation:
+	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
+		TensorStrategySharded, TensorStrategyWeightDelta,
+		TensorStrategySemanticDelta, TensorStrategyKvCache, TensorStrategyActivation:
 		return TensorStrategy(text), nil
 	default:
 		return "", werr.Newf(werr.Malformed, "unknown tensor strategy `%s`", text)
@@ -91,6 +93,8 @@ func (s TensorStrategy) String() string { return string(s) }
 // frameMode returns the frame mode this strategy requires, when frame-backed.
 func (s TensorStrategy) frameMode() (uint32, bool) {
 	switch s {
+	case TensorStrategyFloatTensor:
+		return 9, true
 	case TensorStrategySharded:
 		return 10, true
 	case TensorStrategyWeightDelta:
@@ -117,16 +121,18 @@ func tensorStrategyRank(s TensorStrategy) int {
 		return 0
 	case TensorStrategyZstd:
 		return 1
-	case TensorStrategySharded:
+	case TensorStrategyFloatTensor:
 		return 2
-	case TensorStrategyWeightDelta:
+	case TensorStrategySharded:
 		return 3
-	case TensorStrategySemanticDelta:
+	case TensorStrategyWeightDelta:
 		return 4
-	case TensorStrategyKvCache:
+	case TensorStrategySemanticDelta:
 		return 5
-	case TensorStrategyActivation:
+	case TensorStrategyKvCache:
 		return 6
+	case TensorStrategyActivation:
+		return 7
 	default:
 		return 99
 	}
@@ -160,26 +166,41 @@ func saturatingMul(a, b uint64) uint64 {
 	return lo
 }
 
-// estimatedDecodeNS is the documented linear decode cost model shared with
-// Rust. It is an estimate, never a measurement.
-func estimatedDecodeNS(strategy TensorStrategy, size uint64) uint64 {
-	switch strategy {
+// costClass maps a strategy to the shared decode-cost table.
+func (s TensorStrategy) costClass() CostClass {
+	switch s {
 	case TensorStrategyRaw:
-		return saturatingAdd(size/200, 20_000)
+		return CostClassRaw
 	case TensorStrategyZstd:
-		return saturatingAdd(size, 50_000)
+		return CostClassZstd
+	case TensorStrategyFloatTensor:
+		return CostClassFloatTensor
 	case TensorStrategySharded:
-		return saturatingAdd(saturatingMul(size, 4), 100_000)
+		return CostClassTensorSharded
 	case TensorStrategyWeightDelta:
-		return saturatingAdd(saturatingMul(size, 3), 100_000)
+		return CostClassWeightDelta
 	case TensorStrategySemanticDelta:
-		return saturatingAdd(saturatingMul(size, 3), 150_000)
-	case TensorStrategyKvCache, TensorStrategyActivation:
-		return saturatingAdd(size, 100_000)
+		return CostClassSemanticDelta
+	case TensorStrategyKvCache:
+		return CostClassKvCache
+	case TensorStrategyActivation:
+		return CostClassActivation
 	default:
-		return saturatingAdd(size, 100_000)
+		return CostClassRaw
 	}
 }
+
+// estimatedDecodeNS prices a candidate with the shared table.
+func estimatedDecodeNS(strategy TensorStrategy, size uint64, options TensorPlanOptions) uint64 {
+	model := options.CostModel
+	if model == "" {
+		model = DefaultCostModel
+	}
+	return EstimateDecodeNS(strategy.costClass(), size, model)
+}
+
+// isIndependent reports whether a representation stands alone.
+func (s TensorStrategy) isIndependent() bool { return !s.usesDependency() }
 
 // TensorLayoutSpec is a validated physical layout declaration for one tensor
 // write. Bytes supplied with it are arranged in this physical order and are
@@ -481,6 +502,9 @@ type TensorPlanOptions struct {
 	// LambdaNS is the number of bytes charged per estimated nanosecond of
 	// decode time. 0 is bytes-only.
 	LambdaNS uint64
+	// CostModel selects the decode-cost table. The empty value means
+	// DefaultCostModel (measured).
+	CostModel CostModelKind
 	// MaxCandidates bounds the semantic search (unused by the B2 writer).
 	MaxCandidates int
 	// Candidates are explicit tensor ObjectIds for the semantic search (unused
@@ -603,7 +627,7 @@ func (s *Store) WriteTensorFileWithSpec(
 	if err != nil {
 		return model.Hash32{}, err
 	}
-	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, spec.Causal, spec.Plan)
+	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, spec.Causal, spec.Plan, false)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -640,6 +664,206 @@ func (s *Store) WriteTensorFileWithSpec(
 	return s.commitTensorFile(parent, name, manifestID, contentHash, size, attrs, spec.Causal, seed)
 }
 
+// TensorIndependentPlan is the priced decision among standalone
+// representations (the rebase planner's input).
+type TensorIndependentPlan struct {
+	Chosen          TensorStrategy
+	PhysicalBytes   uint64
+	EstimatedDecode uint64
+	Cost            tensorCost
+	Candidates      []TensorPlanCandidate
+}
+
+// TensorRebase is the result of re-publishing one tensor with a standalone
+// representation. Logical bytes are unchanged; the content root (manifest id)
+// changes because the representation changed.
+type TensorRebase struct {
+	OldVersion  model.Hash32
+	NewVersion  model.Hash32
+	OldContent  model.Hash32
+	NewContent  model.Hash32
+	OldStrategy string
+	Plan        TensorIndependentPlan
+}
+
+// PlanTensorIndependent prices only standalone representations of an existing
+// tensor object (deltas excluded).
+func (s *Store) PlanTensorIndependent(
+	id model.Hash32,
+	options TensorPlanOptions,
+	hint *TensorStrategy,
+) (TensorIndependentPlan, error) {
+	meta, err := s.TensorMetadata(id)
+	if err != nil {
+		return TensorIndependentPlan{}, err
+	}
+	logical, err := s.readObjectUncounted(id)
+	if err != nil {
+		return TensorIndependentPlan{}, err
+	}
+	prepared, err := s.prepareTensorCandidates(
+		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true)
+	if err != nil {
+		return TensorIndependentPlan{}, err
+	}
+	chosen, err := chooseTensorCandidate(prepared, hint)
+	if err != nil {
+		return TensorIndependentPlan{}, err
+	}
+	plan := TensorIndependentPlan{
+		Chosen:     chosen.candidate.Strategy,
+		Candidates: make([]TensorPlanCandidate, 0, len(prepared)),
+	}
+	if chosen.candidate.PhysicalBytes != nil {
+		plan.PhysicalBytes = *chosen.candidate.PhysicalBytes
+	}
+	if chosen.candidate.EstimatedDecodeNS != nil {
+		plan.EstimatedDecode = *chosen.candidate.EstimatedDecodeNS
+	}
+	if chosen.candidate.Cost != nil {
+		plan.Cost = *chosen.candidate.Cost
+	}
+	for _, item := range prepared {
+		plan.Candidates = append(plan.Candidates, item.candidate)
+	}
+	return plan, nil
+}
+
+// RebaseTensorObject publishes a new version with a standalone representation.
+// The previous version and every snapshot are untouched.
+func (s *Store) RebaseTensorObject(
+	id model.Hash32,
+	options TensorPlanOptions,
+	hint *TensorStrategy,
+) (TensorRebase, error) {
+	if err := s.requireWritable(); err != nil {
+		return TensorRebase{}, err
+	}
+	meta, err := s.TensorMetadata(id)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	old, err := s.ObjectMeta(id)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	logical, err := s.readObjectUncounted(id)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	prepared, err := s.prepareTensorCandidates(
+		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	chosen, err := chooseTensorCandidate(prepared, hint)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	if chosen.artifact == nil {
+		return TensorRebase{}, werr.Newf(werr.InvalidArgument,
+			"chosen tensor strategy has no artifact")
+	}
+	root, err := chosenRoot(chosen, s, meta, logical)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	manifestID, _, size, err := s.storeTensorArtifact(
+		meta.Dtype, meta.Shape, logical, meta.Layout, chosen.artifact)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	attrs := model.CloneAttrs(old.Attrs)
+	if err := applyTensorAttrs(attrs, meta.Dtype, meta.Shape, root, meta.Layout,
+		chosen.artifact.StrategyName); err != nil {
+		return TensorRebase{}, err
+	}
+	newVersion, err := s.publishTensorVersion(
+		id, old, manifestID, size, []model.Hash32{old.Version}, attrs)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	newRecord, err := s.ObjectMeta(id)
+	if err != nil {
+		return TensorRebase{}, err
+	}
+	plan := TensorIndependentPlan{
+		Chosen:     chosen.candidate.Strategy,
+		Candidates: make([]TensorPlanCandidate, 0, len(prepared)),
+	}
+	if chosen.candidate.PhysicalBytes != nil {
+		plan.PhysicalBytes = *chosen.candidate.PhysicalBytes
+	}
+	if chosen.candidate.EstimatedDecodeNS != nil {
+		plan.EstimatedDecode = *chosen.candidate.EstimatedDecodeNS
+	}
+	if chosen.candidate.Cost != nil {
+		plan.Cost = *chosen.candidate.Cost
+	}
+	for _, item := range prepared {
+		plan.Candidates = append(plan.Candidates, item.candidate)
+	}
+	return TensorRebase{
+		OldVersion:  old.Version,
+		NewVersion:  newVersion,
+		OldContent:  old.Content,
+		NewContent:  newRecord.Content,
+		OldStrategy: meta.Strategy,
+		Plan:        plan,
+	}, nil
+}
+
+func chosenRoot(
+	chosen preparedTensorCandidate,
+	s *Store,
+	meta StoredTensorMetadata,
+	logical []byte,
+) (model.Hash32, error) {
+	if chosen.artifact != nil && chosen.artifact.Tensor != nil {
+		return chosen.artifact.Tensor.LogicalRoot, nil
+	}
+	return logicalRootForBytes(meta.Dtype, meta.Shape, logical)
+}
+
+func (s *Store) publishTensorVersion(
+	id model.Hash32,
+	old model.ObjectRecord,
+	manifestID model.Hash32,
+	newSize uint64,
+	causal []model.Hash32,
+	attrs map[string]wcb.Value,
+) (model.Hash32, error) {
+	attrs, identityMode, causalHash, closure, err := s.prepareCausal(attrs, causal)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if closure != nil {
+		if err := s.storeCausalClosure(closure); err != nil {
+			return model.Hash32{}, err
+		}
+	}
+	mtime := s.nowNS()
+	version, err := model.DeriveVersionIDWithIdentity(
+		id, manifestID, newSize, mtime, hashPtr(old.Version), identityMode, causalHash)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	record := old.Clone()
+	record.Version = version
+	record.MtimeNS = mtime
+	record.Content = manifestID
+	record.Size = newSize
+	record.Attrs = attrs
+	ops := []model.Op{
+		model.PutObjectOp{Record: record},
+		model.SetTipOp{Object: id, Version: version},
+	}
+	if _, err := s.commitOps(ops, false); err != nil {
+		return model.Hash32{}, err
+	}
+	return version, nil
+}
+
 // PlanTensor prices every applicable strategy without writing anything.
 func (s *Store) PlanTensor(
 	dtypeText string,
@@ -660,7 +884,7 @@ func (s *Store) PlanTensor(
 	if err != nil {
 		return TensorPlan{}, err
 	}
-	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, causal, options)
+	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, causal, options, false)
 	if err != nil {
 		return TensorPlan{}, err
 	}
@@ -732,6 +956,7 @@ func (s *Store) prepareTensorCandidates(
 	layout TensorLayoutSpec,
 	causal []model.Hash32,
 	options TensorPlanOptions,
+	independentOnly bool,
 ) ([]preparedTensorCandidate, error) {
 	lim := limits.Default()
 	size := uint64(len(logical))
@@ -755,8 +980,8 @@ func (s *Store) prepareTensorCandidates(
 				Strategy: TensorStrategyRaw, Applicable: true,
 				Detail:            "canonical row-major chunks",
 				PhysicalBytes:     uint64Ptr(size),
-				EstimatedDecodeNS: uint64Ptr(estimatedDecodeNS(TensorStrategyRaw, size)),
-				Cost:              costPtr(priceTensor(size, estimatedDecodeNS(TensorStrategyRaw, size), options.LambdaNS)),
+				EstimatedDecodeNS: uint64Ptr(estimatedDecodeNS(TensorStrategyRaw, size, options)),
+				Cost:              costPtr(priceTensor(size, estimatedDecodeNS(TensorStrategyRaw, size, options), options.LambdaNS)),
 			},
 			artifact: &tensorArtifact{
 				Kind: model.RepresentationRaw, StrategyName: model.StrategyRaw,
@@ -775,7 +1000,7 @@ func (s *Store) prepareTensorCandidates(
 		out = append(out, skippedTensor(TensorStrategyZstd, err.Error()))
 	} else {
 		physical := uint64(len(zstdFrame))
-		estimate := estimatedDecodeNS(TensorStrategyZstd, size)
+		estimate := estimatedDecodeNS(TensorStrategyZstd, size, options)
 		out = append(out, preparedTensorCandidate{
 			candidate: TensorPlanCandidate{
 				Strategy: TensorStrategyZstd, Applicable: true,
@@ -791,6 +1016,56 @@ func (s *Store) prepareTensorCandidates(
 		})
 	}
 
+	// Mode 9 FLOAT_TENSOR. Offered for byte-aligned float dtypes; priced only
+	// when it saves at least 1/64 of the zstd frame (mode 9 decodes ~19x
+	// slower). This mirrors the Rust planner exactly.
+	var zstdPhysical *uint64
+	for index := range out {
+		if out[index].candidate.Strategy == TensorStrategyZstd && out[index].candidate.Applicable {
+			zstdPhysical = out[index].candidate.PhysicalBytes
+			break
+		}
+	}
+	if floatDtype, ok := floatTensorDtype(dtype); !ok {
+		out = append(out, skippedTensor(TensorStrategyFloatTensor,
+			"dtype "+dtype+" has no mode-9 float layout"))
+	} else if frameBytes, err := modes.EncodeFloatTensor(logical, floatDtype, shape, lim); err != nil {
+		out = append(out, skippedTensor(TensorStrategyFloatTensor, err.Error()))
+	} else {
+		physical := uint64(len(frameBytes))
+		worthwhile := true
+		if zstdPhysical != nil {
+			worthwhile = saturatingMul(physical, 64) <= saturatingMul(*zstdPhysical, 63)
+		}
+		if !worthwhile {
+			out = append(out, skippedTensor(TensorStrategyFloatTensor,
+				"mode 9 saves less than 1/64 of the zstd frame; not worth the decode cost"))
+		} else {
+			root, err := logicalRootForBytes(dtype, shape, logical)
+			if err != nil {
+				return nil, err
+			}
+			estimate := estimatedDecodeNS(TensorStrategyFloatTensor, size, options)
+			out = append(out, preparedTensorCandidate{
+				candidate: TensorPlanCandidate{
+					Strategy: TensorStrategyFloatTensor, Applicable: true,
+					Detail:            "one mode-9 FLOAT_TENSOR frame (" + floatDtype.Name + ")",
+					PhysicalBytes:     uint64Ptr(physical),
+					EstimatedDecodeNS: uint64Ptr(estimate),
+					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+				},
+				artifact: &tensorArtifact{
+					Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTensor.String(),
+					Frame: frameBytes,
+					Tensor: &model.TensorRepresentation{
+						Mode: 9, Dtype: dtype, Shape: append([]uint64(nil), shape...),
+						LogicalRoot: root, Layout: layout.WCBValue(dtype, shape),
+					},
+				},
+			})
+		}
+	}
+
 	// Mode 10 tensor-sharded, restricted to q8_0 (one whole-tensor shard).
 	if quantized {
 		frameBytes, root, err := s.prepareMode10(dtype, shape, logical, lim)
@@ -798,7 +1073,7 @@ func (s *Store) prepareTensorCandidates(
 			out = append(out, skippedTensor(TensorStrategySharded, err.Error()))
 		} else {
 			physical := uint64(len(frameBytes))
-			estimate := estimatedDecodeNS(TensorStrategySharded, size)
+			estimate := estimatedDecodeNS(TensorStrategySharded, size, options)
 			out = append(out, preparedTensorCandidate{
 				candidate: TensorPlanCandidate{
 					Strategy: TensorStrategySharded, Applicable: true,
@@ -823,38 +1098,43 @@ func (s *Store) prepareTensorCandidates(
 	}
 
 	// Mode 11 weight-delta against the causal parent.
-	switch frameBytes, dependency, err := s.prepareDelta(dtype, shape, logical, causal, lim); {
-	case err != nil:
-		out = append(out, skippedTensor(TensorStrategyWeightDelta, err.Error()))
-	case frameBytes == nil:
+	if independentOnly {
 		out = append(out, skippedTensor(TensorStrategyWeightDelta,
-			"no usable causal parent with the same dtype/shape"))
-	default:
-		physical := uint64(len(frameBytes))
-		estimate := estimatedDecodeNS(TensorStrategyWeightDelta, size)
-		root, err := logicalRootForBytes(dtype, shape, logical)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, preparedTensorCandidate{
-			candidate: TensorPlanCandidate{
-				Strategy: TensorStrategyWeightDelta, Applicable: true,
-				Detail:            "mode 11 against the causal parent",
-				PhysicalBytes:     uint64Ptr(physical),
-				EstimatedDecodeNS: uint64Ptr(estimate),
-				Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
-				Dependency:        dependency,
-			},
-			artifact: &tensorArtifact{
-				Kind: model.RepresentationTensor, StrategyName: TensorStrategyWeightDelta.String(),
-				Frame:        frameBytes,
-				Dependencies: []model.Hash32{*dependency},
-				Tensor: &model.TensorRepresentation{
-					Mode: 11, Dtype: dtype, Shape: append([]uint64(nil), shape...),
-					LogicalRoot: root, Layout: layout.WCBValue(dtype, shape),
+			"rebase requires an independent representation"))
+	} else {
+		switch frameBytes, dependency, err := s.prepareDelta(dtype, shape, logical, causal, lim); {
+		case err != nil:
+			out = append(out, skippedTensor(TensorStrategyWeightDelta, err.Error()))
+		case frameBytes == nil:
+			out = append(out, skippedTensor(TensorStrategyWeightDelta,
+				"no usable causal parent with the same dtype/shape"))
+		default:
+			physical := uint64(len(frameBytes))
+			estimate := estimatedDecodeNS(TensorStrategyWeightDelta, size, options)
+			root, err := logicalRootForBytes(dtype, shape, logical)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, preparedTensorCandidate{
+				candidate: TensorPlanCandidate{
+					Strategy: TensorStrategyWeightDelta, Applicable: true,
+					Detail:            "mode 11 against the causal parent",
+					PhysicalBytes:     uint64Ptr(physical),
+					EstimatedDecodeNS: uint64Ptr(estimate),
+					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					Dependency:        dependency,
 				},
-			},
-		})
+				artifact: &tensorArtifact{
+					Kind: model.RepresentationTensor, StrategyName: TensorStrategyWeightDelta.String(),
+					Frame:        frameBytes,
+					Dependencies: []model.Hash32{*dependency},
+					Tensor: &model.TensorRepresentation{
+						Mode: 11, Dtype: dtype, Shape: append([]uint64(nil), shape...),
+						LogicalRoot: root, Layout: layout.WCBValue(dtype, shape),
+					},
+				},
+			})
+		}
 	}
 
 	return out, nil
@@ -945,6 +1225,26 @@ func q8Scales(words []int8, blockSize uint64) ([]uint32, []int64) {
 		zeroPoints = append(zeroPoints, 0)
 	}
 	return scales, zeroPoints
+}
+
+// floatTensorDtype maps a manifest dtype to the mode-9 float layout.
+func floatTensorDtype(dtype string) (modes.FloatDtype, bool) {
+	name := ""
+	switch dtype {
+	case "f16":
+		name = "fp16"
+	case "bf16":
+		name = "bf16"
+	case "f32":
+		name = "fp32"
+	default:
+		return modes.FloatDtype{}, false
+	}
+	parsed, err := modes.ParseFloatDtype(name)
+	if err != nil {
+		return modes.FloatDtype{}, false
+	}
+	return parsed, true
 }
 
 func q8BlockSize(elementCount uint64) uint64 {

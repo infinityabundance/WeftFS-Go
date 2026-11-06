@@ -68,6 +68,8 @@ func readTensorRange(
 
 	var logical []byte
 	switch rep.Tensor.Mode {
+	case 9:
+		logical, err = decodeTensorMode9(parsed, rep, manifest, lim)
 	case 10:
 		logical, err = decodeTensorMode10(parsed, rep, manifest, lim)
 	case 11:
@@ -107,6 +109,8 @@ func readTensorRange(
 
 func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 	switch mode {
+	case 9:
+		return frame.ModeFloatTensor, true
 	case 10:
 		return frame.ModeTensorSharded, true
 	case 11:
@@ -120,6 +124,57 @@ func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func decodeTensorMode9(
+	parsed *frame.Frame,
+	rep *model.Representation,
+	manifest model.Manifest,
+	lim limits.Limits,
+) ([]byte, error) {
+	meta, err := modes.FloatTensorMetadata(parsed, lim)
+	if err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	floatDtype, ok := floatTensorDtype(rep.Tensor.Dtype)
+	if !ok {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 dtype `%s` has no float layout", rep.Tensor.Dtype)
+	}
+	if meta.Dtype.Name != floatDtype.Name {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 dtype `%s` disagrees with manifest dtype `%s`",
+			meta.Dtype.Name, rep.Tensor.Dtype)
+	}
+	if !equalShapes(meta.Shape, rep.Tensor.Shape) {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 shape disagrees with the representation manifest")
+	}
+	if meta.ElementCount*floatDtype.ElementSize() != manifest.Size {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 element count disagrees with the manifest size")
+	}
+	logical, err := modes.DecodeFloatTensorFrame(parsed, lim)
+	if err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	if uint64(len(logical)) != manifest.Size {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 decoded length disagrees with the manifest")
+	}
+	physical, ok := model.TensorPhysicalDtype(rep.Tensor.Dtype)
+	if !ok {
+		return nil, werr.Newf(werr.Unsupported, "mode-9 dtype has no logical root")
+	}
+	recomputed, err := tensor.LogicalRoot(physical, rep.Tensor.Shape, logical, lim)
+	if err != nil {
+		return nil, werr.FromCodec(err)
+	}
+	if recomputed != rep.Tensor.LogicalRoot {
+		return nil, werr.Newf(werr.Corrupt,
+			"mode-9 logical root recomputation mismatch")
+	}
+	return logical, nil
 }
 
 func decodeTensorMode10(

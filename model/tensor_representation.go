@@ -37,8 +37,8 @@ const (
 // TensorRepresentation is the additive tensor payload of a v2 representation
 // map. It exists exactly when Kind is RepresentationTensor.
 type TensorRepresentation struct {
-	// Mode is the tensor frame mode: 10 TENSOR_SHARDED, 11 WEIGHT_DELTA,
-	// 12 KV_CACHE, 13 ACTIVATION_STREAM, 14 SEMANTIC_DELTA.
+	// Mode is the tensor frame mode: 9 FLOAT_TENSOR, 10 TENSOR_SHARDED,
+	// 11 WEIGHT_DELTA, 12 KV_CACHE, 13 ACTIVATION_STREAM, 14 SEMANTIC_DELTA.
 	Mode uint32
 	// Dtype is the canonical WEFT-TENSOR dtype name (or q8_0/q4_0).
 	Dtype string
@@ -67,6 +67,8 @@ var tensorRepresentationKeys = []string{
 // tensor mode.
 func TensorStrategyForMode(mode uint32) (string, bool) {
 	switch mode {
+	case 9:
+		return "float-tensor", true
 	case 10:
 		return "tensor-sharded", true
 	case 11:
@@ -86,6 +88,8 @@ func TensorStrategyForMode(mode uint32) (string, bool) {
 // requires.
 func TensorModeForStrategy(strategy string) (uint32, bool) {
 	switch strategy {
+	case "float-tensor":
+		return 9, true
 	case "tensor-sharded":
 		return 10, true
 	case "weight-delta":
@@ -355,8 +359,10 @@ func SortTensorStrategies(strategies []string) {
 			return 0
 		case name == StrategyZstd:
 			return 1
+		case name == StrategyFloatTensor:
+			return 2
 		case ok:
-			return 2 + int(mode) - 10
+			return 3 + int(mode) - 10
 		default:
 			return 99
 		}

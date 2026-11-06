@@ -172,8 +172,10 @@ type Store struct {
 	contentPins    map[model.Hash32]uint64
 	// Write budgets and the committed blob set used to charge only genuinely
 	// new bytes. Both are derived from committed state.
-	quota          QuotaState
-	blobIndex      map[model.Hash32]uint64
+	quota     QuotaState
+	blobIndex map[model.Hash32]uint64
+	// access holds advisory per-object read counters (access/counts.v1).
+	access         *accessCounts
 	blobIndexReady bool
 	// Chunk blobs read by the most recent Merkle range write. Diagnostic only:
 	// it proves an overwrite does not stream the whole file.
@@ -406,6 +408,7 @@ func Init(path string, opts Options) (*Store, error) {
 		contentPins: make(map[model.Hash32]uint64),
 		quota:       newQuotaState(),
 		blobIndex:   map[model.Hash32]uint64{},
+		access:      loadAccessCounts(path),
 	}
 	if err := store.writeGenesis(); err != nil {
 		lock.Close()
@@ -507,6 +510,7 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 		contentPins:    make(map[model.Hash32]uint64),
 		quota:          newQuotaState(),
 		blobIndex:      map[model.Hash32]uint64{},
+		access:         loadAccessCounts(path),
 	}
 	store.loadQuotaRecord()
 	return store, nil
@@ -571,6 +575,9 @@ func (s *Store) CurrentState() *model.State { return s.state }
 // Close releases the writer lock. It does not fsync anything: every mutation
 // was durably published before its call returned.
 func (s *Store) Close() error {
+	if s.mode == ReadWrite && s.access != nil {
+		_ = s.access.flush(s.root)
+	}
 	if s.lock != nil {
 		err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 		closeErr := s.lock.Close()
@@ -805,6 +812,15 @@ func resolveComponentsIn(state *model.State, components [][]byte) (model.Hash32,
 // ReadObject reads a complete object, verifying every chunk and the
 // whole-content hash for files.
 func (s *Store) ReadObject(id model.Hash32) ([]byte, error) {
+	data, err := s.readObjectState(s.state, id)
+	if err == nil {
+		s.noteObjectRead(id)
+	}
+	return data, err
+}
+
+// readObjectUncounted reads without touching access counters (internal work).
+func (s *Store) readObjectUncounted(id model.Hash32) ([]byte, error) {
 	return s.readObjectState(s.state, id)
 }
 
@@ -817,7 +833,11 @@ func (s *Store) ReadObjectAt(snapshot *model.Hash32, id model.Hash32) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	return s.readObjectState(state, id)
+	data, err := s.readObjectState(state, id)
+	if err == nil {
+		s.noteObjectRead(id)
+	}
+	return data, err
 }
 
 func (s *Store) readObjectState(state *model.State, id model.Hash32) ([]byte, error) {
@@ -864,7 +884,11 @@ func (s *Store) ReadRange(id model.Hash32, offset, length uint64) ([]byte, error
 		return nil, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 	}
 	contentRoot := record.Content
-	return readManifestRange(s.root, &contentRoot, manifest, offset, length, false)
+	data, err := readManifestRange(s.root, &contentRoot, manifest, offset, length, false)
+	if err == nil {
+		s.noteObjectRead(id)
+	}
+	return data, err
 }
 
 // ReadContent reads a byte range directly from a content root (manifest id).
