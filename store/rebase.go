@@ -38,6 +38,7 @@ type RebaseOptions struct {
 	ThresholdNS  uint64
 	LambdaNS     uint64
 	CostModel    CostModelKind
+	Cost         *CostTable
 	StrategyHint *TensorStrategy
 	MaxObjects   int
 	DryRun       bool
@@ -133,7 +134,7 @@ func (s *Store) PlanRebase(root model.Hash32, options RebaseOptions) (RebasePlan
 		Truncated: truncated,
 	}
 	planOptions := TensorPlanOptions{
-		LambdaNS: options.LambdaNS, CostModel: options.CostModel,
+		LambdaNS: options.LambdaNS, CostModel: options.CostModel, Cost: options.Cost,
 	}
 	for _, entry := range objects {
 		plan.Scanned++
@@ -168,7 +169,7 @@ func (s *Store) PlanRebase(root model.Hash32, options RebaseOptions) (RebasePlan
 		if !ok {
 			class = CostClassRaw
 		}
-		decodeCost, err := s.currentDecodeCost(record.Content, record.Size, options.CostModel, 0, map[model.Hash32]bool{})
+		decodeCost, err := s.currentDecodeCost(record.Content, record.Size, options.CostModel, options.Cost, 0, map[model.Hash32]bool{})
 		if err != nil {
 			plan.Skipped = append(plan.Skipped, RebaseSkip{
 				Object: entry.id, Path: entry.path,
@@ -230,7 +231,7 @@ func (s *Store) Rebase(root model.Hash32, options RebaseOptions) (RebaseReport, 
 		return RebaseReport{}, err
 	}
 	planOptions := TensorPlanOptions{
-		LambdaNS: options.LambdaNS, CostModel: options.CostModel,
+		LambdaNS: options.LambdaNS, CostModel: options.CostModel, Cost: options.Cost,
 	}
 	report := RebaseReport{Plan: plan}
 	for _, candidate := range plan.Candidates {
@@ -261,6 +262,7 @@ func (s *Store) currentDecodeCost(
 	content model.Hash32,
 	size uint64,
 	modelCost CostModelKind,
+	table *CostTable,
 	depth int,
 	seen map[model.Hash32]bool,
 ) (uint64, error) {
@@ -286,14 +288,14 @@ func (s *Store) currentDecodeCost(
 	if !ok {
 		class = CostClassRaw
 	}
-	total := EstimateDecodeNS(class, size, modelCost)
+	total := EstimateDecodeNSWith(class, size, modelCost, table)
 	for _, dependency := range dependencies {
 		dependencyManifest, err := readManifest(s.blobs, dependency)
 		if err != nil {
 			return 0, err
 		}
 		child, err := s.currentDecodeCost(
-			dependency, dependencyManifest.Size, modelCost, depth+1, seen)
+			dependency, dependencyManifest.Size, modelCost, table, depth+1, seen)
 		if err != nil {
 			return 0, err
 		}

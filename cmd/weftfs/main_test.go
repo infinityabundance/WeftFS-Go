@@ -438,3 +438,73 @@ func TestPackCLIRoundTrip(t *testing.T) {
 		t.Fatalf("verify: %v", err)
 	}
 }
+
+func TestCalibrationFlag(t *testing.T) {
+	previousModel := plannerCostModel
+	previousPath := calibrationPath
+	previousRecord := calibration
+	t.Cleanup(func() {
+		plannerCostModel = previousModel
+		calibrationPath = previousPath
+		calibration = previousRecord
+	})
+
+	bin := rustBinaryCLI(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "calibration.json")
+	runRustCLI(t, bin,
+		"--store", filepath.Join(dir, "calibrate-store"),
+		"calibrate", "--out", path,
+		"--reps", "5", "--small-kib", "64", "--large-mib", "8", "--json",
+	)
+
+	plannerCostModel = store.DefaultCostModel
+	calibrationPath = ""
+	calibration = nil
+	if _, _, _, err := globals([]string{
+		"--planner-cost-model", "measured", "--calibration", path, "info",
+	}); err != nil {
+		t.Fatalf("valid calibration rejected: %v", err)
+	}
+	if calibration == nil {
+		t.Fatal("--calibration did not load a calibration")
+	}
+	if table := activeCostTable(); table == nil {
+		t.Fatal("active cost table is nil after loading")
+	}
+
+	// --calibration is only legal with the measured model.
+	plannerCostModel = store.CostModelDeclared
+	calibration = nil
+	if _, _, _, err := globals([]string{
+		"--planner-cost-model", "declared", "--calibration", path, "info",
+	}); err == nil {
+		t.Fatal("--calibration with the declared model was accepted")
+	}
+
+	// A missing file refuses the command.
+	plannerCostModel = store.CostModelMeasured
+	calibration = nil
+	if _, _, _, err := globals([]string{
+		"--planner-cost-model", "measured", "--calibration", filepath.Join(dir, "missing.json"), "info",
+	}); err == nil {
+		t.Fatal("a missing calibration file was accepted")
+	}
+
+	// A mutated document is refused, never replaced by the baked table.
+	mutated := filepath.Join(dir, "mutated.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read calibration: %v", err)
+	}
+	raw[len(raw)/2] ^= 0x01
+	if err := os.WriteFile(mutated, raw, 0o644); err != nil {
+		t.Fatalf("write mutated: %v", err)
+	}
+	calibration = nil
+	if _, _, _, err := globals([]string{
+		"--planner-cost-model", "measured", "--calibration", mutated, "info",
+	}); err == nil {
+		t.Fatal("a corrupted calibration document was accepted")
+	}
+}

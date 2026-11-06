@@ -218,7 +218,7 @@ func estimatedDecodeNS(strategy TensorStrategy, size uint64, options TensorPlanO
 	if model == "" {
 		model = DefaultCostModel
 	}
-	return EstimateDecodeNS(strategy.costClass(), size, model)
+	return EstimateDecodeNSWith(strategy.costClass(), size, model, options.Cost)
 }
 
 // isIndependent reports whether a representation stands alone.
@@ -527,6 +527,9 @@ type TensorPlanOptions struct {
 	// CostModel selects the decode-cost table. The empty value means
 	// DefaultCostModel (measured).
 	CostModel CostModelKind
+	// Cost is an explicit host calibration table. When non-nil it wins over
+	// CostModel; it is only set by `--calibration` after strict validation.
+	Cost *CostTable
 	// MaxCandidates bounds the semantic search (unused by the B2 writer).
 	MaxCandidates int
 	// Candidates are explicit tensor ObjectIds for the semantic search (unused

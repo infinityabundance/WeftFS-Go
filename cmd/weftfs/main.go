@@ -98,7 +98,19 @@ var (
 	packMember   = store.DefaultPackOptions().MemberThresholdBytes
 	packCatalog  = store.DefaultPackOptions().MaxCatalogBytes
 	packSegments = store.DefaultPackOptions().CatalogSegments
+	// Planner cost model. `--calibration` is only legal with `measured`.
+	plannerCostModel = store.DefaultCostModel
+	calibrationPath  string
+	calibration      *store.Calibration
 )
+
+// activeCostTable returns the host calibration table when one was accepted.
+func activeCostTable() *store.CostTable {
+	if calibration == nil {
+		return nil
+	}
+	return calibration.Table()
+}
 
 func applyPlanePolicy(opts *store.Options) {
 	opts.BlobBackend = blobBackend
@@ -271,6 +283,30 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			i++
 		case strings.HasPrefix(args[i], "--blob-root="):
 			blobRoot = strings.TrimPrefix(args[i], "--blob-root=")
+		case args[i] == "--planner-cost-model" || args[i] == "-planner-cost-model":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--planner-cost-model requires a value")
+			}
+			kind, parseErr := store.ParseCostModelKind(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			plannerCostModel = kind
+			i++
+		case strings.HasPrefix(args[i], "--planner-cost-model="):
+			kind, parseErr := store.ParseCostModelKind(strings.TrimPrefix(args[i], "--planner-cost-model="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			plannerCostModel = kind
+		case args[i] == "--calibration" || args[i] == "-calibration":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--calibration requires a file")
+			}
+			calibrationPath = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--calibration="):
+			calibrationPath = strings.TrimPrefix(args[i], "--calibration=")
 		case args[i] == "--pack":
 			packing = true
 		case strings.HasPrefix(args[i], "--pack="):
@@ -362,6 +398,17 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 		default:
 			rest = append(rest, args[i])
 		}
+	}
+	if calibrationPath != "" {
+		if plannerCostModel != store.CostModelMeasured {
+			return nil, "", false, werr.Newf(werr.InvalidArgument,
+				"--calibration requires --planner-cost-model measured")
+		}
+		record, loadErr := store.LoadCalibration(calibrationPath)
+		if loadErr != nil {
+			return nil, "", false, loadErr
+		}
+		calibration = record
 	}
 	return rest, storeDir, jsonOut, nil
 }
@@ -750,7 +797,9 @@ func cmdWrite(args []string, storeDir string) error {
 		id, err := s.WriteTensorFileWithSpec(parent, name, *dtype, shape, data, layout, store.TensorWriteSpec{
 			StrategyHint: hint,
 			Causal:       causalIDs,
-			Plan:         store.TensorPlanOptions{LambdaNS: *lambdaNS},
+			Plan: store.TensorPlanOptions{
+				LambdaNS: *lambdaNS, CostModel: plannerCostModel, Cost: activeCostTable(),
+			},
 		})
 		if err != nil {
 			return err

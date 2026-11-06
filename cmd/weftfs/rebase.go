@@ -68,6 +68,8 @@ func cmdRebase(args []string, storeDir string, jsonOut bool) error {
 	options := store.DefaultRebaseOptions()
 	options.ThresholdNS = *threshold
 	options.LambdaNS = *lambdaNS
+	options.CostModel = plannerCostModel
+	options.Cost = activeCostTable()
 	options.StrategyHint = hint
 	options.MaxObjects = *maxObjects
 	options.DryRun = *dryRun

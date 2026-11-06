@@ -130,3 +130,75 @@ func EstimateDecodeNS(class CostClass, decodedBytes uint64, model CostModelKind)
 	scaled := (hi << 44) | (lo >> 20)
 	return saturatingAdd(scaled, row.FixedNS)
 }
+
+// CostClassAll is the canonical row order. A calibration document must carry
+// exactly one row for each entry.
+var CostClassAll = [10]CostClass{
+	CostClassRaw,
+	CostClassZstd,
+	CostClassFloatTensor,
+	CostClassTensorSharded,
+	CostClassTensorTiled,
+	CostClassWeightDelta,
+	CostClassSparseDelta,
+	CostClassSemanticDelta,
+	CostClassKvCache,
+	CostClassActivation,
+}
+
+// Index is the position of a class in CostClassAll.
+func (c CostClass) Index() int {
+	for index, candidate := range CostClassAll {
+		if candidate == c {
+			return index
+		}
+	}
+	return 0
+}
+
+// CostTable is a complete ten-row affine decode-cost table.
+type CostTable struct {
+	rows [10]Coefficients
+}
+
+// NewCostTable builds a table from rows in CostClassAll order.
+func NewCostTable(rows [10]Coefficients) *CostTable {
+	return &CostTable{rows: rows}
+}
+
+// BakedCostTable returns the historical declared or measured table.
+func BakedCostTable(model CostModelKind) *CostTable {
+	rows := [10]Coefficients{}
+	source := MeasuredCoefficients
+	if model == CostModelDeclared {
+		source = DeclaredCoefficients
+	}
+	for index, class := range CostClassAll {
+		rows[index] = source[class]
+	}
+	return NewCostTable(rows)
+}
+
+// Row returns one row of the table.
+func (t *CostTable) Row(class CostClass) Coefficients {
+	if t == nil {
+		return Coefficients{}
+	}
+	return t.rows[class.Index()]
+}
+
+// EstimateNS prices `decodedBytes` with this table.
+func (t *CostTable) EstimateNS(class CostClass, decodedBytes uint64) uint64 {
+	row := t.Row(class)
+	hi, lo := bits.Mul64(decodedBytes, row.NSperMiB)
+	scaled := (hi << 44) | (lo >> 20)
+	return saturatingAdd(scaled, row.FixedNS)
+}
+
+// EstimateDecodeNSWith prices with an explicit table when one is supplied.
+func EstimateDecodeNSWith(class CostClass, decodedBytes uint64, model CostModelKind, table *CostTable) uint64 {
+	if table != nil {
+		return table.EstimateNS(class, decodedBytes)
+	}
+	return EstimateDecodeNS(class, decodedBytes, model)
+}
