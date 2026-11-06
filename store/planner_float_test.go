@@ -92,8 +92,9 @@ func TestFloatTensorCandidateAndCostModel(t *testing.T) {
 		t.Fatal("incompressible data must not select mode 9")
 	}
 
-	// Shared measured table values (must equal src/cost_model.rs).
-	if got, want := store.EstimateDecodeNS(store.CostClassFloatTensor, 1<<20, store.CostModelMeasured), uint64(15_403_165); got != want {
+	// Shared measured table values (must equal src/cost_model.rs). The estimate
+	// is the affine fit: fixed_ns + ns_per_mib * bytes / 2^20.
+	if got, want := store.EstimateDecodeNS(store.CostClassFloatTensor, 1<<20, store.CostModelMeasured), uint64(4_683_726+18_264); got != want {
 		t.Fatalf("measured float-tensor estimate = %d, want %d", got, want)
 	}
 	if got, want := store.EstimateDecodeNS(store.CostClassZstd, 1<<20, store.CostModelDeclared), uint64(1_048_576+50_000); got != want {

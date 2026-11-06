@@ -88,20 +88,21 @@ var DeclaredCoefficients = map[CostClass]Coefficients{
 }
 
 // MeasuredCalibration names the exact court measurement.
-const MeasuredCalibration = "weftfs-r1/decode-calibration/v1"
+const MeasuredCalibration = "weftfs-r2/decode-calibration/v1"
 
 // MeasuredCoefficients is the median of three independent 7-repetition runs of
-// `examples/calibrate_decode.rs` (128 KiB and 16 MiB, warm cache). Delta rows
-// are incremental: the measured base read is subtracted. Modes 12/13 are never
-// produced by the store and retain the declared values.
+// `examples/calibrate_decode.rs` (128 KiB and 16 MiB, warm cache), re-measured
+// after the R2 Huffman and plane-join work. Delta rows are incremental: the
+// measured base read is subtracted. Modes 12/13 are never produced by the
+// store and retain the declared values. Must equal src/cost_model.rs.
 var MeasuredCoefficients = map[CostClass]Coefficients{
-	CostClassRaw:           {FixedNS: 10_000, NSperMiB: 318_321},
-	CostClassZstd:          {FixedNS: 17_000, NSperMiB: 814_267},
-	CostClassFloatTensor:   {FixedNS: 0, NSperMiB: 15_403_165},
-	CostClassTensorSharded: {FixedNS: 32_000, NSperMiB: 13_788_933},
-	CostClassTensorTiled:   {FixedNS: 14_000, NSperMiB: 10_056_794},
-	CostClassWeightDelta:   {FixedNS: 31_000, NSperMiB: 5_297_277},
-	CostClassSemanticDelta: {FixedNS: 18_000, NSperMiB: 7_228_350},
+	CostClassRaw:           {FixedNS: 11_757, NSperMiB: 307_019},
+	CostClassZstd:          {FixedNS: 21_285, NSperMiB: 779_888},
+	CostClassFloatTensor:   {FixedNS: 18_264, NSperMiB: 4_683_726},
+	CostClassTensorSharded: {FixedNS: 16_172, NSperMiB: 9_123_307},
+	CostClassTensorTiled:   {FixedNS: 14_131, NSperMiB: 3_366_772},
+	CostClassWeightDelta:   {FixedNS: 30_725, NSperMiB: 5_293_987},
+	CostClassSemanticDelta: {FixedNS: 31_891, NSperMiB: 6_458_523},
 	CostClassKvCache:       {FixedNS: 100_000, NSperMiB: 1_048_576},
 	CostClassActivation:    {FixedNS: 100_000, NSperMiB: 1_048_576},
 }
