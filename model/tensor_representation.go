@@ -79,6 +79,8 @@ func TensorStrategyForMode(mode uint32) (string, bool) {
 		return "activation", true
 	case 14:
 		return "semantic-delta", true
+	case 16:
+		return "sparse-delta", true
 	default:
 		return "", false
 	}
@@ -100,14 +102,16 @@ func TensorModeForStrategy(strategy string) (uint32, bool) {
 		return 13, true
 	case "semantic-delta":
 		return 14, true
+	case "sparse-delta":
+		return 16, true
 	default:
 		return 0, false
 	}
 }
 
 // TensorModeHasDependency reports whether a tensor mode carries a base content
-// root (modes 11 and 14).
-func TensorModeHasDependency(mode uint32) bool { return mode == 11 || mode == 14 }
+// root (modes 11, 14, and 16).
+func TensorModeHasDependency(mode uint32) bool { return mode == 11 || mode == 14 || mode == 16 }
 
 // TensorDtypeNames lists the canonical manifest dtype names in Rust order.
 var TensorDtypeNames = []string{

@@ -204,8 +204,23 @@ func TestTensorPlannerChoosesWeightDeltaAndRaw(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	if plan.Chosen != store.TensorStrategyWeightDelta {
-		t.Fatalf("chosen = %s, want weight-delta (plan %+v)", plan.Chosen, plan)
+	if plan.Chosen != store.TensorStrategySparseDelta {
+		t.Fatalf("chosen = %s, want sparse-delta (plan %+v)", plan.Chosen, plan)
+	}
+	// Mode 11 is still priced and must be the larger of the two delta frames
+	// for a 1,000-word change out of 131,072 elements.
+	var weightBytes uint64
+	for _, candidate := range plan.Candidates {
+		if candidate.Strategy == store.TensorStrategyWeightDelta {
+			if !candidate.Applicable || candidate.PhysicalBytes == nil {
+				t.Fatalf("weight-delta must be an applicable candidate: %+v", candidate)
+			}
+			weightBytes = *candidate.PhysicalBytes
+		}
+	}
+	if weightBytes == 0 || plan.ChosenPhysicalBytes >= weightBytes {
+		t.Fatalf("mode 16 %d bytes is not smaller than mode 11 %d bytes",
+			plan.ChosenPhysicalBytes, weightBytes)
 	}
 	derivedID, err := s.WriteTensorFileWithSpec(model.RootID, []byte("derived"), "bf16", shape, derived,
 		store.RowMajorTensorLayout(), store.TensorWriteSpec{Causal: []model.Hash32{baseRecord.Version}})
@@ -217,7 +232,7 @@ func TestTensorPlannerChoosesWeightDeltaAndRaw(t *testing.T) {
 	}
 	rep := tensorRepresentation(t, dir, s, "/derived")
 	if rep == nil || rep.Kind != model.RepresentationTensor || rep.Tensor == nil ||
-		rep.Tensor.Mode != 11 || rep.Strategy != model.StrategyWeightDelta {
+		rep.Tensor.Mode != 16 || rep.Strategy != model.StrategySparseDelta {
 		t.Fatalf("derived representation = %+v", rep)
 	}
 	if len(rep.Dependencies) != 1 || rep.Dependencies[0] != baseRecord.Content {

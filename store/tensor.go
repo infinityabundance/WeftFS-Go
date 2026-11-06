@@ -54,6 +54,9 @@ const (
 	TensorStrategySharded TensorStrategy = "tensor-sharded"
 	// TensorStrategyWeightDelta is one mode-11 frame against the causal parent.
 	TensorStrategyWeightDelta TensorStrategy = "weight-delta"
+	// TensorStrategySparseDelta is one mode-16 zero-run delta frame against the
+	// causal parent.
+	TensorStrategySparseDelta TensorStrategy = "sparse-delta"
 	// TensorStrategySemanticDelta is one mode-14 frame (readable, not produced
 	// by the B2 writer).
 	TensorStrategySemanticDelta TensorStrategy = "semantic-delta"
@@ -67,7 +70,7 @@ const (
 func ParseTensorStrategy(text string) (TensorStrategy, error) {
 	switch TensorStrategy(text) {
 	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
-		TensorStrategySharded, TensorStrategyWeightDelta,
+		TensorStrategySharded, TensorStrategyWeightDelta, TensorStrategySparseDelta,
 		TensorStrategySemanticDelta, TensorStrategyKvCache, TensorStrategyActivation:
 		return TensorStrategy(text), nil
 	default:
@@ -99,6 +102,8 @@ func (s TensorStrategy) frameMode() (uint32, bool) {
 		return 10, true
 	case TensorStrategyWeightDelta:
 		return 11, true
+	case TensorStrategySparseDelta:
+		return 16, true
 	case TensorStrategyKvCache:
 		return 12, true
 	case TensorStrategyActivation:
@@ -112,7 +117,8 @@ func (s TensorStrategy) frameMode() (uint32, bool) {
 
 // usesDependency reports whether the representation carries a base root.
 func (s TensorStrategy) usesDependency() bool {
-	return s == TensorStrategyWeightDelta || s == TensorStrategySemanticDelta
+	return s == TensorStrategyWeightDelta || s == TensorStrategySparseDelta ||
+		s == TensorStrategySemanticDelta
 }
 
 func tensorStrategyRank(s TensorStrategy) int {
@@ -127,12 +133,14 @@ func tensorStrategyRank(s TensorStrategy) int {
 		return 3
 	case TensorStrategyWeightDelta:
 		return 4
-	case TensorStrategySemanticDelta:
+	case TensorStrategySparseDelta:
 		return 5
-	case TensorStrategyKvCache:
+	case TensorStrategySemanticDelta:
 		return 6
-	case TensorStrategyActivation:
+	case TensorStrategyKvCache:
 		return 7
+	case TensorStrategyActivation:
+		return 8
 	default:
 		return 99
 	}
@@ -179,6 +187,8 @@ func (s TensorStrategy) costClass() CostClass {
 		return CostClassTensorSharded
 	case TensorStrategyWeightDelta:
 		return CostClassWeightDelta
+	case TensorStrategySparseDelta:
+		return CostClassSparseDelta
 	case TensorStrategySemanticDelta:
 		return CostClassSemanticDelta
 	case TensorStrategyKvCache:
@@ -1102,7 +1112,8 @@ func (s *Store) prepareTensorCandidates(
 		out = append(out, skippedTensor(TensorStrategyWeightDelta,
 			"rebase requires an independent representation"))
 	} else {
-		switch frameBytes, dependency, err := s.prepareDelta(dtype, shape, logical, causal, lim); {
+		switch frameBytes, dependency, err := s.prepareDelta(dtype, shape, logical, causal, lim,
+			TensorStrategyWeightDelta); {
 		case err != nil:
 			out = append(out, skippedTensor(TensorStrategyWeightDelta, err.Error()))
 		case frameBytes == nil:
@@ -1130,6 +1141,50 @@ func (s *Store) prepareTensorCandidates(
 					Dependencies: []model.Hash32{*dependency},
 					Tensor: &model.TensorRepresentation{
 						Mode: 11, Dtype: dtype, Shape: append([]uint64(nil), shape...),
+						LogicalRoot: root, Layout: layout.WCBValue(dtype, shape),
+					},
+				},
+			})
+		}
+	}
+
+	// Mode 16 sparse-delta against the causal parent: the same exact delta as
+	// mode 11, stored as a zero-run stream. The planner keeps mode 11 when its
+	// Huffman planes are smaller (dense deltas) and mode 16 when the run stream
+	// is smaller (sparse deltas).
+	if independentOnly {
+		out = append(out, skippedTensor(TensorStrategySparseDelta,
+			"rebase requires an independent representation"))
+	} else {
+		switch frameBytes, dependency, err := s.prepareDelta(dtype, shape, logical, causal, lim,
+			TensorStrategySparseDelta); {
+		case err != nil:
+			out = append(out, skippedTensor(TensorStrategySparseDelta, err.Error()))
+		case frameBytes == nil:
+			out = append(out, skippedTensor(TensorStrategySparseDelta,
+				"no usable causal parent with the same dtype/shape"))
+		default:
+			physical := uint64(len(frameBytes))
+			estimate := estimatedDecodeNS(TensorStrategySparseDelta, size, options)
+			root, err := logicalRootForBytes(dtype, shape, logical)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, preparedTensorCandidate{
+				candidate: TensorPlanCandidate{
+					Strategy: TensorStrategySparseDelta, Applicable: true,
+					Detail:            "mode 16 against the causal parent",
+					PhysicalBytes:     uint64Ptr(physical),
+					EstimatedDecodeNS: uint64Ptr(estimate),
+					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					Dependency:        dependency,
+				},
+				artifact: &tensorArtifact{
+					Kind: model.RepresentationTensor, StrategyName: TensorStrategySparseDelta.String(),
+					Frame:        frameBytes,
+					Dependencies: []model.Hash32{*dependency},
+					Tensor: &model.TensorRepresentation{
+						Mode: 16, Dtype: dtype, Shape: append([]uint64(nil), shape...),
 						LogicalRoot: root, Layout: layout.WCBValue(dtype, shape),
 					},
 				},
@@ -1262,7 +1317,11 @@ func (s *Store) prepareDelta(
 	logical []byte,
 	causal []model.Hash32,
 	lim limits.Limits,
+	strategy TensorStrategy,
 ) ([]byte, *model.Hash32, error) {
+	if strategy != TensorStrategyWeightDelta && strategy != TensorStrategySparseDelta {
+		return nil, nil, nil
+	}
 	weightName, ok := model.TensorWeightDtype(dtype)
 	if !ok || (dtype != "bf16" && dtype != "f16" && dtype != "f32") {
 		return nil, nil, nil
@@ -1295,7 +1354,14 @@ func (s *Store) prepareDelta(
 	if err != nil {
 		return nil, nil, werr.FromCodec(err)
 	}
-	frameBytes, err := modes.EncodeWeightDelta(context.Background(), logical, weight, shape, baseFrame, lim)
+	var frameBytes []byte
+	if strategy == TensorStrategySparseDelta {
+		frameBytes, err = modes.EncodeSparseDelta(
+			context.Background(), logical, weight, shape, baseFrame, lim)
+	} else {
+		frameBytes, err = modes.EncodeWeightDelta(
+			context.Background(), logical, weight, shape, baseFrame, lim)
+	}
 	if err != nil {
 		return nil, nil, werr.FromCodec(err)
 	}

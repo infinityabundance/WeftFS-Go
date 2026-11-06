@@ -49,6 +49,7 @@ const (
 	CostClassTensorSharded CostClass = "tensor-sharded"
 	CostClassTensorTiled   CostClass = "tensor-tiled"
 	CostClassWeightDelta   CostClass = "weight-delta"
+	CostClassSparseDelta   CostClass = "sparse-delta"
 	CostClassSemanticDelta CostClass = "semantic-delta"
 	CostClassKvCache       CostClass = "kv-cache"
 	CostClassActivation    CostClass = "activation"
@@ -59,7 +60,7 @@ func ParseCostClass(text string) (CostClass, bool) {
 	switch CostClass(text) {
 	case CostClassRaw, CostClassZstd, CostClassFloatTensor,
 		CostClassTensorSharded, CostClassTensorTiled, CostClassWeightDelta,
-		CostClassSemanticDelta, CostClassKvCache, CostClassActivation:
+		CostClassSparseDelta, CostClassSemanticDelta, CostClassKvCache, CostClassActivation:
 		return CostClass(text), true
 	default:
 		return "", false
@@ -82,6 +83,9 @@ var DeclaredCoefficients = map[CostClass]Coefficients{
 	CostClassTensorSharded: {FixedNS: 100_000, NSperMiB: 4_194_304},
 	CostClassTensorTiled:   {FixedNS: 100_000, NSperMiB: 4_194_304},
 	CostClassWeightDelta:   {FixedNS: 100_000, NSperMiB: 3_145_728},
+	// SPARSE_DELTA reuses the WEIGHT_DELTA row (not separately calibrated);
+	// keeps parity with src/cost_model.rs.
+	CostClassSparseDelta:   {FixedNS: 100_000, NSperMiB: 3_145_728},
 	CostClassSemanticDelta: {FixedNS: 150_000, NSperMiB: 3_145_728},
 	CostClassKvCache:       {FixedNS: 100_000, NSperMiB: 1_048_576},
 	CostClassActivation:    {FixedNS: 100_000, NSperMiB: 1_048_576},
@@ -102,6 +106,9 @@ var MeasuredCoefficients = map[CostClass]Coefficients{
 	CostClassTensorSharded: {FixedNS: 16_172, NSperMiB: 9_123_307},
 	CostClassTensorTiled:   {FixedNS: 14_131, NSperMiB: 3_366_772},
 	CostClassWeightDelta:   {FixedNS: 30_725, NSperMiB: 5_293_987},
+	// SPARSE_DELTA reuses the measured WEIGHT_DELTA row (not separately
+	// calibrated); keeps parity with src/cost_model.rs.
+	CostClassSparseDelta:   {FixedNS: 30_725, NSperMiB: 5_293_987},
 	CostClassSemanticDelta: {FixedNS: 31_891, NSperMiB: 6_458_523},
 	CostClassKvCache:       {FixedNS: 100_000, NSperMiB: 1_048_576},
 	CostClassActivation:    {FixedNS: 100_000, NSperMiB: 1_048_576},

@@ -23,7 +23,9 @@ var tensorShape = []uint64{256, 512}
 
 // writeRustTensorStore builds the required Rust-written shape:
 //   - an independent bf16 tensor (planner-chosen raw/zstd),
-//   - a near-duplicate pair whose second member is a mode-11 weight delta,
+//   - a near-duplicate pair whose second member is a mode-16 sparse delta
+//     (the planner's choice for a 1,000-word change),
+//   - the same pair forced to mode-11 weight delta,
 //   - an incompressible bf16 tensor (raw).
 func writeRustTensorStore(t *testing.T, bin, dir, payloadDir string) map[string][]byte {
 	t.Helper()
@@ -50,13 +52,16 @@ func writeRustTensorStore(t *testing.T, bin, dir, payloadDir string) map[string]
 		t.Fatalf("rust stat /pair-base.bin returned no version_id: %+v", stat)
 	}
 	writeTensor("/pair-derived.bin", derived, "--causal", versionID)
+	writeTensor("/pair-derived-weight.bin", derived, "--causal", versionID,
+		"--strategy", "weight-delta")
 	writeTensor("/incompressible.bin", incompressible)
 
 	return map[string][]byte{
-		"/independent.bin":    independent,
-		"/pair-base.bin":      base,
-		"/pair-derived.bin":   derived,
-		"/incompressible.bin": incompressible,
+		"/independent.bin":         independent,
+		"/pair-base.bin":           base,
+		"/pair-derived.bin":        derived,
+		"/pair-derived-weight.bin": derived,
+		"/incompressible.bin":      incompressible,
 	}
 }
 
@@ -93,6 +98,14 @@ func writeGoTensorStore(t *testing.T, dir string) (map[string][]byte, *store.Sto
 	if err != nil {
 		t.Fatalf("go write pair derived: %v", err)
 	}
+	if _, err := s.WriteTensorFileWithSpec(model.RootID, []byte("pair-derived-weight.bin"), "bf16",
+		tensorShape, derived, store.RowMajorTensorLayout(),
+		store.TensorWriteSpec{
+			Causal:       []model.Hash32{baseRecord.Version},
+			StrategyHint: strategyPtr(store.TensorStrategyWeightDelta),
+		}); err != nil {
+		t.Fatalf("go write mode-11 pair derived: %v", err)
+	}
 	if _, err := s.WriteTensorFile(model.RootID, []byte("incompressible.bin"), "bf16", tensorShape,
 		incompressible, store.RowMajorTensorLayout(), nil); err != nil {
 		t.Fatalf("go write incompressible: %v", err)
@@ -103,19 +116,25 @@ func writeGoTensorStore(t *testing.T, dir string) (map[string][]byte, *store.Sto
 	}
 	rep := tensorRepresentation(t, dir, s, "/pair-derived.bin")
 	if rep == nil || rep.Kind != model.RepresentationTensor || rep.Tensor == nil ||
-		rep.Tensor.Mode != 11 || rep.Strategy != model.StrategyWeightDelta {
-		t.Fatalf("go derived representation = %+v, want mode 11 weight-delta", rep)
+		rep.Tensor.Mode != 16 || rep.Strategy != model.StrategySparseDelta {
+		t.Fatalf("go derived representation = %+v, want mode 16 sparse-delta", rep)
+	}
+	weightRep := tensorRepresentation(t, dir, s, "/pair-derived-weight.bin")
+	if weightRep == nil || weightRep.Tensor == nil || weightRep.Tensor.Mode != 11 ||
+		weightRep.Strategy != model.StrategyWeightDelta {
+		t.Fatalf("go forced representation = %+v, want mode 11 weight-delta", weightRep)
 	}
 	report, err := s.Verify(true)
 	if err != nil || !report.OK {
 		t.Fatalf("go verify: %v, problems=%+v", err, report.Problems)
 	}
 	return map[string][]byte{
-		"/independent.bin":    independent,
-		"/pair-base.bin":      base,
-		"/pair-derived.bin":   derived,
-		"/incompressible.bin": incompressible,
-		"/quantized.bin":      quantized,
+		"/independent.bin":         independent,
+		"/pair-base.bin":           base,
+		"/pair-derived.bin":        derived,
+		"/pair-derived-weight.bin": derived,
+		"/incompressible.bin":      incompressible,
+		"/quantized.bin":           quantized,
 	}, s, derivedID
 }
 
@@ -181,11 +200,17 @@ func TestTensorHandoffRustThenGo(t *testing.T) {
 		}
 	}
 
-	// The near-duplicate must be an exact-mode weight delta with one dependency.
+	// The planner-chosen member is an exact mode-16 sparse delta with one
+	// dependency; the forced member is mode 11.
 	rep := tensorRepresentation(t, dir, s, "/pair-derived.bin")
-	if rep == nil || rep.Tensor == nil || rep.Tensor.Mode != 11 ||
-		rep.Strategy != model.StrategyWeightDelta || len(rep.Dependencies) != 1 {
+	if rep == nil || rep.Tensor == nil || rep.Tensor.Mode != 16 ||
+		rep.Strategy != model.StrategySparseDelta || len(rep.Dependencies) != 1 {
 		t.Fatalf("rust pair-derived representation = %+v", rep)
+	}
+	weightRep := tensorRepresentation(t, dir, s, "/pair-derived-weight.bin")
+	if weightRep == nil || weightRep.Tensor == nil || weightRep.Tensor.Mode != 11 ||
+		weightRep.Strategy != model.StrategyWeightDelta || len(weightRep.Dependencies) != 1 {
+		t.Fatalf("rust forced representation = %+v", weightRep)
 	}
 
 	// Region reads are exact (rows 10..12 of 256x512 bf16).
@@ -244,8 +269,8 @@ func TestTensorRetentionRustWrittenGoGC(t *testing.T) {
 	}
 	defer writer.Close()
 	rep := tensorRepresentation(t, dir, writer, "/pair-derived.bin")
-	if rep == nil || rep.Tensor == nil || rep.Tensor.Mode != 11 || len(rep.Dependencies) != 1 {
-		t.Fatalf("rust pair-derived is not a mode-11 delta: %+v", rep)
+	if rep == nil || rep.Tensor == nil || rep.Tensor.Mode != 16 || len(rep.Dependencies) != 1 {
+		t.Fatalf("rust pair-derived is not a mode-16 delta: %+v", rep)
 	}
 	dependency := rep.Dependencies[0]
 	root, _ := writer.ResolvePath("/")

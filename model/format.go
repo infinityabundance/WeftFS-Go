@@ -127,6 +127,7 @@ const (
 	StrategyTensorSharded = "tensor-sharded"
 	StrategyFloatTensor   = "float-tensor"
 	StrategyWeightDelta   = "weight-delta"
+	StrategySparseDelta   = "sparse-delta"
 	StrategyKvCache       = "kv-cache"
 	StrategyActivation    = "activation"
 	StrategySemanticDelta = "semantic-delta"

@@ -73,9 +73,11 @@ func readTensorRange(
 	case 10:
 		logical, err = decodeTensorMode10(parsed, rep, manifest, lim)
 	case 11:
-		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, false, lim)
+		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaWeight, lim)
 	case 14:
-		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, true, lim)
+		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaSemantic, lim)
+	case 16:
+		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaSparse, lim)
 	case 12:
 		logical, err = decodeTensorKvPage(parsed, rep, lim)
 	case 13:
@@ -107,6 +109,16 @@ func readTensorRange(
 	return out, nil
 }
 
+// deltaKind selects which exact word-wise delta decoder a kind:"tensor"
+// manifest names.
+type deltaKind int
+
+const (
+	deltaWeight deltaKind = iota
+	deltaSemantic
+	deltaSparse
+)
+
 func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 	switch mode {
 	case 9:
@@ -121,6 +133,8 @@ func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 		return frame.ModeActivationStream, true
 	case 14:
 		return frame.ModeSemanticDelta, true
+	case 16:
+		return frame.ModeSparseDelta, true
 	default:
 		return 0, false
 	}
@@ -232,13 +246,14 @@ func decodeTensorDelta(
 	rep *model.Representation,
 	depth int,
 	seen []model.Hash32,
-	semantic bool,
+	kind deltaKind,
 	lim limits.Limits,
 ) ([]byte, error) {
 	var descriptorDtype string
 	var descriptorShape []uint64
 	var baseHash model.Hash32
-	if semantic {
+	switch kind {
+	case deltaSemantic:
 		meta, err := modes.SemanticDeltaMetadata(parsed, lim)
 		if err != nil {
 			return nil, werr.FromCodec(err)
@@ -249,7 +264,18 @@ func decodeTensorDelta(
 				"unknown weight-dtype `%s`", meta.Dtype.Name)
 		}
 		descriptorDtype, descriptorShape, baseHash = dtype, meta.Shape, meta.Base
-	} else {
+	case deltaSparse:
+		meta, err := modes.SparseDeltaMetadata(parsed, lim)
+		if err != nil {
+			return nil, werr.FromCodec(err)
+		}
+		dtype, ok := model.TensorDtypeFromWeightName(meta.Dtype.Name)
+		if !ok {
+			return nil, werr.Newf(werr.Malformed,
+				"unknown weight-dtype `%s`", meta.Dtype.Name)
+		}
+		descriptorDtype, descriptorShape, baseHash = dtype, meta.Shape, meta.Base
+	default:
 		meta, err := modes.WeightDeltaMetadata(parsed, lim)
 		if err != nil {
 			return nil, werr.FromCodec(err)
@@ -315,10 +341,14 @@ func decodeTensorDelta(
 		return nil, werr.FromCodec(err)
 	}
 	var logical []byte
-	if semantic {
+	switch kind {
+	case deltaSemantic:
 		logical, err = modes.DecodeSemanticDeltaFrameWithBase(
 			context.Background(), parsed, baseFrame, dependency.NewMapResolver(), lim)
-	} else {
+	case deltaSparse:
+		logical, err = modes.DecodeSparseDeltaFrameWithBase(
+			context.Background(), parsed, baseFrame, dependency.NewMapResolver(), lim)
+	default:
 		logical, err = modes.DecodeWeightDeltaFrameWithBase(
 			context.Background(), parsed, baseFrame, dependency.NewMapResolver(), lim)
 	}
