@@ -121,6 +121,18 @@ func (s TensorStrategy) usesDependency() bool {
 		s == TensorStrategySemanticDelta
 }
 
+// IsIndependent reports whether the representation decodes without another
+// object. Rebase requires one of these; a delta is what rebase removes.
+func (s TensorStrategy) IsIndependent() bool {
+	switch s {
+	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
+		TensorStrategySharded:
+		return true
+	default:
+		return false
+	}
+}
+
 func tensorStrategyRank(s TensorStrategy) int {
 	switch s {
 	case TensorStrategyRaw:
