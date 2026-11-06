@@ -244,7 +244,7 @@ func (s *Store) storeCausalClosure(closure *weftcontext.CausalClosure) error {
 	if err != nil {
 		return werr.FromCodec(err)
 	}
-	if _, err := ReadBlobVerified(s.root, BlobManifest, id, hash.DomainCausal); err == nil {
+	if _, err := readBlobVerified(s.blobs, BlobManifest, id, hash.DomainCausal); err == nil {
 		return nil
 	}
 	_, err = s.storeBlob(BlobManifest, hash.DomainCausal, bytesValue)

@@ -101,7 +101,7 @@ func (e overlayEdit) apply(chunkStart, chunkEnd uint64, dst []byte) error {
 // canonicalChunkTable returns the canonical chunk table of a manifest the
 // writer may build on: a v3 chunk table or a resolved v4 overlay chain. A
 // frame-backed representation is refused; there is no table to extend.
-func canonicalChunkTable(root string, manifestID model.Hash32, manifest model.Manifest) ([]model.ChunkRef, error) {
+func canonicalChunkTable(src blobSource, manifestID model.Hash32, manifest model.Manifest) ([]model.ChunkRef, error) {
 	rep := manifest.Representation
 	if rep == nil || rep.Kind == model.RepresentationRaw {
 		if manifest.Identity != model.ContentIdentityMerkleV1 {
@@ -121,7 +121,7 @@ func canonicalChunkTable(root string, manifestID model.Hash32, manifest model.Ma
 			return nil, werr.Newf(werr.Corrupt, "overlay representation is missing its overlay map")
 		}
 		seen := make(map[model.Hash32]struct{})
-		return overlayChunkTable(root, manifestID, manifest, rep.Overlay, 0, seen)
+		return overlayChunkTable(src, manifestID, manifest, rep.Overlay, 0, seen)
 	}
 	return nil, werr.Newf(werr.InvalidArgument,
 		"overlay writes require a chunk-table base, not a frame-backed representation")
@@ -227,7 +227,7 @@ func (s *Store) writeFileOverlay(
 		return WriteOutcome{}, werr.Newf(werr.LimitExceeded,
 			"file exceeds the %d-byte v1 bound", MaxFileBytes)
 	}
-	oldTable, err := canonicalChunkTable(s.root, old.Content, oldManifest)
+	oldTable, err := canonicalChunkTable(s.blobs, old.Content, oldManifest)
 	if err != nil {
 		return WriteOutcome{}, err
 	}
@@ -406,7 +406,7 @@ func (s *Store) writeFileOverlay(
 				keep = oldRef.Len
 			}
 			if keep > 0 {
-				stored, err := ReadBlobVerified(s.root, BlobObject, oldRef.Hash, model.DomainChunk)
+				stored, err := readBlobVerified(s.blobs, BlobObject, oldRef.Hash, model.DomainChunk)
 				if err != nil {
 					return WriteOutcome{}, err
 				}
@@ -503,7 +503,7 @@ func (s *Store) writeFileOverlay(
 	if baseID == old.Content {
 		baseManifest = oldManifest
 	} else {
-		baseManifest, err = ReadManifest(s.root, baseID)
+		baseManifest, err = readManifest(s.blobs, baseID)
 		if err != nil {
 			return WriteOutcome{}, err
 		}
@@ -513,7 +513,7 @@ func (s *Store) writeFileOverlay(
 			"overlay base disagrees with the previous version's declared base")
 	}
 	if baseID != old.Content {
-		baseTable, err = canonicalChunkTable(s.root, baseID, baseManifest)
+		baseTable, err = canonicalChunkTable(s.blobs, baseID, baseManifest)
 		if err != nil {
 			return WriteOutcome{}, err
 		}
@@ -604,7 +604,7 @@ func (s *Store) Compact(id model.Hash32) (CompactReport, error) {
 	if old.Kind != model.KindFile {
 		return CompactReport{}, werr.Newf(werr.InvalidArgument, "compact requires a file object")
 	}
-	oldManifest, err := ReadManifest(s.root, old.Content)
+	oldManifest, err := readManifest(s.blobs, old.Content)
 	if err != nil {
 		return CompactReport{}, err
 	}
@@ -617,7 +617,7 @@ func (s *Store) Compact(id model.Hash32) (CompactReport, error) {
 			"compact requires an overlay-represented object")
 	}
 	overlay := oldManifest.Representation.Overlay
-	table, err := canonicalChunkTable(s.root, old.Content, oldManifest)
+	table, err := canonicalChunkTable(s.blobs, old.Content, oldManifest)
 	if err != nil {
 		return CompactReport{}, err
 	}
@@ -627,7 +627,7 @@ func (s *Store) Compact(id model.Hash32) (CompactReport, error) {
 	}
 	var verifiedBytes uint64
 	for index, chunk := range table {
-		bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)
+		bytesValue, err := readBlobVerified(s.blobs, BlobObject, chunk.Hash, model.DomainChunk)
 		if err != nil {
 			return CompactReport{}, err
 		}

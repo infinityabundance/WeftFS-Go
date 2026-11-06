@@ -86,12 +86,24 @@ var (
 	// invocation. They install (or replace) the persisted policy on a writable
 	// open; an empty slice enforces the persisted policy unchanged.
 	quotaBudgets []store.QuotaBudget
+	// Plane routing. The defaults are the historical single local backend:
+	// blobs and control state on the store root.
+	blobBackend   = store.PlaneLocal
+	commitBackend = store.PlaneLocal
+	blobRoot      string
 )
+
+func applyPlanePolicy(opts *store.Options) {
+	opts.BlobBackend = blobBackend
+	opts.CommitBackend = commitBackend
+	opts.BlobRoot = blobRoot
+}
 
 func applyRepresentationPolicy(opts *store.Options) {
 	opts.Representation = representationMode
 	opts.CodecMinBytes = codecMinBytes
 	opts.ContentIdentity = contentIdentityMode
+	applyPlanePolicy(opts)
 }
 
 func readQuotaFile(path string) ([]store.QuotaBudget, error) {
@@ -204,6 +216,46 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			quotaBudgets = append(quotaBudgets, budgets...)
+		case args[i] == "--blob-backend" || args[i] == "-blob-backend":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--blob-backend requires a value")
+			}
+			kind, parseErr := store.ParsePlaneKind(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			blobBackend = kind
+			i++
+		case strings.HasPrefix(args[i], "--blob-backend="):
+			kind, parseErr := store.ParsePlaneKind(strings.TrimPrefix(args[i], "--blob-backend="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			blobBackend = kind
+		case args[i] == "--commit-backend" || args[i] == "-commit-backend":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--commit-backend requires a value")
+			}
+			kind, parseErr := store.ParsePlaneKind(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			commitBackend = kind
+			i++
+		case strings.HasPrefix(args[i], "--commit-backend="):
+			kind, parseErr := store.ParsePlaneKind(strings.TrimPrefix(args[i], "--commit-backend="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			commitBackend = kind
+		case args[i] == "--blob-root" || args[i] == "-blob-root":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--blob-root requires a directory")
+			}
+			blobRoot = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--blob-root="):
+			blobRoot = strings.TrimPrefix(args[i], "--blob-root=")
 		case args[i] == "--fixed-timestamp-ns" || args[i] == "-fixed-timestamp-ns":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--fixed-timestamp-ns requires a value")
@@ -387,12 +439,15 @@ func cmdInfo(storeDir string, jsonOut bool) error {
 			"codec_min_bytes":      codecMinBytes,
 			"rejected_generations": s.RejectedGenerations(),
 			"recovery_notes":       s.RecoveryNotes(),
+			"planes":               s.Planes(),
 		})
 	}
 	fmt.Printf("format=weftfs-store 1\ngeneration=%d\nsnapshot_root=%s\n", s.Generation(), s.Head().Hex())
 	fmt.Printf("objects=%d\nentries=%d\nrelations=%d\nsnapshots=%d\n",
 		len(state.Objects), len(state.Entries), len(state.Relations), len(state.Snapshots))
 	fmt.Printf("representation=%s\ncontent_identity=%s\ncodec_min_bytes=%d\n", representationMode.AsString(), store.ContentIdentityString(contentIdentityMode), codecMinBytes)
+	planes := s.Planes()
+	fmt.Printf("blob_backend=%s\ncommit_backend=%s\nblob_root=%s\ncommit_root=%s\n", planes.Blobs.Backend, planes.Commits.Backend, planes.BlobRoot, planes.CommitRoot)
 	for _, generation := range s.RejectedGenerations() {
 		fmt.Printf("rejected_generation=%d\n", generation)
 	}

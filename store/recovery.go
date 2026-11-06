@@ -2,6 +2,7 @@ package store
 
 import (
 	"os"
+	"path/filepath"
 	"sort"
 	"sync/atomic"
 
@@ -43,33 +44,96 @@ const (
 	// BlobManifest is manifests/<ab>/<hash>, including checkpoint state
 	// manifests.
 	BlobManifest
+	// BlobIndex is indexes/<ab>/<commit>.idx (advisory, rebuildable).
+	BlobIndex
+	// BlobPack is packs/<ab>/<hash>: a physical pack of small blobs.
+	BlobPack
+	// BlobPackCatalog is pack-catalog/<ab>/<hash>: an immutable catalog
+	// segment naming pack members.
+	BlobPackCatalog
 )
 
-// BlobPath returns the path for a blob.
+// PackReclaim reports physical pack reclamation after a deletion pass.
+type PackReclaim struct {
+	DeletedPacks           uint64 `json:"deleted_packs"`
+	DeletedPackBytes       uint64 `json:"deleted_pack_bytes"`
+	DeletedCatalogSegments uint64 `json:"deleted_catalog_segments"`
+	LivePacks              uint64 `json:"live_packs"`
+	LiveMembers            uint64 `json:"live_members"`
+}
+
+// BlobPath returns the path for a blob under a flat store root.
 func BlobPath(root string, kind BlobKind, id model.Hash32) string {
-	if kind == BlobObject {
+	switch kind {
+	case BlobObject:
+		return ObjectPath(root, id)
+	case BlobManifest:
+		return ManifestPath(root, id)
+	case BlobIndex:
+		hexID := id.Hex()
+		return filepath.Join(root, "indexes", hexID[:2], hexID+".idx")
+	case BlobPack:
+		hexID := id.Hex()
+		return filepath.Join(root, "packs", hexID[:2], hexID)
+	case BlobPackCatalog:
+		hexID := id.Hex()
+		return filepath.Join(root, "pack-catalog", hexID[:2], hexID)
+	default:
 		return ObjectPath(root, id)
 	}
-	return ManifestPath(root, id)
+}
+
+// blobSource is the minimal immutable-byte access every reader needs. A flat
+// local root and a packed plane both implement it, so no reader can bypass
+// packing and no reader depends on a physical path.
+type blobSource interface {
+	Get(kind BlobKind, id model.Hash32) ([]byte, error)
+	GetRange(kind BlobKind, id model.Hash32, offset, length uint64) ([]byte, error)
+	Length(kind BlobKind, id model.Hash32) (uint64, error)
+	Exists(kind BlobKind, id model.Hash32) (bool, error)
+}
+
+// flatSource adapts a bare store root to blobSource. It is used by the
+// exported single-root helpers and by tests; it never packs.
+func flatSource(root string) BlobAccess {
+	plane, err := newFlatBlobPlane(root, PlaneLocal)
+	if err != nil {
+		// PlaneLocal is always constructible.
+		panic(err)
+	}
+	return plane
 }
 
 // ReadBlobVerified reads a blob and verifies its domain-separated hash.
 func ReadBlobVerified(root string, kind BlobKind, id model.Hash32, domain string) ([]byte, error) {
-	path := BlobPath(root, kind, id)
-	b, err := os.ReadFile(path)
+	return readBlobVerified(flatSource(root), kind, id, domain)
+}
+
+// readBlobVerified is the plane-routed verified read. A missing blob is
+// Corrupt (the store's failing-closed contract); a transport error keeps its
+// Io class.
+func readBlobVerified(src blobSource, kind BlobKind, id model.Hash32, domain string) ([]byte, error) {
+	b, err := src.Get(kind, id)
 	if err != nil {
-		return nil, werr.Wrap(werr.Corrupt, err, "missing blob %s", path)
+		if typed, ok := err.(*werr.Error); ok && typed.Kind == werr.NotFound {
+			return nil, werr.Newf(werr.Corrupt, "missing blob %s: %s", blobRelPath(kind, id), typed.Error())
+		}
+		return nil, err
 	}
 	actual := hash.Domain(domain, b)
 	if actual != id {
-		return nil, werr.Newf(werr.Corrupt, "blob %s fails its hash check (expected %s, got %s)", path, id.Hex(), actual.Hex())
+		return nil, werr.Newf(werr.Corrupt, "blob %s fails its hash check (expected %s, got %s)", blobRelPath(kind, id), id.Hex(), actual.Hex())
 	}
 	return b, nil
 }
 
 // ReadManifest reads a file manifest by its manifest id.
 func ReadManifest(root string, manifestID model.Hash32) (model.Manifest, error) {
-	b, err := ReadBlobVerified(root, BlobManifest, manifestID, model.DomainManifest)
+	return readManifest(flatSource(root), manifestID)
+}
+
+func readManifest(src blobSource, manifestID model.Hash32) (model.Manifest, error) {
+	b, err := readBlobVerified(src, BlobManifest, manifestID, model.DomainManifest)
 	if err != nil {
 		return model.Manifest{}, err
 	}
@@ -91,7 +155,11 @@ func ReadManifest(root string, manifestID model.Hash32) (model.Manifest, error) 
 
 // ReadStateManifest reads and verifies a checkpoint state manifest.
 func ReadStateManifest(root string, manifestID model.Hash32) (*model.State, error) {
-	b, err := ReadBlobVerified(root, BlobManifest, manifestID, model.DomainManifest)
+	return readStateManifest(flatSource(root), manifestID)
+}
+
+func readStateManifest(src blobSource, manifestID model.Hash32) (*model.State, error) {
+	b, err := readBlobVerified(src, BlobManifest, manifestID, model.DomainManifest)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +196,10 @@ func CommitIndex(root string, maxGeneration uint64) (map[model.Hash32]LoadedComm
 // When checkCatalog is true, every file object's manifest and chunk files are
 // checked for existence, hash, and length.
 func LoadStateAt(root string, headHash model.Hash32, maxGeneration uint64, checkCatalog bool) (*model.State, []string, error) {
+	return loadStateAt(flatSource(root), root, headHash, maxGeneration, checkCatalog)
+}
+
+func loadStateAt(src blobSource, root string, headHash model.Hash32, maxGeneration uint64, checkCatalog bool) (*model.State, []string, error) {
 	index, err := CommitIndex(root, maxGeneration)
 	if err != nil {
 		return nil, nil, err
@@ -176,7 +248,7 @@ func LoadStateAt(root string, headHash model.Hash32, maxGeneration uint64, check
 	state := model.NewState()
 	for _, loaded := range chain {
 		if loaded.Commit.Checkpoint != nil {
-			checkpointState, err := ReadStateManifest(root, *loaded.Commit.Checkpoint)
+			checkpointState, err := readStateManifest(src, *loaded.Commit.Checkpoint)
 			if err != nil {
 				notes = append(notes, "checkpoint "+loaded.Commit.Checkpoint.Hex()+" in generation "+
 					itoa(loaded.Generation)+" is invalid ("+err.Error()+"); replayed ops instead")
@@ -195,7 +267,7 @@ func LoadStateAt(root string, headHash model.Hash32, maxGeneration uint64, check
 	}
 
 	if checkCatalog {
-		if err := ValidateCatalog(root, state); err != nil {
+		if err := validateCatalog(src, root, state); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -206,6 +278,10 @@ func LoadStateAt(root string, headHash model.Hash32, maxGeneration uint64, check
 // existence: entry parents/targets, tip objects, manifest identity, and chunk
 // existence/length. Chunk bytes are verified by materialization and --full.
 func ValidateCatalog(root string, state *model.State) error {
+	return validateCatalog(flatSource(root), root, state)
+}
+
+func validateCatalog(src blobSource, _ string, state *model.State) error {
 	rootObject, ok := state.Objects[model.RootID]
 	if !ok {
 		return werr.Newf(werr.Corrupt, "namespace root object is missing")
@@ -234,7 +310,7 @@ func ValidateCatalog(root string, state *model.State) error {
 		if record.Kind != model.KindFile {
 			continue
 		}
-		manifest, err := ReadManifest(root, record.Content)
+		manifest, err := readManifest(src, record.Content)
 		if err != nil {
 			return err
 		}
@@ -242,13 +318,15 @@ func ValidateCatalog(root string, state *model.State) error {
 			return werr.Newf(werr.Corrupt, "object %s size %d disagrees with manifest size %d", record.ID.Hex(), record.Size, manifest.Size)
 		}
 		for _, chunk := range manifest.Chunks {
-			path := ObjectPath(root, chunk.Hash)
-			info, err := os.Stat(path)
+			length, err := src.Length(BlobObject, chunk.Hash)
 			if err != nil {
-				return werr.Wrap(werr.Corrupt, err, "missing chunk %s", path)
+				if typed, ok := err.(*werr.Error); ok && typed.Kind == werr.NotFound {
+					return werr.Newf(werr.Corrupt, "missing chunk %s", chunk.Hash.Hex())
+				}
+				return err
 			}
-			if uint64(info.Size()) != chunk.Len {
-				return werr.Newf(werr.Corrupt, "chunk %s is %d bytes, manifest says %d", path, info.Size(), chunk.Len)
+			if length != chunk.Len {
+				return werr.Newf(werr.Corrupt, "chunk %s is %d bytes, manifest says %d", chunk.Hash.Hex(), length, chunk.Len)
 			}
 		}
 	}
@@ -274,24 +352,24 @@ type Recovery struct {
 // generation-addressed bounded replay. It never invents data and never deletes
 // rejected generations.
 func Recover(root string) (*Recovery, error) {
-	return recoverWithStrategy(root, replayBounded, true)
+	return recoverWithStrategy(root, flatSource(root), replayBounded, true)
 }
 
 // recoverForWrite is the writable-open path. It needs one commit-directory
 // enumeration so next_generation never reuses a rejected generation; the commit
 // decode window is still bounded by the checkpoint interval.
-func recoverForWrite(root string) (*Recovery, error) {
-	return recoverWithStrategy(root, replayBounded, false)
+func recoverForWrite(root string, src blobSource) (*Recovery, error) {
+	return recoverWithStrategy(root, src, replayBounded, false)
 }
 
 // recoverFullScan is the original full commit-directory recovery. It stays
 // authoritative for its rejected set and notes, and is the fallback for every
 // bounded-replay inconsistency.
-func recoverFullScan(root string) (*Recovery, error) {
-	return recoverWithStrategy(root, replayFullScan, false)
+func recoverFullScan(root string, src blobSource) (*Recovery, error) {
+	return recoverWithStrategy(root, src, replayFullScan, false)
 }
 
-func recoverWithStrategy(root string, strategy replayStrategy, allowDirectoryFree bool) (*Recovery, error) {
+func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, allowDirectoryFree bool) (*Recovery, error) {
 	view, err := ReadSuperblock(root)
 	if err != nil {
 		return nil, err
@@ -314,14 +392,14 @@ func recoverWithStrategy(root string, strategy replayStrategy, allowDirectoryFre
 	}
 
 	if allowDirectoryFree && strategy == replayBounded {
-		recovery, err := recoverDirectoryFree(root, view, validSlots, maxVisible, slotByGen)
+		recovery, err := recoverDirectoryFree(root, src, view, validSlots, maxVisible, slotByGen)
 		if err == nil {
 			return recovery, nil
 		}
 		// Do not reuse anything from the fast attempt: the scan-based recovery
 		// is authoritative, including its rejected set and notes. Record that
 		// the fallback happened.
-		recovery, fallbackErr := recoverWithStrategy(root, replayBounded, false)
+		recovery, fallbackErr := recoverWithStrategy(root, src, replayBounded, false)
 		if fallbackErr != nil {
 			return nil, fallbackErr
 		}
@@ -380,13 +458,13 @@ func recoverWithStrategy(root string, strategy replayStrategy, allowDirectoryFre
 		var state *model.State
 		var loadNotes []string
 		if strategy == replayBounded {
-			state, loadNotes, err = loadStateBounded(root, loaded.Hash, loaded.Generation, maxVisible)
+			state, loadNotes, err = loadStateBounded(root, src, loaded.Hash, loaded.Generation, maxVisible)
 			if err != nil {
 				notes = append(notes, "generation "+itoa(generation)+": bounded replay fell back to full scan: "+err.Error())
-				state, loadNotes, err = LoadStateAt(root, loaded.Hash, maxVisible, true)
+				state, loadNotes, err = loadStateAt(src, root, loaded.Hash, maxVisible, true)
 			}
 		} else {
-			state, loadNotes, err = LoadStateAt(root, loaded.Hash, maxVisible, true)
+			state, loadNotes, err = loadStateAt(src, root, loaded.Hash, maxVisible, true)
 		}
 		if err != nil {
 			notes = append(notes, "generation "+itoa(generation)+" rejected: "+err.Error())
@@ -407,7 +485,7 @@ func recoverWithStrategy(root string, strategy replayStrategy, allowDirectoryFre
 // must be the head, its commit file must exist and match the slot hash and
 // length, and the bounded chain replay must complete. Anything else returns an
 // error so the caller can fall back to the full directory scan.
-func recoverDirectoryFree(root string, view SuperblockView, validSlots []SuperblockSlot, maxVisible uint64, slotByGen map[uint64]SuperblockSlot) (*Recovery, error) {
+func recoverDirectoryFree(root string, src blobSource, view SuperblockView, validSlots []SuperblockSlot, maxVisible uint64, slotByGen map[uint64]SuperblockSlot) (*Recovery, error) {
 	// The scan-based path records a rejection for every published slot whose
 	// commit file is missing. Reproducing that note without enumerating is not
 	// possible, so fall back when it happens.
@@ -436,7 +514,7 @@ func recoverDirectoryFree(root string, view SuperblockView, validSlots []Superbl
 		}
 	}
 
-	state, loadNotes, err := loadStateBounded(root, loaded.Hash, loaded.Generation, maxVisible)
+	state, loadNotes, err := loadStateBounded(root, src, loaded.Hash, loaded.Generation, maxVisible)
 	if err != nil {
 		return nil, err
 	}
@@ -471,7 +549,7 @@ func recoverDirectoryFree(root string, view SuperblockView, validSlots []Superbl
 // back to LoadStateAt; this function never accepts a shorter or partial chain
 // as a substitute. The walk is bounded by headGeneration steps and by
 // maxGeneration, so a hostile chain cannot force unbounded work.
-func loadStateBounded(root string, headHash model.Hash32, headGeneration, maxGeneration uint64) (*model.State, []string, error) {
+func loadStateBounded(root string, src blobSource, headHash model.Hash32, headGeneration, maxGeneration uint64) (*model.State, []string, error) {
 	if headGeneration == 0 {
 		return nil, nil, werr.Newf(werr.Corrupt, "bounded replay requires a non-zero head generation")
 	}
@@ -512,7 +590,7 @@ func loadStateBounded(root string, headHash model.Hash32, headGeneration, maxGen
 		if loaded.Commit.Checkpoint != nil {
 			// A checkpoint that cannot be verified is not silently ignored
 			// here: the caller replays through the full path instead.
-			state, err := ReadStateManifest(root, *loaded.Commit.Checkpoint)
+			state, err := readStateManifest(src, *loaded.Commit.Checkpoint)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -580,7 +658,7 @@ func loadStateBounded(root string, headHash model.Hash32, headGeneration, maxGen
 		state.Generation = loaded.Generation
 	}
 
-	if err := ValidateCatalog(root, state); err != nil {
+	if err := validateCatalog(src, root, state); err != nil {
 		return nil, nil, err
 	}
 	// Honest recovery note: a bounded open does not enumerate commit files below
@@ -626,7 +704,11 @@ func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
 // manifests read through the chunk path; v2 `kind:"codec"` manifests decode
 // the named frame.
 func ReadRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
-	return readManifestRange(root, nil, manifest, offset, length, verifyWhole)
+	return readRange(flatSource(root), manifest, offset, length, verifyWhole)
+}
+
+func readRange(src blobSource, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
+	return readManifestRange(src, nil, manifest, offset, length, verifyWhole)
 }
 
 // itoa formats a generation for recovery notes.

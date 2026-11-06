@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/infinityabundance/WeftFS-Go/model"
@@ -303,5 +304,86 @@ func TestOverlayCompactCLIReportsUnchangedRoot(t *testing.T) {
 	}
 	if after.ContentHash != before.ContentHash {
 		t.Fatalf("compact changed the content root")
+	}
+}
+
+func resetPlanePolicy(t *testing.T) {
+	t.Helper()
+	previousBlob := blobBackend
+	previousCommit := commitBackend
+	previousRoot := blobRoot
+	t.Cleanup(func() {
+		blobBackend = previousBlob
+		commitBackend = previousCommit
+		blobRoot = previousRoot
+	})
+}
+
+func TestGlobalsPlanePolicy(t *testing.T) {
+	resetPlanePolicy(t)
+	blobBackend = store.PlaneLocal
+	commitBackend = store.PlaneLocal
+	blobRoot = ""
+	rest, dir, _, err := globals([]string{
+		"--store", "/tmp/store",
+		"--blob-backend", "object",
+		"--commit-backend=local",
+		"--blob-root", "/tmp/blobs",
+		"info",
+	})
+	if err != nil {
+		t.Fatalf("globals: %v", err)
+	}
+	if dir != "/tmp/store" || len(rest) != 1 || rest[0] != "info" {
+		t.Fatalf("rest=%v dir=%s", rest, dir)
+	}
+	if blobBackend != store.PlaneObject || commitBackend != store.PlaneLocal || blobRoot != "/tmp/blobs" {
+		t.Fatalf("plane policy not applied: %s/%s/%s", blobBackend, commitBackend, blobRoot)
+	}
+	opts := store.DefaultOptions()
+	applyPlanePolicy(&opts)
+	if opts.BlobBackend != store.PlaneObject || opts.CommitBackend != store.PlaneLocal || opts.BlobRoot != "/tmp/blobs" {
+		t.Fatalf("options not routed: %+v", opts)
+	}
+	if _, _, _, err := globals([]string{"--blob-backend", "bogus", "info"}); err == nil {
+		t.Fatal("invalid --blob-backend was accepted")
+	}
+}
+
+func TestSplitCLIInfoReportsPlanes(t *testing.T) {
+	resetPlanePolicy(t)
+	dir := t.TempDir()
+	blobDir := filepath.Join(t.TempDir(), "blobs")
+	opts := store.DefaultOptions()
+	opts.BlobBackend = store.PlaneObject
+	opts.CommitBackend = store.PlaneLocal
+	opts.BlobRoot = blobDir
+	s, err := store.Init(dir, opts)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	s.Close()
+
+	blobBackend = store.PlaneObject
+	commitBackend = store.PlaneLocal
+	blobRoot = blobDir
+	output := captureStdout(t, func() error {
+		return run("info", nil, dir, true)
+	})
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("info JSON: %v\n%s", err, output)
+	}
+	planes, ok := parsed["planes"].(map[string]any)
+	if !ok {
+		t.Fatalf("info JSON has no planes: %s", output)
+	}
+	blobs, _ := planes["blobs"].(map[string]any)
+	commits, _ := planes["commits"].(map[string]any)
+	if blobs["backend"] != "object" || commits["backend"] != "local" {
+		t.Fatalf("planes report = %v", planes)
+	}
+	if planes["blob_root"] != blobDir || planes["commit_root"] != dir {
+		t.Fatalf("plane roots = %v/%v", planes["blob_root"], planes["commit_root"])
 	}
 }

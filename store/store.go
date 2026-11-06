@@ -108,6 +108,17 @@ type Options struct {
 	// MaxOverlayBytes bounds the total logical bytes carried by an overlay
 	// chain. Zero selects DefaultMaxOverlayBytes.
 	MaxOverlayBytes uint64
+	// BlobBackend selects the immutable blob plane (`local`, `object`, or
+	// `posix`). The empty value is `local` (and `object` when the commit plane
+	// is `object`, so a single `--backend object` store stays unchanged).
+	BlobBackend PlaneKind
+	// CommitBackend selects the versioned control plane. The empty value is
+	// `local`.
+	CommitBackend PlaneKind
+	// BlobRoot relocates the blob plane (chunks, manifests, indexes, packs)
+	// to another directory. Empty keeps it on the store root. Commit/control
+	// state always lives on the store root.
+	BlobRoot string
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -126,6 +137,8 @@ func DefaultOptions() Options {
 		CodecDeltaMarginPercent: DefaultCodecDeltaMarginPercent,
 		MaxOverlayDepth:         DefaultMaxOverlayDepth,
 		MaxOverlayBytes:         DefaultMaxOverlayBytes,
+		BlobBackend:             PlaneLocal,
+		CommitBackend:           PlaneLocal,
 	}
 }
 
@@ -179,6 +192,14 @@ type Store struct {
 	notes          []string
 	pins           map[model.Hash32]uint64
 	contentPins    map[model.Hash32]uint64
+	// Physical planes. `blobRoot` is the immutable namespace root (chunks,
+	// manifests, indexes, packs); `root` is the store/commit root. On the
+	// default configuration they are the same directory and the bytes are the
+	// historical single-backend layout.
+	blobRoot    string
+	blobs       BlobAccess
+	commits     *commitPlane
+	planeReport PlaneReport
 	// Write budgets and the committed blob set used to charge only genuinely
 	// new bytes. Both are derived from committed state.
 	quota     QuotaState
@@ -249,6 +270,27 @@ func validateOptions(opts Options) error {
 	case RepresentationModeRaw, RepresentationModeCodecAuto, RepresentationModeOverlay:
 	default:
 		return werr.Newf(werr.InvalidArgument, "representation must be `raw`, `codec-auto`, or `overlay` (got `%s`)", opts.Representation)
+	}
+	if opts.BlobBackend == "" {
+		opts.BlobBackend = PlaneLocal
+	}
+	if opts.CommitBackend == "" {
+		opts.CommitBackend = PlaneLocal
+	}
+	if _, err := ParsePlaneKind(string(opts.BlobBackend)); err != nil {
+		return err
+	}
+	if _, err := ParsePlaneKind(string(opts.CommitBackend)); err != nil {
+		return err
+	}
+	if opts.BlobRoot != "" && opts.BlobBackend == PlanePosix {
+		return werr.Newf(werr.InvalidArgument, "a `posix` blob plane cannot be given an explicit root")
+	}
+	if opts.BlobRoot != "" {
+		cleaned := filepath.Clean(opts.BlobRoot)
+		if cleaned == "." || cleaned == string(filepath.Separator) {
+			return werr.Newf(werr.InvalidArgument, "--blob-root must name a directory")
+		}
 	}
 	if opts.MaxOverlayDepth == 0 {
 		opts.MaxOverlayDepth = DefaultMaxOverlayDepth
@@ -382,7 +424,17 @@ func Init(path string, opts Options) (*Store, error) {
 		return nil, werr.Wrap(werr.Io, err, "cannot stat %s", path)
 	}
 
-	if err := ensureLayout(path); err != nil {
+	if err := ensureCommitLayout(path); err != nil {
+		return nil, err
+	}
+	store := &Store{root: path, mode: ReadWrite, options: opts}
+	if err := store.buildPlanes(); err != nil {
+		return nil, err
+	}
+	if err := requireWritablePlanes(store.blobs.Capabilities(), store.commits.Capabilities()); err != nil {
+		return nil, err
+	}
+	if err := ensureBlobLayout(store.blobRoot); err != nil {
 		return nil, err
 	}
 	if err := writeNewFile(filepath.Join(path, "FORMAT"), []byte(model.FormatContents), 0o644); err != nil {
@@ -417,22 +469,17 @@ func Init(path string, opts Options) (*Store, error) {
 	}
 	file.Close()
 
-	store := &Store{
-		root:        path,
-		mode:        ReadWrite,
-		options:     opts,
-		lock:        lock,
-		state:       model.NewState(),
-		head:        model.ZeroHash,
-		generation:  0,
-		rejected:    nil,
-		notes:       nil,
-		pins:        make(map[model.Hash32]uint64),
-		contentPins: make(map[model.Hash32]uint64),
-		quota:       newQuotaState(),
-		blobIndex:   map[model.Hash32]uint64{},
-		access:      loadAccessCounts(path),
-	}
+	store.lock = lock
+	store.state = model.NewState()
+	store.head = model.ZeroHash
+	store.generation = 0
+	store.rejected = nil
+	store.notes = nil
+	store.pins = make(map[model.Hash32]uint64)
+	store.contentPins = make(map[model.Hash32]uint64)
+	store.quota = newQuotaState()
+	store.blobIndex = map[model.Hash32]uint64{}
+	store.access = loadAccessCounts(path)
 	if err := store.writeGenesis(); err != nil {
 		lock.Close()
 		return nil, err
@@ -454,23 +501,35 @@ func Init(path string, opts Options) (*Store, error) {
 // bounded replay and never enumerate the commit directory; a writable open
 // enumerates it once so next_generation cannot reuse a rejected generation.
 func Open(path string, mode OpenMode) (*Store, error) {
-	return openWithStrategy(path, mode, false)
+	return openWithStrategy(path, mode, false, DefaultOptions())
 }
 
 // OpenFullScanForBench opens through the original full commit-directory scan so
 // the bounded fast path's cost can be measured against it. It is not used by
 // any production path.
 func OpenFullScanForBench(path string, mode OpenMode) (*Store, error) {
-	return openWithStrategy(path, mode, true)
+	return openWithStrategy(path, mode, true, DefaultOptions())
 }
 
-func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error) {
+func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (*Store, error) {
+	if err := validateOptions(opts); err != nil {
+		return nil, err
+	}
 	format, err := os.ReadFile(filepath.Join(path, "FORMAT"))
 	if err != nil {
 		return nil, werr.Wrap(werr.Corrupt, err, "cannot read FORMAT")
 	}
 	if string(format) != model.FormatContents {
 		return nil, werr.Newf(werr.Unsupported, "FORMAT is %q, expected %q", string(format), model.FormatContents)
+	}
+	store := &Store{root: path, mode: mode, options: opts}
+	if err := store.buildPlanes(); err != nil {
+		return nil, err
+	}
+	if mode == ReadWrite {
+		if err := requireWritablePlanes(store.blobs.Capabilities(), store.commits.Capabilities()); err != nil {
+			return nil, err
+		}
 	}
 	var lock *os.File
 	if mode == ReadWrite {
@@ -483,11 +542,23 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 			lock.Close()
 			return nil, werr.Wrap(werr.Busy, err, "store is locked by another writer")
 		}
-		if err := ensureLayout(path); err != nil {
+		if err := ensureCommitLayout(path); err != nil {
+			lock.Close()
+			return nil, err
+		}
+		if err := ensureBlobLayout(store.blobRoot); err != nil {
 			lock.Close()
 			return nil, err
 		}
 		if err := cleanStaleTmp(path, DefaultGCGraceSecs); err != nil {
+			lock.Close()
+			return nil, err
+		}
+		if err := cleanStaleTmp(store.blobRoot, DefaultGCGraceSecs); err != nil {
+			lock.Close()
+			return nil, err
+		}
+		if err := store.probePlanes(); err != nil {
 			lock.Close()
 			return nil, err
 		}
@@ -496,11 +567,11 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 	var recovery *Recovery
 	switch {
 	case fullScan:
-		recovery, err = recoverFullScan(path)
+		recovery, err = recoverFullScan(path, store.blobs)
 	case mode == ReadWrite:
-		recovery, err = recoverForWrite(path)
+		recovery, err = recoverForWrite(path, store.blobs)
 	default:
-		recovery, err = Recover(path)
+		recovery, err = recoverWithStrategy(path, store.blobs, replayBounded, true)
 	}
 	if err != nil {
 		if lock != nil {
@@ -518,23 +589,18 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool) (*Store, error)
 		}
 		return nil, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
-	store := &Store{
-		root:           path,
-		mode:           mode,
-		options:        DefaultOptions(),
-		lock:           lock,
-		state:          recovery.State,
-		head:           recovery.Head,
-		generation:     recovery.Generation,
-		nextGeneration: base + 1,
-		rejected:       recovery.Rejected,
-		notes:          recovery.Notes,
-		pins:           make(map[model.Hash32]uint64),
-		contentPins:    make(map[model.Hash32]uint64),
-		quota:          newQuotaState(),
-		blobIndex:      map[model.Hash32]uint64{},
-		access:         loadAccessCounts(path),
-	}
+	store.lock = lock
+	store.state = recovery.State
+	store.head = recovery.Head
+	store.generation = recovery.Generation
+	store.nextGeneration = base + 1
+	store.rejected = recovery.Rejected
+	store.notes = recovery.Notes
+	store.pins = make(map[model.Hash32]uint64)
+	store.contentPins = make(map[model.Hash32]uint64)
+	store.quota = newQuotaState()
+	store.blobIndex = map[model.Hash32]uint64{}
+	store.access = loadAccessCounts(path)
 	store.loadQuotaRecord()
 	return store, nil
 }
@@ -544,7 +610,7 @@ func OpenWithOptions(path string, mode OpenMode, opts Options) (*Store, error) {
 	if err := validateOptions(opts); err != nil {
 		return nil, err
 	}
-	store, err := Open(path, mode)
+	store, err := openWithStrategy(path, mode, false, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -575,6 +641,72 @@ func (s *Store) Mode() OpenMode { return s.mode }
 
 // Root returns the store directory.
 func (s *Store) Root() string { return s.root }
+
+// BlobRoot returns the immutable blob namespace root.
+func (s *Store) BlobRoot() string { return s.blobRoot }
+
+// Planes reports the routed planes and their probe evidence.
+func (s *Store) Planes() PlaneReport { return s.planeReport }
+
+// buildPlanes constructs the two planes from the open options.
+func (s *Store) buildPlanes() error {
+	blobKind := s.options.BlobBackend
+	if blobKind == "" {
+		if s.options.CommitBackend == PlaneObject {
+			blobKind = PlaneObject
+		} else {
+			blobKind = PlaneLocal
+		}
+	}
+	commitKind := s.options.CommitBackend
+	if commitKind == "" {
+		commitKind = PlaneLocal
+	}
+	blobRoot := s.options.BlobRoot
+	if blobRoot == "" {
+		blobRoot = s.root
+	}
+	blobs, err := newFlatBlobPlane(blobRoot, blobKind)
+	if err != nil {
+		return err
+	}
+	commits, err := newCommitPlane(s.root, commitKind)
+	if err != nil {
+		return err
+	}
+	s.blobs = blobs
+	s.commits = commits
+	s.blobRoot = blobRoot
+	s.planeReport = PlaneReport{
+		Blobs:      blobs.Capabilities(),
+		Commits:    commits.Capabilities(),
+		BlobRoot:   blobRoot,
+		CommitRoot: s.root,
+	}
+	return nil
+}
+
+// probePlanes proves both capabilities on a writable open. A probe may only
+// refute a declared capability, never upgrade one; a failure refuses the open.
+func (s *Store) probePlanes() error {
+	flat, ok := s.blobs.(*flatBlobPlane)
+	if !ok {
+		// A packed plane is probed through its inner flat plane before packing
+		// is constructed (stage 3); nothing else exists today.
+		return werr.Newf(werr.Unsupported, "blob plane has no capability probe")
+	}
+	blobProbe, err := flat.probe()
+	if err != nil {
+		return err
+	}
+	commitProbe, err := s.commits.probe()
+	if err != nil {
+		return err
+	}
+	s.planeReport.BlobProbe = &blobProbe
+	s.planeReport.CommitProbe = &commitProbe
+	return requireWritablePlanes(s.blobs.Capabilities(), s.commits.Capabilities())
+}
 
 // Generation returns the published generation.
 func (s *Store) Generation() uint64 { return s.generation }
@@ -650,7 +782,7 @@ func (s *Store) StateAt(commit model.Hash32) (*model.State, error) {
 	if err != nil {
 		return nil, err
 	}
-	state, _, err := LoadStateAt(s.root, commit, maxVisible, false)
+	state, _, err := loadStateAt(s.blobs, s.root, commit, maxVisible, false)
 	if err != nil {
 		return nil, err
 	}
@@ -878,7 +1010,7 @@ func (s *Store) readObjectState(state *model.State, id model.Hash32) ([]byte, er
 		}
 		return append([]byte(nil), target...), nil
 	default:
-		manifest, err := ReadManifest(s.root, record.Content)
+		manifest, err := readManifest(s.blobs, record.Content)
 		if err != nil {
 			return nil, err
 		}
@@ -886,7 +1018,7 @@ func (s *Store) readObjectState(state *model.State, id model.Hash32) ([]byte, er
 			return nil, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 		}
 		contentRoot := record.Content
-		return readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true)
+		return readManifestRange(s.blobs, &contentRoot, manifest, 0, manifest.Size, true)
 	}
 }
 
@@ -899,7 +1031,7 @@ func (s *Store) ReadRange(id model.Hash32, offset, length uint64) ([]byte, error
 	if record.Kind != model.KindFile {
 		return nil, werr.Newf(werr.InvalidArgument, "read_range requires a file object")
 	}
-	manifest, err := ReadManifest(s.root, record.Content)
+	manifest, err := readManifest(s.blobs, record.Content)
 	if err != nil {
 		return nil, err
 	}
@@ -907,7 +1039,7 @@ func (s *Store) ReadRange(id model.Hash32, offset, length uint64) ([]byte, error
 		return nil, werr.Newf(werr.Corrupt, "object size disagrees with manifest")
 	}
 	contentRoot := record.Content
-	data, err := readManifestRange(s.root, &contentRoot, manifest, offset, length, false)
+	data, err := readManifestRange(s.blobs, &contentRoot, manifest, offset, length, false)
 	if err == nil {
 		s.noteObjectRead(id)
 	}
@@ -918,12 +1050,12 @@ func (s *Store) ReadRange(id model.Hash32, offset, length uint64) ([]byte, error
 // It does not consult live object state, so it is safe for snapshot
 // materialization.
 func (s *Store) ReadContent(contentRoot model.Hash32, offset, length uint64) ([]byte, error) {
-	manifest, err := ReadManifest(s.root, contentRoot)
+	manifest, err := readManifest(s.blobs, contentRoot)
 	if err != nil {
 		return nil, err
 	}
 	whole := offset == 0 && length >= manifest.Size
-	return readManifestRange(s.root, &contentRoot, manifest, offset, length, whole)
+	return readManifestRange(s.blobs, &contentRoot, manifest, offset, length, whole)
 }
 
 // NLink returns the POSIX link count for an object.
@@ -1401,61 +1533,20 @@ func (s *Store) storeManifest(manifest model.Manifest) (model.Hash32, model.Hash
 	return manifestID, contentHash, size, nil
 }
 
-// storeBlob writes a content-addressed blob crash-safely: tmp/ -> fsync ->
-// rename -> fsync directory. An existing file is verified, never overwritten.
+// storeBlob writes a content-addressed blob through the routed blob plane.
+// An existing blob is verified, never overwritten. Publication (fsync + rename
+// or link + directory fsync) belongs to the plane.
 func (s *Store) storeBlob(kind BlobKind, domain string, data []byte) (model.Hash32, error) {
 	hash := hashOf(domain, data)
-	finalPath := BlobPath(s.root, kind, hash)
-	if existing, err := os.ReadFile(finalPath); err == nil {
+	if existing, err := s.blobs.Get(kind, hash); err == nil {
 		if hashOf(domain, existing) != hash {
-			return model.Hash32{}, werr.Newf(werr.Corrupt, "existing blob %s does not match its name", finalPath)
+			return model.Hash32{}, werr.Newf(werr.Corrupt, "existing blob %s does not match its name", blobRelPath(kind, hash))
 		}
 		return hash, nil
+	} else if typed, ok := err.(*werr.Error); !ok || typed.Kind != werr.NotFound {
+		return model.Hash32{}, err
 	}
-	parent := filepath.Dir(finalPath)
-	if _, err := os.Stat(parent); errors.Is(err, os.ErrNotExist) {
-		if err := makeDir(parent); err != nil {
-			return model.Hash32{}, err
-		}
-		if err := fsyncDir(filepath.Dir(parent)); err != nil {
-			return model.Hash32{}, err
-		}
-	} else if err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot stat %s", parent)
-	}
-	counter := tmpCounter.Add(1)
-	tmp := filepath.Join(s.root, "tmp", "blob-"+itoa(uint64(os.Getpid()))+"-"+hash.Hex()+"-"+itoa(counter))
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot create %s", tmp)
-	}
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot write %s", tmp)
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot fsync %s", tmp)
-	}
-	file.Close()
-	if existing, err := os.ReadFile(finalPath); err == nil {
-		_ = os.Remove(tmp)
-		if hashOf(domain, existing) != hash {
-			return model.Hash32{}, werr.Newf(werr.Corrupt, "blob appeared with a mismatched hash")
-		}
-		return hash, nil
-	}
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		_ = os.Remove(tmp)
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot chmod %s", tmp)
-	}
-	if err := os.Rename(tmp, finalPath); err != nil {
-		_ = os.Remove(tmp)
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot rename %s into place", finalPath)
-	}
-	if err := fsyncDir(parent); err != nil {
+	if err := s.blobs.Put(kind, hash, data); err != nil {
 		return model.Hash32{}, err
 	}
 	return hash, nil

@@ -156,7 +156,7 @@ func (s *Store) PlanRebase(root model.Hash32, options RebaseOptions) (RebasePlan
 			})
 			continue
 		}
-		manifest, err := ReadManifest(s.root, record.Content)
+		manifest, err := readManifest(s.blobs, record.Content)
 		if err != nil {
 			return RebasePlan{}, err
 		}
@@ -272,7 +272,7 @@ func (s *Store) currentDecodeCost(
 		return 0, werr.Newf(werr.Corrupt, "rebase decode-cost cycle")
 	}
 	seen[content] = true
-	manifest, err := ReadManifest(s.root, content)
+	manifest, err := readManifest(s.blobs, content)
 	if err != nil {
 		return 0, err
 	}
@@ -288,7 +288,7 @@ func (s *Store) currentDecodeCost(
 	}
 	total := EstimateDecodeNS(class, size, modelCost)
 	for _, dependency := range dependencies {
-		dependencyManifest, err := ReadManifest(s.root, dependency)
+		dependencyManifest, err := readManifest(s.blobs, dependency)
 		if err != nil {
 			return 0, err
 		}

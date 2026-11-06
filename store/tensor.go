@@ -1414,7 +1414,7 @@ func (s *Store) representationDepDepth(manifestID model.Hash32, seen []model.Has
 	if containsHash(seen, manifestID) {
 		return 0, werr.Newf(werr.Corrupt, "tensor representation dependency cycle")
 	}
-	manifest, err := ReadManifest(s.root, manifestID)
+	manifest, err := readManifest(s.blobs, manifestID)
 	if err != nil {
 		return 0, err
 	}
@@ -1603,7 +1603,7 @@ func (s *Store) TensorMetadata(id model.Hash32) (StoredTensorMetadata, error) {
 		return meta, werr.Newf(werr.InvalidArgument,
 			"tensor metadata requires a file object")
 	}
-	manifest, err := ReadManifest(s.root, record.Content)
+	manifest, err := readManifest(s.blobs, record.Content)
 	if err != nil {
 		return meta, err
 	}
@@ -1754,7 +1754,7 @@ func (s *Store) q8ShardMeta(id model.Hash32) (modes.ShardedTensorMeta, error) {
 	if err != nil {
 		return modes.ShardedTensorMeta{}, err
 	}
-	manifest, err := ReadManifest(s.root, record.Content)
+	manifest, err := readManifest(s.blobs, record.Content)
 	if err != nil {
 		return modes.ShardedTensorMeta{}, err
 	}
@@ -1764,7 +1764,7 @@ func (s *Store) q8ShardMeta(id model.Hash32) (modes.ShardedTensorMeta, error) {
 		return modes.ShardedTensorMeta{}, werr.Newf(werr.Corrupt,
 			"q8_0 tensor is not stored through mode 10")
 	}
-	frameBytes, err := ReadBlobVerified(s.root, BlobManifest,
+	frameBytes, err := readBlobVerified(s.blobs, BlobManifest,
 		*manifest.Representation.Frame, model.DomainManifest)
 	if err != nil {
 		return modes.ShardedTensorMeta{}, err

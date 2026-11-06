@@ -185,7 +185,7 @@ func (s *Store) writeFileRangesCausal(id model.Hash32, ranges []RangeWrite, caus
 	if cached != nil && cached.Content == old.Content && cached.Manifest.Size == old.Size {
 		oldManifest = cached.Manifest
 	} else {
-		oldManifest, err = ReadManifest(s.root, old.Content)
+		oldManifest, err = readManifest(s.blobs, old.Content)
 		if err != nil {
 			return WriteOutcome{}, err
 		}
@@ -401,7 +401,7 @@ func (s *Store) writeFileMerkleRanges(id model.Hash32, old model.ObjectRecord, o
 				keep = oldRef.Len
 			}
 			if keep > 0 {
-				stored, err := ReadBlobVerified(s.root, BlobObject, oldRef.Hash, model.DomainChunk)
+				stored, err := readBlobVerified(s.blobs, BlobObject, oldRef.Hash, model.DomainChunk)
 				if err != nil {
 					return WriteOutcome{}, err
 				}
@@ -458,7 +458,7 @@ func (s *Store) writeFileMerkleRanges(id model.Hash32, old model.ObjectRecord, o
 // existing v3 file stays v3; a v1/v2 file adopts the store-wide option.
 func (s *Store) contentIdentityFor(record model.ObjectRecord) model.ContentIdentity {
 	if record.Kind == model.KindFile {
-		if manifest, err := ReadManifest(s.root, record.Content); err == nil && manifest.Identity == model.ContentIdentityMerkleV1 {
+		if manifest, err := readManifest(s.blobs, record.Content); err == nil && manifest.Identity == model.ContentIdentityMerkleV1 {
 			return model.ContentIdentityMerkleV1
 		}
 	}
@@ -496,7 +496,7 @@ func (s *Store) Truncate(id model.Hash32, size uint64) (model.Hash32, error) {
 	if old.Kind != model.KindFile {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "truncate requires a file object")
 	}
-	oldManifest, err := ReadManifest(s.root, old.Content)
+	oldManifest, err := readManifest(s.blobs, old.Content)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -641,7 +641,7 @@ func (s *Store) ZeroRange(id model.Hash32, offset, length uint64, extend bool) (
 	if zeroEnd <= offset {
 		return old.Version, nil
 	}
-	oldManifest, err := ReadManifest(s.root, old.Content)
+	oldManifest, err := readManifest(s.blobs, old.Content)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -700,7 +700,7 @@ func (s *Store) CollapseRange(id model.Hash32, offset, length uint64) (model.Has
 	if offset > old.Size || length > old.Size-offset {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "collapse range lies past EOF")
 	}
-	collapseManifest, err := ReadManifest(s.root, old.Content)
+	collapseManifest, err := readManifest(s.blobs, old.Content)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -753,7 +753,7 @@ func (s *Store) InsertRange(id model.Hash32, offset, length uint64) (model.Hash3
 	if offset > old.Size {
 		return model.Hash32{}, werr.Newf(werr.InvalidArgument, "insert offset lies past EOF")
 	}
-	insertManifest, err := ReadManifest(s.root, old.Content)
+	insertManifest, err := readManifest(s.blobs, old.Content)
 	if err != nil {
 		return model.Hash32{}, err
 	}

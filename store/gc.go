@@ -2,9 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
-	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
@@ -45,10 +42,14 @@ type GCReport struct {
 	// (left behind by a crash while an unlinked object was pinned).
 	RemovedOrphans []string
 	Problems       []string
+	// ReclaimedPacks reports physical pack/catalog reclamation after the
+	// sweep (zero on a flat plane).
+	ReclaimedPacks PackReclaim
 }
 
 type gcCandidate struct {
-	path string
+	kind BlobKind
+	id   model.Hash32
 	rel  string
 	size uint64
 }
@@ -163,7 +164,7 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	markedManifests := make(map[model.Hash32]struct{})
 	markedChunks := make(map[model.Hash32]struct{})
 
-	if err := markState(ctx, s.root, s.state, markedManifests, markedChunks, &report.Problems); err != nil {
+	if err := markState(ctx, s.blobs, s.state, markedManifests, markedChunks, &report.Problems); err != nil {
 		return report, err
 	}
 
@@ -183,7 +184,7 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 				"snapshot "+name+" ("+commit.Hex()+") state is unreadable: "+err.Error())
 			continue
 		}
-		if err := markState(ctx, s.root, snapshotState, markedManifests, markedChunks, &report.Problems); err != nil {
+		if err := markState(ctx, s.blobs, snapshotState, markedManifests, markedChunks, &report.Problems); err != nil {
 			return report, err
 		}
 	}
@@ -204,13 +205,13 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 		}
 		checkpoint := *commit.Commit.Checkpoint
 		markedManifests[checkpoint] = struct{}{}
-		checkpointState, err := ReadStateManifest(s.root, checkpoint)
+		checkpointState, err := readStateManifest(s.blobs, checkpoint)
 		if err != nil {
 			report.Problems = append(report.Problems,
 				"checkpoint "+checkpoint.Hex()+" is unreadable: "+err.Error())
 			continue
 		}
-		if err := markState(ctx, s.root, checkpointState, markedManifests, markedChunks, &report.Problems); err != nil {
+		if err := markState(ctx, s.blobs, checkpointState, markedManifests, markedChunks, &report.Problems); err != nil {
 			return report, err
 		}
 	}
@@ -228,7 +229,7 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 		}
 		markedManifests[content] = struct{}{}
 		seen := make(map[model.Hash32]struct{})
-		if err := markManifestTree(ctx, s.root, content, markedManifests, markedChunks, &report.Problems, 0, seen); err != nil {
+		if err := markManifestTree(ctx, s.blobs, content, markedManifests, markedChunks, &report.Problems, 0, seen); err != nil {
 			return report, err
 		}
 	}
@@ -238,12 +239,12 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 
 	now := time.Now()
 	candidates := make([]gcCandidate, 0)
-	manifestCandidates, err := collectUnmarked(ctx, s.root, "manifests", markedManifests, now, graceSecs, &report)
+	manifestCandidates, err := collectUnmarked(ctx, s.blobs, "manifests", markedManifests, now, graceSecs, &report)
 	if err != nil {
 		return report, err
 	}
 	candidates = append(candidates, manifestCandidates...)
-	objectCandidates, err := collectUnmarked(ctx, s.root, "objects", markedChunks, now, graceSecs, &report)
+	objectCandidates, err := collectUnmarked(ctx, s.blobs, "objects", markedChunks, now, graceSecs, &report)
 	if err != nil {
 		return report, err
 	}
@@ -266,14 +267,20 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 			if err := checkCancel(ctx); err != nil {
 				return report, err
 			}
-			if err := os.Remove(candidate.path); err != nil {
-				return report, werr.Wrap(werr.Io, err, "cannot delete %s", candidate.path)
+			if err := s.blobs.DeleteEntry(BlobEntry{Kind: candidate.kind, ID: candidate.id, Rel: candidate.rel, Size: candidate.size}); err != nil {
+				return report, werr.Wrap(werr.Io, err, "cannot delete %s", candidate.rel)
 			}
 			report.Deleted = append(report.Deleted, candidate.rel)
 			report.DeletedFiles++
 			report.DeletedBytes += candidate.size
 			deleted++
 			deletedBytes += candidate.size
+		}
+		reclaimed, err := s.blobs.ReclaimUnreferencedPacks()
+		if err != nil {
+			report.Problems = append(report.Problems, "pack reclamation: "+err.Error())
+		} else {
+			report.ReclaimedPacks = reclaimed
 		}
 		report.RemainingFiles = report.UnreachableFiles - report.DeletedFiles
 		report.RemainingBytes = report.UnreachableBytes - deletedBytes
@@ -318,7 +325,7 @@ func (s *Store) orphanObjectIDs() []model.Hash32 {
 
 // markState marks the manifest and chunks of every file object in a state.
 // Non-file objects carry a content digest that is not a manifest.
-func markState(ctx context.Context, root string, state *model.State, manifests, chunks map[model.Hash32]struct{}, problems *[]string) error {
+func markState(ctx context.Context, src blobSource, state *model.State, manifests, chunks map[model.Hash32]struct{}, problems *[]string) error {
 	for _, id := range model.SortHashKeys(state.Objects) {
 		if err := checkCancel(ctx); err != nil {
 			return err
@@ -335,7 +342,7 @@ func markState(ctx context.Context, root string, state *model.State, manifests, 
 			continue
 		}
 		seen := make(map[model.Hash32]struct{})
-		if err := markManifestTree(ctx, root, record.Content, manifests, chunks, problems, 0, seen); err != nil {
+		if err := markManifestTree(ctx, src, record.Content, manifests, chunks, problems, 0, seen); err != nil {
 			return err
 		}
 	}
@@ -346,7 +353,7 @@ func markState(ctx context.Context, root string, state *model.State, manifests, 
 // raw chunks, the codec frame blob, and (transitively, bounded) dependency
 // content roots. It mirrors the Rust GC so a GC that keeps a dependent keeps
 // its whole dependency closure.
-func markManifestTree(ctx context.Context, root string, manifestID model.Hash32, manifests, chunks map[model.Hash32]struct{}, problems *[]string, depth int, seen map[model.Hash32]struct{}) error {
+func markManifestTree(ctx context.Context, src blobSource, manifestID model.Hash32, manifests, chunks map[model.Hash32]struct{}, problems *[]string, depth int, seen map[model.Hash32]struct{}) error {
 	if err := checkCancel(ctx); err != nil {
 		return err
 	}
@@ -362,7 +369,7 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 	}
 	seen[manifestID] = struct{}{}
 	manifests[manifestID] = struct{}{}
-	manifest, err := ReadManifest(root, manifestID)
+	manifest, err := readManifest(src, manifestID)
 	if err != nil {
 		*problems = append(*problems,
 			"cannot read manifest "+manifestID.Hex()+": "+err.Error())
@@ -379,7 +386,7 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 			manifests[*rep.Frame] = struct{}{}
 		}
 		for _, dependency := range rep.Dependencies {
-			if err := markManifestTree(ctx, root, dependency, manifests, chunks, problems, depth+1, seen); err != nil {
+			if err := markManifestTree(ctx, src, dependency, manifests, chunks, problems, depth+1, seen); err != nil {
 				return err
 			}
 		}
@@ -396,7 +403,7 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 				chunks[chunk.Hash] = struct{}{}
 			}
 		}
-		return markManifestTree(ctx, root, rep.Overlay.Base, manifests, chunks, problems, depth+1, seen)
+		return markManifestTree(ctx, src, rep.Overlay.Base, manifests, chunks, problems, depth+1, seen)
 	}
 	for _, chunk := range manifest.Chunks {
 		chunks[chunk.Hash] = struct{}{}
@@ -408,74 +415,35 @@ func markManifestTree(ctx context.Context, root string, manifestID model.Hash32,
 // symlinks, only considers regular files, and applies the Rust grace rule: with
 // grace_secs > 0 an unmarked file whose age is below the window is retained
 // (a future mtime counts as age zero).
-func collectUnmarked(ctx context.Context, root, kindDir string, marked map[model.Hash32]struct{}, now time.Time, graceSecs uint64, report *GCReport) ([]gcCandidate, error) {
-	dir := filepath.Join(root, kindDir)
-	shards, err := os.ReadDir(dir)
+func collectUnmarked(ctx context.Context, src BlobAccess, kindDir string, marked map[model.Hash32]struct{}, now time.Time, graceSecs uint64, report *GCReport) ([]gcCandidate, error) {
+	entries, problems, err := src.List(kindDir)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, werr.Wrap(werr.Io, err, "cannot read %s", dir)
+		return nil, err
 	}
+	report.Problems = append(report.Problems, problems...)
 	out := make([]gcCandidate, 0)
-	for _, shard := range shards {
+	for _, entry := range entries {
 		if err := checkCancel(ctx); err != nil {
 			return nil, err
 		}
-		shardPath := filepath.Join(dir, shard.Name())
-		shardInfo, err := os.Lstat(shardPath)
-		if err != nil {
-			return nil, werr.Wrap(werr.Io, err, "cannot stat %s", shardPath)
-		}
-		if !shardInfo.IsDir() || shardInfo.Mode()&os.ModeSymlink != 0 {
+		if _, ok := marked[entry.ID]; ok {
+			report.ReachableFiles++
+			report.ReachableBytes += entry.Size
+			report.Retained++
 			continue
 		}
-		files, err := os.ReadDir(shardPath)
-		if err != nil {
-			return nil, werr.Wrap(werr.Io, err, "cannot read %s", shardPath)
-		}
-		for _, file := range files {
-			if err := checkCancel(ctx); err != nil {
-				return nil, err
+		if graceSecs > 0 {
+			age := uint64(0)
+			if now.After(entry.ModTime) {
+				age = uint64(now.Sub(entry.ModTime) / time.Second)
 			}
-			name := file.Name()
-			path := filepath.Join(shardPath, name)
-			info, err := os.Lstat(path)
-			if err != nil {
-				return nil, werr.Wrap(werr.Io, err, "cannot stat %s", path)
-			}
-			if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-				continue
-			}
-			hash, ok := parseLowerHash(name)
-			if !ok {
-				report.Problems = append(report.Problems, "unrecognized blob filename "+path)
-				continue
-			}
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				rel = path
-			}
-			rel = filepath.ToSlash(rel)
-			if _, ok := marked[hash]; ok {
-				report.ReachableFiles++
-				report.ReachableBytes += uint64(info.Size())
+			if age < graceSecs {
+				report.GraceRetained++
 				report.Retained++
 				continue
 			}
-			if graceSecs > 0 {
-				age := uint64(0)
-				if now.After(info.ModTime()) {
-					age = uint64(now.Sub(info.ModTime()) / time.Second)
-				}
-				if age < graceSecs {
-					report.GraceRetained++
-					report.Retained++
-					continue
-				}
-			}
-			out = append(out, gcCandidate{path: path, rel: rel, size: uint64(info.Size())})
 		}
+		out = append(out, gcCandidate{kind: entry.Kind, id: entry.ID, rel: entry.Rel, size: entry.Size})
 	}
 	return out, nil
 }

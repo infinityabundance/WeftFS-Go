@@ -15,7 +15,7 @@ import (
 // readManifestRange is the internal range reader. rootID is the manifest id of
 // manifest when known; it seeds the cycle check exactly as the Rust reader
 // seeds `seen` with the content root.
-func readManifestRange(root string, rootID *model.Hash32, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
+func readManifestRange(src blobSource, rootID *model.Hash32, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
 	if manifest.Size > MaxFileBytes {
 		return nil, werr.Newf(werr.LimitExceeded, "manifest size %d exceeds the %d-byte v1 bound", manifest.Size, MaxFileBytes)
 	}
@@ -23,26 +23,26 @@ func readManifestRange(root string, rootID *model.Hash32, manifest model.Manifes
 	if rootID != nil {
 		seen = append(seen, *rootID)
 	}
-	return readManifestRangeInner(root, manifest, offset, length, verifyWhole, 0, seen)
+	return readManifestRangeInner(src, manifest, offset, length, verifyWhole, 0, seen)
 }
 
-func readManifestRangeInner(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool, depth int, seen []model.Hash32) ([]byte, error) {
+func readManifestRangeInner(src blobSource, manifest model.Manifest, offset, length uint64, verifyWhole bool, depth int, seen []model.Hash32) ([]byte, error) {
 	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationOverlay {
-		return readOverlayRange(root, manifest, manifest.Representation, offset, length, verifyWhole)
+		return readOverlayRange(src, manifest, manifest.Representation, offset, length, verifyWhole)
 	}
 	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationCodec {
-		return readCodecRange(root, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
+		return readCodecRange(src, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
 	}
 	if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationTensor {
-		return readTensorRange(root, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
+		return readTensorRange(src, manifest, manifest.Representation, offset, length, verifyWhole, depth, seen)
 	}
-	return readRawRange(root, manifest, offset, length, verifyWhole)
+	return readRawRange(src, manifest, offset, length, verifyWhole)
 }
 
 // readOverlayRange resolves a `weft.manifest.v4` base chain to a canonical
 // chunk table without fetching any content chunk, then reads only the chunks
 // intersecting the requested range.
-func readOverlayRange(root string, manifest model.Manifest, rep *model.Representation, offset, length uint64, verifyWhole bool) ([]byte, error) {
+func readOverlayRange(src blobSource, manifest model.Manifest, rep *model.Representation, offset, length uint64, verifyWhole bool) ([]byte, error) {
 	if rep == nil || rep.Overlay == nil {
 		return nil, werr.Newf(werr.Corrupt, "overlay representation is missing its overlay map")
 	}
@@ -54,17 +54,17 @@ func readOverlayRange(root string, manifest model.Manifest, rep *model.Represent
 		return nil, err
 	}
 	seenSet := make(map[model.Hash32]struct{})
-	table, err := overlayChunkTable(root, manifestID, manifest, rep.Overlay, 0, seenSet)
+	table, err := overlayChunkTable(src, manifestID, manifest, rep.Overlay, 0, seenSet)
 	if err != nil {
 		return nil, err
 	}
-	return readChunkTableRange(root, table, manifest.Size, manifest.ContentHash,
+	return readChunkTableRange(src, table, manifest.Size, manifest.ContentHash,
 		model.ContentIdentityMerkleV1, offset, length, verifyWhole)
 }
 
 // overlayChunkTable resolves and validates the canonical chunk table of one
 // immutable overlay layer over its base chain. Only manifest blobs are read.
-func overlayChunkTable(root string, manifestID model.Hash32, manifest model.Manifest,
+func overlayChunkTable(src blobSource, manifestID model.Hash32, manifest model.Manifest,
 	overlay *model.OverlayRepresentation, depth int, seen map[model.Hash32]struct{}) ([]model.ChunkRef, error) {
 	if depth > int(model.MaxOverlayChainDepth) {
 		return nil, werr.Newf(werr.LimitExceeded,
@@ -80,7 +80,7 @@ func overlayChunkTable(root string, manifestID model.Hash32, manifest model.Mani
 	if err := overlay.ValidateShape(manifest.ChunkSize, manifest.Size); err != nil {
 		return nil, err
 	}
-	baseManifest, err := ReadManifest(root, overlay.Base)
+	baseManifest, err := readManifest(src, overlay.Base)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func overlayChunkTable(root string, manifestID model.Hash32, manifest model.Mani
 				"overlay depth %d does not follow the base depth %d", overlay.Depth, baseOverlay.Depth)
 		}
 		baseOverlayBytes = baseOverlay.OverlayBytes
-		baseTable, err = overlayChunkTable(root, overlay.Base, baseManifest, baseOverlay, depth+1, seen)
+		baseTable, err = overlayChunkTable(src, overlay.Base, baseManifest, baseOverlay, depth+1, seen)
 		if err != nil {
 			return nil, err
 		}
@@ -218,14 +218,14 @@ func overlayChunkTable(root string, manifestID model.Hash32, manifest model.Mani
 // readRawRange assembles a byte range from the manifest's chunk references,
 // verifying every chunk it touches. v1 manifests and v2 `kind:"raw"`
 // manifests share this path byte for byte.
-func readRawRange(root string, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
-	return readChunkTableRange(root, manifest.Chunks, manifest.Size, manifest.ContentHash,
+func readRawRange(src blobSource, manifest model.Manifest, offset, length uint64, verifyWhole bool) ([]byte, error) {
+	return readChunkTableRange(src, manifest.Chunks, manifest.Size, manifest.ContentHash,
 		manifest.Identity, offset, length, verifyWhole)
 }
 
 // readChunkTableRange assembles a range from an explicit canonical chunk table.
 // It is shared by the raw path and the resolved overlay path.
-func readChunkTableRange(root string, chunks []model.ChunkRef, size uint64, contentHash model.Hash32,
+func readChunkTableRange(src blobSource, chunks []model.ChunkRef, size uint64, contentHash model.Hash32,
 	identity model.ContentIdentity, offset, length uint64, verifyWhole bool) ([]byte, error) {
 	if offset >= size {
 		return []byte{}, nil
@@ -250,7 +250,7 @@ func readChunkTableRange(root string, chunks []model.ChunkRef, size uint64, cont
 		if chunkEnd <= offset || chunkStart >= end {
 			continue
 		}
-		bytesValue, err := ReadBlobVerified(root, BlobObject, chunk.Hash, model.DomainChunk)
+		bytesValue, err := readBlobVerified(src, BlobObject, chunk.Hash, model.DomainChunk)
 		if err != nil {
 			return nil, werr.Newf(werr.Corrupt, "chunk %d (%s): %s", index, chunk.Hash.Hex(), err.Error())
 		}
@@ -290,7 +290,7 @@ func readChunkTableRange(root string, chunks []model.ChunkRef, size uint64, cont
 // content root (recursively, depth-bounded, cycle-checked) and verified against
 // the frame's dependency table. A missing, unreadable, or mismatched dependency
 // is Corrupt; no partial or approximate bytes are ever returned.
-func readCodecRange(root string, manifest model.Manifest, rep *model.Representation, offset, length uint64, verifyWhole bool, depth int, seen []model.Hash32) ([]byte, error) {
+func readCodecRange(src blobSource, manifest model.Manifest, rep *model.Representation, offset, length uint64, verifyWhole bool, depth int, seen []model.Hash32) ([]byte, error) {
 	if depth > MaxCodecDependencyDepth {
 		return nil, werr.Newf(werr.Corrupt,
 			"codec representation dependency depth exceeds %d", MaxCodecDependencyDepth)
@@ -302,7 +302,7 @@ func readCodecRange(root string, manifest model.Manifest, rep *model.Representat
 		return nil, werr.Newf(werr.Corrupt,
 			"codec representation decoded_size disagrees with manifest size")
 	}
-	frameBytes, err := ReadBlobVerified(root, BlobManifest, *rep.Frame, model.DomainManifest)
+	frameBytes, err := readBlobVerified(src, BlobManifest, *rep.Frame, model.DomainManifest)
 	if err != nil {
 		return nil, err
 	}
@@ -336,12 +336,12 @@ func readCodecRange(root string, manifest model.Manifest, rep *model.Representat
 		if containsHash(seen, depRoot) {
 			return nil, werr.Newf(werr.Corrupt, "codec representation dependency cycle")
 		}
-		depManifest, err := ReadManifest(root, depRoot)
+		depManifest, err := readManifest(src, depRoot)
 		if err != nil {
 			return nil, err
 		}
 		seen = append(seen, depRoot)
-		bytesValue, err := readManifestRangeInner(root, depManifest, 0, depManifest.Size, true, depth+1, seen)
+		bytesValue, err := readManifestRangeInner(src, depManifest, 0, depManifest.Size, true, depth+1, seen)
 		seen = seen[:len(seen)-1]
 		if err != nil {
 			return nil, err

@@ -1185,7 +1185,7 @@ func (s *Store) collectManifestBlobs(
 	if _, ok := additions[manifestID]; ok {
 		return 0, nil
 	}
-	b, err := ReadBlobVerified(s.root, BlobManifest, manifestID, model.DomainManifest)
+	b, err := readBlobVerified(s.blobs, BlobManifest, manifestID, model.DomainManifest)
 	if err != nil {
 		return 0, err
 	}
@@ -1207,11 +1207,13 @@ func (s *Store) collectManifestBlobs(
 		if rep.Frame != nil {
 			if _, ok := index[*rep.Frame]; !ok {
 				if _, ok := additions[*rep.Frame]; !ok {
-					info, err := os.Stat(BlobPath(s.root, BlobManifest, *rep.Frame))
+					length, err := s.blobs.Length(BlobManifest, *rep.Frame)
 					if err != nil {
-						return 0, werr.Wrap(werr.Corrupt, err, "missing frame blob")
+						if typed, ok := err.(*werr.Error); ok && typed.Kind == werr.NotFound {
+							return 0, werr.Newf(werr.Corrupt, "missing frame blob")
+						}
+						return 0, err
 					}
-					length := uint64(info.Size())
 					additions[*rep.Frame] = length
 					total += length
 				}

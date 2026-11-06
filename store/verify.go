@@ -112,7 +112,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
-	recovered, err := Recover(s.root)
+	recovered, err := recoverWithStrategy(s.root, s.blobs, replayBounded, true)
 	if err != nil {
 		report.problem(string(werr.ClassOf(err)), "recovery failed: "+err.Error())
 	} else {
@@ -132,7 +132,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 			if path, ok := files[maxVisible]; ok {
 				expected := maxVisible
 				if loaded, loadErr := LoadCommitFile(path, &expected); loadErr == nil {
-					if highest, loadNotes, stateErr := LoadStateAt(s.root, loaded.Hash, maxVisible, false); stateErr == nil {
+					if highest, loadNotes, stateErr := loadStateAt(s.blobs, s.root, loaded.Hash, maxVisible, false); stateErr == nil {
 						for _, note := range loadNotes {
 							report.problem(string(werr.Corrupt), note)
 						}
@@ -142,7 +142,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 				}
 			}
 		}
-		state, notes, err := LoadStateAt(s.root, recovered.Head, maxVisible, true)
+		state, notes, err := loadStateAt(s.blobs, s.root, recovered.Head, maxVisible, true)
 		if err != nil {
 			report.problem(string(werr.ClassOf(err)), "state replay failed: "+err.Error())
 		} else {
@@ -163,7 +163,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 			continue
 		}
 		report.CheckedManifests++
-		checkpointState, err := ReadStateManifest(s.root, *commit.Commit.Checkpoint)
+		checkpointState, err := readStateManifest(s.blobs, *commit.Commit.Checkpoint)
 		if err != nil {
 			report.problem(string(werr.ClassOf(err)), "checkpoint "+commit.Commit.Checkpoint.Hex()+": "+err.Error())
 			continue
@@ -320,7 +320,7 @@ func (s *Store) verifyContextState(state *model.State, full bool, report *Verify
 			report.problem(string(werr.Corrupt), "object "+id.Hex()+" causal hash: "+err.Error())
 			continue
 		}
-		bytesValue, err := ReadBlobVerified(s.root, BlobManifest, causalHash, hash.DomainCausal)
+		bytesValue, err := readBlobVerified(s.blobs, BlobManifest, causalHash, hash.DomainCausal)
 		if err != nil {
 			report.problem(string(werr.ClassOf(err)), "object "+id.Hex()+" causal closure blob: "+err.Error())
 			continue
@@ -340,7 +340,7 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 			continue
 		}
 		report.CheckedObjects++
-		manifest, err := ReadManifest(s.root, record.Content)
+		manifest, err := readManifest(s.blobs, record.Content)
 		if err != nil {
 			report.problem(string(werr.ClassOf(err)), "manifest for object "+id.Hex()+": "+err.Error())
 			continue
@@ -351,7 +351,7 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		}
 		if manifest.Representation != nil && manifest.Representation.Kind == model.RepresentationOverlay {
 			contentRoot := record.Content
-			table, tableErr := overlayChunkTable(s.root, record.Content, manifest,
+			table, tableErr := overlayChunkTable(s.blobs, record.Content, manifest,
 				manifest.Representation.Overlay, 0, make(map[model.Hash32]struct{}))
 			if tableErr != nil {
 				report.problem(string(werr.ClassOf(tableErr)),
@@ -359,7 +359,7 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 				continue
 			}
 			if full {
-				if _, err := readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
+				if _, err := readManifestRange(s.blobs, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
 					report.problem(string(werr.ClassOf(err)),
 						"overlay representation for object "+id.Hex()+" manifest "+record.Content.Hex()+": "+err.Error())
 				} else {
@@ -379,7 +379,7 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 				}
 				kind := manifest.Representation.Kind
 				contentRoot := record.Content
-				if _, err := readManifestRange(s.root, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
+				if _, err := readManifestRange(s.blobs, &contentRoot, manifest, 0, manifest.Size, true); err != nil {
 					report.problem(string(werr.ClassOf(err)),
 						string(kind)+" representation for object "+id.Hex()+" manifest "+record.Content.Hex()+" frame "+frame+": "+err.Error())
 				} else {
@@ -404,7 +404,7 @@ func (s *Store) verifyState(state *model.State, full bool, report *VerifyReport)
 		leaves := make([]model.ChunkRef, 0, len(manifest.Chunks))
 		for index, chunk := range manifest.Chunks {
 			report.CheckedChunks++
-			bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)
+			bytesValue, err := readBlobVerified(s.blobs, BlobObject, chunk.Hash, model.DomainChunk)
 			if err != nil {
 				report.problem(string(werr.ClassOf(err)), "chunk "+itoa(uint64(index))+" ("+chunk.Hash.Hex()+"): "+err.Error())
 				continue
@@ -449,7 +449,7 @@ type RegionVerification struct {
 // Verify with full=true for those. A tampered blob or hash names the chunk
 // index.
 func (s *Store) VerifyContentRegion(contentRoot model.Hash32, offset, length uint64) (RegionVerification, error) {
-	manifest, err := ReadManifest(s.root, contentRoot)
+	manifest, err := readManifest(s.blobs, contentRoot)
 	if err != nil {
 		return RegionVerification{}, err
 	}
@@ -481,7 +481,7 @@ func (s *Store) VerifyContentRegion(contentRoot model.Hash32, offset, length uin
 		if chunkEnd <= offset || chunkStart >= end {
 			continue
 		}
-		bytesValue, err := ReadBlobVerified(s.root, BlobObject, chunk.Hash, model.DomainChunk)
+		bytesValue, err := readBlobVerified(s.blobs, BlobObject, chunk.Hash, model.DomainChunk)
 		if err != nil {
 			return RegionVerification{}, werr.Newf(werr.Corrupt, "chunk %d (%s): %s", index, chunk.Hash.Hex(), err.Error())
 		}

@@ -328,5 +328,5 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 // ManifestOf reads and validates a manifest by content id. It seeds a
 // ManifestCache for WriteFileCached.
 func (s *Store) ManifestOf(content model.Hash32) (model.Manifest, error) {
-	return ReadManifest(s.root, content)
+	return readManifest(s.blobs, content)
 }

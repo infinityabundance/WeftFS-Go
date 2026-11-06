@@ -20,7 +20,7 @@ import (
 // full read) the frozen content hash are all verified. A missing, unreadable,
 // cyclic, or mismatched dependency is Corrupt; no partial bytes are returned.
 func readTensorRange(
-	root string,
+	src blobSource,
 	manifest model.Manifest,
 	rep *model.Representation,
 	offset, length uint64,
@@ -46,7 +46,7 @@ func readTensorRange(
 	if rep.Frame == nil {
 		return nil, werr.Newf(werr.Corrupt, "tensor representation has no frame id")
 	}
-	frameBytes, err := ReadBlobVerified(root, BlobManifest, *rep.Frame, model.DomainManifest)
+	frameBytes, err := readBlobVerified(src, BlobManifest, *rep.Frame, model.DomainManifest)
 	if err != nil {
 		return nil, err
 	}
@@ -73,11 +73,11 @@ func readTensorRange(
 	case 10:
 		logical, err = decodeTensorMode10(parsed, rep, manifest, lim)
 	case 11:
-		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaWeight, lim)
+		logical, err = decodeTensorDelta(src, parsed, rep, depth, seen, deltaWeight, lim)
 	case 14:
-		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaSemantic, lim)
+		logical, err = decodeTensorDelta(src, parsed, rep, depth, seen, deltaSemantic, lim)
 	case 16:
-		logical, err = decodeTensorDelta(root, parsed, rep, depth, seen, deltaSparse, lim)
+		logical, err = decodeTensorDelta(src, parsed, rep, depth, seen, deltaSparse, lim)
 	case 12:
 		logical, err = decodeTensorKvPage(parsed, rep, lim)
 	case 13:
@@ -241,7 +241,7 @@ func decodeTensorMode10(
 }
 
 func decodeTensorDelta(
-	root string,
+	src blobSource,
 	parsed *frame.Frame,
 	rep *model.Representation,
 	depth int,
@@ -303,12 +303,12 @@ func decodeTensorDelta(
 	if containsHash(seen, depRoot) {
 		return nil, werr.Newf(werr.Corrupt, "tensor representation dependency cycle")
 	}
-	depManifest, err := ReadManifest(root, depRoot)
+	depManifest, err := readManifest(src, depRoot)
 	if err != nil {
 		return nil, err
 	}
 	seen = append(seen, depRoot)
-	baseBytes, err := readManifestRangeInner(root, depManifest, 0, depManifest.Size, true, depth+1, seen)
+	baseBytes, err := readManifestRangeInner(src, depManifest, 0, depManifest.Size, true, depth+1, seen)
 	seen = seen[:len(seen)-1]
 	if err != nil {
 		return nil, err
