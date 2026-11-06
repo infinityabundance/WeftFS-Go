@@ -229,8 +229,7 @@ func (c *accessCounts) consume(id model.Hash32) uint64 {
 	previous := c.counts[id]
 	delete(c.counts, id)
 	if previous > 0 {
-		// Keep a zero-delta pending entry so flush cannot early-return: a pure
-		// consumption must still publish the compacted snapshot.
+		// Keep a zero-delta pending entry so flush cannot early-return: a pure consumption must still publish the compacted snapshot.
 		c.pending[id] = 0
 		c.pendingReads = saturatingAdd(c.pendingReads, 1)
 		c.forceCompact = true
