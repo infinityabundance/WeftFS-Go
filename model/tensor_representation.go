@@ -85,6 +85,8 @@ func TensorStrategyForMode(mode uint32) (string, bool) {
 		return "sparse-delta", true
 	case 17:
 		return "float-tiled", true
+	case 18:
+		return "float-tiled-streams", true
 	default:
 		return "", false
 	}
@@ -112,6 +114,8 @@ func TensorModeForStrategy(strategy string) (uint32, bool) {
 		return 16, true
 	case "float-tiled":
 		return 17, true
+	case "float-tiled-streams":
+		return 18, true
 	default:
 		return 0, false
 	}

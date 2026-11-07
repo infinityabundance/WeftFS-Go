@@ -84,6 +84,15 @@ func readTensorRange(
 		logical, err = decodeTensorActivation(parsed, rep, lim)
 	case 15:
 		logical, err = modes.DecodeTiledTensor(parsed, lim)
+	case 18:
+		logical, err = modes.DecodeFloatTiledStreams(parsed, lim, 1)
+		if err == nil {
+			var root model.Hash32
+			root, err = tensor.LogicalRoot(rep.Tensor.Dtype, rep.Tensor.Shape, logical, lim)
+			if err == nil && root != rep.Tensor.LogicalRoot {
+				err = werr.Newf(werr.Corrupt, "mode-18 logical root disagrees with the manifest")
+			}
+		}
 	case 17:
 		logical, err = modes.DecodeFloatTiled(parsed, lim)
 		if err == nil {
@@ -150,6 +159,8 @@ func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 		return frame.ModeSparseDelta, true
 	case 17:
 		return frame.ModeFloatTiled, true
+	case 18:
+		return frame.ModeFloatTiledStreams, true
 	default:
 		return 0, false
 	}

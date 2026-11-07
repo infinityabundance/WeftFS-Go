@@ -22,6 +22,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"math/bits"
 	"sort"
@@ -121,6 +122,9 @@ const (
 	// TensorStrategyFloatTiled is one mode-17 FLOAT_TILED frame: a per-tile
 	// mode-9 plane split with independent tiles.
 	TensorStrategyFloatTiled TensorStrategy = "float-tiled"
+	// TensorStrategyFloatTiledStreams is one mode-18 FLOAT_TILED_STREAMS
+	// frame: per-tile interleaved Huffman streams.
+	TensorStrategyFloatTiledStreams TensorStrategy = "float-tiled-streams"
 )
 
 // ParseTensorStrategy parses a canonical planner strategy spelling.
@@ -129,7 +133,7 @@ func ParseTensorStrategy(text string) (TensorStrategy, error) {
 	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
 		TensorStrategySharded, TensorStrategyWeightDelta, TensorStrategySparseDelta,
 		TensorStrategySemanticDelta, TensorStrategyKvCache, TensorStrategyActivation,
-		TensorStrategyFloatTiled:
+		TensorStrategyFloatTiled, TensorStrategyFloatTiledStreams:
 		return TensorStrategy(text), nil
 	default:
 		return "", werr.Newf(werr.Malformed, "unknown tensor strategy `%s`", text)
@@ -170,6 +174,8 @@ func (s TensorStrategy) frameMode() (uint32, bool) {
 		return 14, true
 	case TensorStrategyFloatTiled:
 		return 17, true
+	case TensorStrategyFloatTiledStreams:
+		return 18, true
 	default:
 		return 0, false
 	}
@@ -186,7 +192,7 @@ func (s TensorStrategy) usesDependency() bool {
 func (s TensorStrategy) IsIndependent() bool {
 	switch s {
 	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
-		TensorStrategySharded, TensorStrategyFloatTiled:
+		TensorStrategySharded, TensorStrategyFloatTiled, TensorStrategyFloatTiledStreams:
 		return true
 	default:
 		return false
@@ -215,6 +221,8 @@ func tensorStrategyRank(s TensorStrategy) int {
 		return 8
 	case TensorStrategyFloatTiled:
 		return 9
+	case TensorStrategyFloatTiledStreams:
+		return 10
 	default:
 		return 99
 	}
@@ -261,6 +269,10 @@ func (s TensorStrategy) costClass() CostClass {
 		// Same per-tile geometry and Huffman exponent decode as mode 15; the
 		// frozen calibration class set has no float-tiled row.
 		return CostClassTensorTiled
+	case TensorStrategyFloatTiledStreams:
+		// Mode 18 has its own measured row (see EstimateMode18NS); the frozen
+		// calibration class set has no mode-18 row.
+		return CostClassTensorTiled
 	case TensorStrategySharded:
 		return CostClassTensorSharded
 	case TensorStrategyWeightDelta:
@@ -285,14 +297,26 @@ func estimatedDecodeNS(strategy TensorStrategy, size uint64, options TensorPlanO
 	if model == "" {
 		model = DefaultCostModel
 	}
-	full := EstimateDecodeNSWith(strategy.costClass(), size, model, options.Cost)
-	tileIndependent := strategy == TensorStrategyFloatTiled
+	var full uint64
+	if strategy == TensorStrategyFloatTiledStreams && options.Cost == nil {
+		full = EstimateMode18NS(size)
+	} else {
+		full = EstimateDecodeNSWith(strategy.costClass(), size, model, options.Cost)
+	}
+	tileIndependent := strategy == TensorStrategyFloatTiled ||
+		strategy == TensorStrategyFloatTiledStreams
+	estimate := func(bytes uint64) uint64 {
+		if strategy == TensorStrategyFloatTiledStreams && options.Cost == nil {
+			return EstimateMode18NS(bytes)
+		}
+		return EstimateDecodeNSWith(strategy.costClass(), bytes, model, options.Cost)
+	}
 	regionCost := func(regionBytes uint64) uint64 {
 		if regionBytes > size {
 			regionBytes = size
 		}
 		if tileIndependent {
-			return EstimateDecodeNSWith(strategy.costClass(), regionBytes, model, options.Cost)
+			return estimate(regionBytes)
 		}
 		return full
 	}
@@ -635,6 +659,9 @@ type TensorPlanOptions struct {
 	// AccessPattern is the pattern the decode estimate is priced for. The zero
 	// value is Whole and reproduces the historical plan exactly.
 	AccessPattern AccessPattern
+	// NStreams is the mode-18 interleaved stream count. 0 uses
+	// modes.FloatTiledStreamsDefault (4).
+	NStreams uint64
 }
 
 // TensorWriteSpec is the option set for one tensor write.
@@ -1228,6 +1255,54 @@ func (s *Store) prepareTensorCandidates(
 				},
 			},
 		})
+	}
+
+	// Mode 18 FLOAT_TILED_STREAMS: multi-stream interleaved per-tile split.
+	// Same tile opt-in as mode 17; the bytes-only default keeps choosing the
+	// strictly smaller representation because mode 18 pays one 256-byte table
+	// per exponent stream.
+	if len(options.TileShape) == 0 {
+		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, "no tile shape supplied"))
+	} else if floatDtype, ok := floatTensorDtype(dtype); !ok {
+		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams,
+			"dtype "+dtype+" has no mode-9 float layout"))
+	} else if floatDtype.Name != "bf16" && floatDtype.Name != "fp16" && floatDtype.Name != "fp32" {
+		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams,
+			floatDtype.Name+" has no logical-tensor identity layout for mode 18"))
+	} else {
+		nStreams := options.NStreams
+		if nStreams == 0 {
+			nStreams = modes.FloatTiledStreamsDefault
+		}
+		frameBytes, err := modes.EncodeFloatTiledStreams(
+			logical, floatDtype, shape, options.TileShape, nStreams, lim)
+		if err != nil {
+			out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, err.Error()))
+		} else if parsed, err := frame.Parse(frameBytes, lim); err != nil {
+			out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, err.Error()))
+		} else if descriptor, err := modes.ParseFloatTiledStreams(parsed, lim); err != nil {
+			out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, err.Error()))
+		} else {
+			physical := uint64(len(frameBytes))
+			estimate := estimatedDecodeNS(TensorStrategyFloatTiledStreams, size, options)
+			out = append(out, preparedTensorCandidate{
+				candidate: TensorPlanCandidate{
+					Strategy: TensorStrategyFloatTiledStreams, Applicable: true,
+					Detail:            fmt.Sprintf("one mode-18 float-tiled frame with %d streams", nStreams),
+					PhysicalBytes:     uint64Ptr(physical),
+					EstimatedDecodeNS: uint64Ptr(estimate),
+					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+				},
+				artifact: &tensorArtifact{
+					Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTiledStreams.String(),
+					Frame: frameBytes,
+					Tensor: &model.TensorRepresentation{
+						Mode: 18, Dtype: dtype, Shape: append([]uint64(nil), shape...),
+						LogicalRoot: descriptor.Meta.LogicalRoot, Layout: layout.WCBValue(dtype, shape),
+					},
+				},
+			})
+		}
 	}
 
 	// Mode 10 tensor-sharded, restricted to q8_0 (one whole-tensor shard).

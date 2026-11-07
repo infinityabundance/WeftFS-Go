@@ -28,6 +28,27 @@ const (
 // DefaultCostModel is the planner default.
 const DefaultCostModel = CostModelMeasured
 
+// Mode18MeasuredCalibration names the measured mode-18 row. Mode 18 has its
+// own measured affine coefficients; the persisted calibration schema has no
+// mode-18 class, so a host calibration prices mode 18 with the tensor-tiled row.
+const Mode18MeasuredCalibration = "weftfs-mode18/decode-calibration/v1"
+
+// mode18FixedNS and mode18NSPerMiB are the measured mode-18 coefficients
+// (median of three 7-repetition runs, 128 KiB and 16 MiB, four interleaved
+// streams). They are not a copy of the tensor-tiled row.
+const (
+	mode18FixedNS  uint64 = 0
+	mode18NSPerMiB uint64 = 3674824
+)
+
+// EstimateMode18NS returns the measured mode-18 decode estimate for
+// decodedBytes logical bytes.
+func EstimateMode18NS(decodedBytes uint64) uint64 {
+	hi, lo := bits.Mul64(decodedBytes, mode18NSPerMiB)
+	scaled := (hi << 44) | (lo >> 20)
+	return saturatingAdd(scaled, mode18FixedNS)
+}
+
 // ParseCostModelKind parses `declared|measured`.
 func ParseCostModelKind(text string) (CostModelKind, error) {
 	switch CostModelKind(text) {
