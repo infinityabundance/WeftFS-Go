@@ -31,6 +31,10 @@ type GCReport struct {
 	Deleted      []string
 	DeletedFiles uint64
 	DeletedBytes uint64
+	// DeletedIndexes names advisory index segments removed by this pass. Their
+	// bytes are included in DeletedBytes; removing a segment never removes
+	// data, a later query simply rebuilds.
+	DeletedIndexes []string
 	// Retained counts marked files plus unmarked files kept by the grace gate.
 	Retained      uint64
 	GraceRetained uint64
@@ -287,6 +291,28 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	} else {
 		report.RemainingFiles = report.UnreachableFiles
 		report.RemainingBytes = report.UnreachableBytes
+	}
+
+	// Advisory index segments are retained only for commits named by a
+	// retained root: the current head, a snapshot, or a commit carrying a
+	// checkpoint manifest. In-memory object pins are subsumed by the head.
+	retainedIndexes := make(map[model.Hash32]struct{}, len(s.state.Snapshots)+1)
+	retainedIndexes[s.head] = struct{}{}
+	for _, commit := range s.state.Snapshots {
+		retainedIndexes[commit] = struct{}{}
+	}
+	for _, commit := range commits {
+		if commit.Commit.Checkpoint != nil {
+			retainedIndexes[commit.Hash] = struct{}{}
+		}
+	}
+	indexCandidates, indexDeleted, indexBytes, indexProblems := s.gcIndexSegments(
+		retainedIndexes, now, graceSecs, apply)
+	report.Problems = append(report.Problems, indexProblems...)
+	report.Candidates = append(report.Candidates, indexCandidates...)
+	if apply {
+		report.DeletedIndexes = append(report.DeletedIndexes, indexDeleted...)
+		report.DeletedBytes += indexBytes
 	}
 	return report, nil
 }

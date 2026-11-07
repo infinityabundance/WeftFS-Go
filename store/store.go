@@ -232,6 +232,9 @@ type Store struct {
 	pendingOps           []model.Op
 	groupForceCheckpoint bool
 	groupUndo            groupJournal
+	// Advisory selector index cache and diagnostics (indexes/<ab>/<commit>.idx).
+	// Derived data only: never part of a commit or a format.
+	indexes indexState
 }
 
 // ResetWriteChunkReads resets the Merkle range-write chunk-read counter.
@@ -835,8 +838,14 @@ func (s *Store) CurrentState() *model.State { return s.state }
 // Close releases the writer lock. It does not fsync anything: every mutation
 // was durably published before its call returned.
 func (s *Store) Close() error {
-	if s.mode == ReadWrite && s.access != nil {
-		_ = s.access.flush(s.commits)
+	if s.mode == ReadWrite {
+		if s.access != nil {
+			_ = s.access.flush(s.commits)
+		}
+		// Publish anything a packed plane buffered after the last commit's
+		// flush. The advisory index segment is written after its commit
+		// publishes, so on a packed plane it is exactly this case.
+		_ = s.blobs.Flush()
 	}
 	s.writerLockHeld = false
 	return s.commits.Close()
@@ -1253,7 +1262,7 @@ func (s *Store) Resolve(sel *selector.Selector, snapshot *model.Hash32, principa
 		snapshotID = *snapshot
 		state = pinned
 	}
-	return resolver.ResolveState(sel, snapshotID, state, principal, lim)
+	return resolver.ResolveStateIndexed(sel, snapshotID, state, principal, lim, s.stateIndex(snapshotID, state))
 }
 
 // ResolveState evaluates a selector against an explicit state.
@@ -1368,6 +1377,7 @@ func (s *Store) writeGenesis() error {
 	s.head = hash
 	s.generation = 1
 	s.nextGeneration = 2
+	s.persistIndexAfterCommit(s.head, s.state)
 	return nil
 }
 
@@ -1442,6 +1452,9 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
+	// Advisory only: the commit is already durable and visible. A failed index
+	// write is recorded and ignored.
+	s.persistIndexAfterCommit(hash, s.state)
 	if quotaPlan != nil {
 		s.recordQuotaAfterCommit(quotaPlan)
 	}

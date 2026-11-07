@@ -1044,6 +1044,7 @@ func (s *Store) publishQuotaUsageOp(op model.SetQuotaUsageOp) (model.Hash32, err
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
+	s.persistIndexAfterCommit(hash, s.state)
 	return hash, nil
 }
 

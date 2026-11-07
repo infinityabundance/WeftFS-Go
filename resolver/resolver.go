@@ -23,6 +23,7 @@ import (
 	"github.com/infinityabundance/WeftCodec-Go/selector"
 	"github.com/infinityabundance/WeftCodec-Go/wcb"
 	"github.com/infinityabundance/WeftFS-Go/auth"
+	weftindex "github.com/infinityabundance/WeftFS-Go/index"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
@@ -113,6 +114,22 @@ func selectorPredicatesAllowed(expr *selector.Expr, capability *auth.Capability)
 // budget enforcement. Authorization is applied before counting; an overrun is
 // LimitExceeded, never a silently truncated success.
 func ResolveStateWithBudget(sel *selector.Selector, snapshotID model.Hash32, state *model.State, principal auth.Principal, lim limits.Limits, capability *auth.Capability, contextRootID *model.Hash32, budget *weftcontext.Budget) (*Resolution, error) {
+	return resolveStateInner(sel, snapshotID, state, principal, lim, capability, contextRootID, budget, nil)
+}
+
+// ResolveStateIndexed evaluates a selector with candidate narrowing from a
+// caller-provided (cached or persisted) index. The index must describe `state`;
+// an index that does not is refused with Corrupt rather than used, because it
+// could under-select. Every candidate is still confirmed by the authoritative
+// evaluator, so the index can never decide a match.
+func ResolveStateIndexed(sel *selector.Selector, snapshotID model.Hash32, state *model.State, principal auth.Principal, lim limits.Limits, idx *weftindex.StateIndex) (*Resolution, error) {
+	if idx == nil {
+		return ResolveStateWithBudget(sel, snapshotID, state, principal, lim, nil, nil, nil)
+	}
+	return resolveStateInner(sel, snapshotID, state, principal, lim, nil, nil, nil, idx)
+}
+
+func resolveStateInner(sel *selector.Selector, snapshotID model.Hash32, state *model.State, principal auth.Principal, lim limits.Limits, capability *auth.Capability, contextRootID *model.Hash32, budget *weftcontext.Budget, idx *weftindex.StateIndex) (*Resolution, error) {
 	if sel.Namespace != model.DefaultNamespace {
 		return nil, werr.Newf(werr.NamespaceMismatch, "selector namespace `%s` is not `%s`", sel.Namespace, model.DefaultNamespace)
 	}
@@ -159,19 +176,47 @@ func ResolveStateWithBudget(sel *selector.Selector, snapshotID model.Hash32, sta
 	if err != nil {
 		return nil, werr.FromCodec(err)
 	}
+	// Fail closed: an index that does not describe this state could
+	// under-select candidates, which would be a silent correctness violation.
+	if idx != nil && !idx.MatchesState(state) {
+		return nil, werr.Newf(werr.Corrupt, "cached state index does not describe this state")
+	}
 
 	type match struct {
 		record   model.ObjectRecord
 		evidence []EvidenceEntry
 	}
 	matches := make([]match, 0)
-	for _, id := range model.SortHashKeys(state.Objects) {
-		record := state.Objects[id]
-		if !auth.CanRead(record, principal) {
-			continue
+	if idx == nil {
+		for _, id := range model.SortHashKeys(state.Objects) {
+			record := state.Objects[id]
+			if !auth.CanRead(record, principal) {
+				continue
+			}
+			if evidence, ok := evalExpr(sel.Predicate, record, state, principal); ok {
+				matches = append(matches, match{record: record, evidence: evidence})
+			}
 		}
-		if evidence, ok := evalExpr(sel.Predicate, record, state, principal); ok {
-			matches = append(matches, match{record: record, evidence: evidence})
+	} else {
+		authorized := make(map[model.Hash32]struct{}, len(state.Objects))
+		for id, record := range state.Objects {
+			if auth.CanRead(record, principal) {
+				authorized[id] = struct{}{}
+			}
+		}
+		for id := range candidatesFor(sel.Predicate, idx, state, principal, authorized).ids {
+			// Defense in depth: candidates are always intersected with the
+			// authorized universe, but never rely on that for disclosure.
+			if _, ok := authorized[id]; !ok {
+				continue
+			}
+			record, ok := state.Objects[id]
+			if !ok {
+				continue
+			}
+			if evidence, ok := evalExpr(sel.Predicate, record, state, principal); ok {
+				matches = append(matches, match{record: record, evidence: evidence})
+			}
 		}
 	}
 	matchedCount := uint64(len(matches))

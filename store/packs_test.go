@@ -415,6 +415,12 @@ func TestPackedLayoutIsDeterministic(t *testing.T) {
 	for round := 0; round < 2; round++ {
 		dir := t.TempDir()
 		opts := packedStoreOptions(1024)
+		// Advisory index segments are keyed by commit hash, and a commit hash
+		// includes its timestamp. A fixed clock is therefore part of "identical
+		// inputs" once the pack also carries `indexes/`; without it this test
+		// would compare two different stores.
+		fixed := int64(1_700_000_000_000_000_000)
+		opts.FixedTimestampNS = &fixed
 		opts.PackOptions.TargetBytes = 8192
 		opts.PackOptions.MemberThresholdBytes = 512
 		s, err := store.Init(dir, opts)

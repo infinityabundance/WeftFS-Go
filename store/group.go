@@ -319,6 +319,8 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
+	// Advisory only: the commit is already durable and visible.
+	s.persistIndexAfterCommit(hash, s.state)
 	if quotaPlan != nil {
 		s.recordQuotaAfterCommit(quotaPlan)
 	}
