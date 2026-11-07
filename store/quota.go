@@ -20,8 +20,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 
@@ -1389,48 +1387,6 @@ func (s *Store) recordQuotaAfterCommit(plan *quotaPlan) {
 	}
 	s.quota.Generation = s.generation
 	s.quota.Commit = s.head
-}
-
-// writeReplace atomically replaces a mutable record.
-func writeReplace(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	if err := makeDir(dir); err != nil {
-		return err
-	}
-	tmp := filepath.Join(dir, "tmp", "quota-"+fmt.Sprintf("%d-%d", os.Getpid(), tmpCounter.Add(1)))
-	if err := os.MkdirAll(filepath.Dir(tmp), 0o755); err != nil {
-		return werr.Wrap(werr.Io, err, "cannot create tmp directory")
-	}
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return werr.Wrap(werr.Io, err, "cannot create %s", tmp)
-	}
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot write %s", tmp)
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot fsync %s", tmp)
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot close %s", tmp)
-	}
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot chmod %s", tmp)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot replace %s", path)
-	}
-	if err := fsyncDir(dir); err != nil {
-		return err
-	}
-	return nil
 }
 
 func objectRecordsEqual(a, b model.ObjectRecord) bool {

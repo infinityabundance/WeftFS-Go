@@ -205,7 +205,46 @@ func (c *localControl) WriteRecordNew(name string, data []byte) error {
 }
 
 func (c *localControl) WriteRecordReplace(name string, data []byte) error {
-	return writeReplace(c.path(name), data)
+	return writeRecordReplace(c.root, c.path(name), data)
+}
+
+// writeRecordReplace atomically replaces a control record, staging in the
+// store's single `tmp/` directory. It must not stage under the record's own
+// directory: `access/counts.v1` and `tmp/probe-*` would otherwise create
+// nested `access/tmp` or `tmp/tmp` directories.
+func writeRecordReplace(root, path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := makeDir(dir); err != nil {
+		return err
+	}
+	tmpDir := filepath.Join(root, "tmp")
+	if err := makeDir(tmpDir); err != nil {
+		return err
+	}
+	tmp := filepath.Join(tmpDir, "record-"+itoa(uint64(os.Getpid()))+"-"+itoa(tmpCounter.Add(1)))
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return werr.Wrap(werr.Io, err, "cannot create %s", tmp)
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		_ = os.Remove(tmp)
+		return werr.Wrap(werr.Io, err, "cannot write %s", tmp)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		_ = os.Remove(tmp)
+		return werr.Wrap(werr.Io, err, "cannot fsync %s", tmp)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return werr.Wrap(werr.Io, err, "cannot close %s", tmp)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return werr.Wrap(werr.Io, err, "cannot publish %s", path)
+	}
+	return fsyncDir(dir)
 }
 
 func (c *localControl) DeleteRecord(name string) error {

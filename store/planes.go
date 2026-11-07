@@ -743,17 +743,20 @@ func (c *commitPlane) compareExchange(name string, expected *string, data []byte
 		return "", werr.Newf(werr.Busy,
 			"control record %s changed since it was read; compare-and-swap refused", name)
 	}
-	if err := writeReplace(c.path(name), data); err != nil {
+	if err := writeRecordReplace(c.root, c.path(name), data); err != nil {
 		return "", err
 	}
 	return ControlToken(data), nil
 }
 
 func (c *commitPlane) writeControl(name string, data []byte) error {
-	return writeReplace(c.path(name), data)
+	return writeRecordReplace(c.root, c.path(name), data)
 }
 
 func (c *commitPlane) putControlIfAbsent(name string, data []byte) error {
+	if err := makeDir(filepath.Dir(c.path(name))); err != nil {
+		return err
+	}
 	return writeNewFile(c.path(name), data, 0o644)
 }
 
