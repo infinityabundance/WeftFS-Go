@@ -212,6 +212,7 @@ func TestCalibrateCLIInstallRejectsMalformedAndWritesNothing(t *testing.T) {
 
 func TestCalibrateCLIInstallRefusesARemoteStore(t *testing.T) {
 	resetCalibrateGlobals(t)
+	resetPlanePolicy(t)
 	if err := runCalibrateCLIError(t, []string{
 		"--backend", "gcs", "calibrate", "--install",
 	}); err == nil {
