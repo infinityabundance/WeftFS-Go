@@ -1045,3 +1045,191 @@ parent file was edited.
   no-ops: physical packs are not rewritten by the Go plane.
 - Durability means "the provider acknowledged the write"; there is no fsync on
   S3 and the court's data is a tmpfs, so no durability claim is made.
+
+---
+
+## Selector-index persistence (WFX2) — implemented
+
+This closes the last storage-surface gap against the Rust reference's advisory
+per-commit selector index (`src/index.rs`, `store::state_index`).
+
+Revisions: WeftFS-Go `c4a72c497c41dcc29a00a0a5f43acf0f1944237d` (code + tests)
+plus the documentation/benchmark commit that follows it. No parent file, no
+parent pin, and no codec submodule was modified.
+
+### What is implemented
+
+- `index/` is the Go port of Rust's `StateIndex`: presence/equality attribute
+  maps, outgoing relation edges by `(subject, predicate)`, and `tagged_as`
+  text tags. Equality keys are the canonical WCB bytes of
+  `["weft.eq.<tag>", value]`, and the numeric families (`U64`, `I64`,
+  `Timestamp`) share `["weft.eq.num", "<decimal i128>"]`, exactly as Rust
+  writes them. Arrays/maps have no equality key; a scalar that the canonical
+  encoder rejects marks the index **incomplete**, and an incomplete index is
+  never persisted.
+- `resolver.ResolveStateIndexed` is the port of Rust's `candidates_for`.
+  `evalExpr` still confirms every candidate; `Not` only complements an exact
+  candidate set. An index whose `MatchesState` guard fails is refused with
+  `Corrupt`, never used.
+- `store/index.go`:
+  - **write**: after every published commit — `init`, `commitOps`,
+    `publishGroupOps` (one segment per group, not per buffered mutation), and
+    `publishQuotaUsageOp` — publish `indexes/<ab>/<commit>.idx` through
+    `BlobAccess` (so the local/object/packed/S3 plane rules are unchanged). A
+    write error becomes a diagnostic note and a `WriteErrors` count; the
+    commit has already published and is never failed.
+  - **load**: first resolution after reopen tries the segment for the pinned
+    commit. It must decode, name the same commit, and match the state's
+    generation and all three counts; any mismatch emits a note, increments
+    `Rejects`, and rebuilds. A loaded index is marked complete.
+  - **cache**: bounded (8 entries), LRU by snapshot commit, guarded by
+    `MatchesState`. Inside a group the live state changes while the head does
+    not, so the index is rebuilt per call there (same rule as Rust).
+  - **read-only**: `writeStateIndex` returns immediately; a read-only open
+    never creates `indexes/`.
+  - `Store.IndexStats()` / `ResetIndexStats()` expose `DiskLoads`, `Builds`,
+    `Rejects`, `Writes`, `WriteErrors`, `GCDeleted`, and up to 64 notes.
+- `GC` deletes segments whose commit is not named by the current head, a
+  snapshot, or a commit carrying a checkpoint manifest; the configured grace
+  window applies; `GCReport.DeletedIndexes` lists what was removed. Verify
+  never reads an index segment (`verify --full` is unaffected by deleting or
+  corrupting one; the tests assert this).
+
+### WFX2 layout (verified on a real segment)
+
+`magic "WFX2" | u32le version=1 | commit[32] | u64le generation | u64le
+object_count | u64le relation_count | u64le entry_count | with_attr section |
+attr_eq section | flattened relations_from section | tags section |
+BLAKE3("weft/index/v2", all preceding bytes)`. Every section is
+`u32le count` followed by fixed-width elements; ids are 32 bytes ascending;
+names/predicates are `u32le len || UTF-8`; relation targets are one tag byte
+plus payload (`0` object id, `1` null, `2` bool, `3` u64, `4` i64,
+`5` timestamp, `6` text, `7` bytes).
+
+Real 10,000-object segment from `cmd/indexbench`, produced in
+`weft/fuse-court:1`:
+
+```
+2423650 /tmp/weft-go-index-bench/indexes/e6/e6c1e70597dab5a53deb73df54c5d53ba72d60bbb4462aa51c0689a4e10ae6ba.idx
+0000000 57 46 58 32 01 00 00 00 e6 c1 e7 05 97 da b5 a5
+0000016 3d eb 73 df 54 c5 d5 3b a7 2d 60 bb b4 46 2a a5
+0000032 1c 06 89 a4 e1 0a e6 ba 02 00 00 00 00 00 00 00
+0000048 11 27 00 00 00 00 00 00 10 27 00 00 00 00 00 00
+0000064 10 27 00 00 00 00 00 00 03 00 00 00 06 00 00 00
+0000080 6e 65 73 74 65 64 10 27 00 00 00 00 69 d5 de 40
+```
+
+`57 46 58 32` = `WFX2`, version 1, commit `e6c1…e6ba`, generation 2 (the group
+commit), 10001 objects / 10000 relations / 10000 entries, then three
+`with_attr` names starting with `nested` and its 10000 ids. The byte length,
+2,423,650, is the same as the Rust WFX2 file recorded for its own 10k fixture;
+the fixture is not identical, so this is a consistency observation, not an
+equality proof (the equality proof is the cross-language test below).
+
+### Cross-language evidence (real processes, fuse court)
+
+Command:
+`scripts/docker-court.sh fuse "cd /work/WeftFS-Go && go test -count=1 ./store/
+-run 'TestRustLoadsGoWrittenIndexSegment|TestGoLoadsRustWrittenIndexSegment' -v"`
+
+- **Rust loads a Go-written segment**: Go builds the fixture and its segments.
+  Rust `query 'select tag("alpha")'` agrees with Go on the same store. Then the
+  test decodes the Go segment with `weftindex.DecodeFile`, empties the tag
+  section (or, separately, the attr_eq section), re-encodes with a valid
+  digest, and writes it back. Rust then answers **0 matches** for the emptied
+  section. A rebuild would still have found the relation/attribute and
+  returned matches, so 0 proves Rust *decoded and trusted the Go bytes*. The
+  original bytes are restored and Rust answers again.
+- **Go loads a Rust-written segment**: Rust writes init/creates (string and
+  u64 attributes)/`tagged_as`/`links`/snapshot. Go opens read-only and, with
+  counters reset, answers a tag query, an attr-equality query, a range query,
+  a relation query, and `true` with `DiskLoads=1, Builds=0, Rejects=0`; every
+  answer equals the index-free scan oracle for two principals. A second
+  principal reuses the cache (`DiskLoads=0`). The pinned view loads its own
+  Rust-written segment. `DecodeFile` → `EncodeFile` of the Rust file is
+  **byte-identical**.
+- Both directions pass (`PASS`, 0.02 s and 0.01 s). The Go-only court skips
+  these (the Rust binary needs libfuse3) rather than failing.
+
+### Test counts and commands
+
+Environment: `weft/fuse-court:1` (image id
+`sha256:1a0e1337179d9bcc5c05efd00b94b40b674d9586a344dacb977625a1b3273157`),
+kernel 7.3.1-1-cachyos, `--memory=3g --memory-swap=3g --pids-limit=1024
+--cpus=4`, tmpfs `/tmp`, `--cap-drop=ALL` (+ SYS_ADMIN and `/dev/fuse` for the
+fuse court). No host build or test was run.
+
+- `gofmt -l .` empty, `go vet ./...` clean, `CGO_ENABLED=0 go build ./...`
+  clean (go court).
+- `go test -race -count=1 ./...` (fuse court): **all packages ok** —
+  `cmd/weftfs`, `fusefs`, `index`, `model`, `store`; `store` 112.9 s. No
+  failures. Top-level `func Test` counts: store 197, fusefs 25, index 4,
+  model 6, cmd/weftfs 18.
+- New index tests: `index/index_test.go` 4 (constants, canonical key bytes,
+  round-trip/determinism, canonical-order rejection); `store/index_persistence_test.go`
+  7 (one with 9 subtests = 15 cases); `store/index_handoff_test.go` 2.
+- Corruption modes exercised, each asserted to produce `Rejects>=1`,
+  `DiskLoads==0`, `Builds>=1`, a note naming the index, unchanged scan-oracle
+  answers, and a clean `verify`: bad magic, wrong version (99), wrong commit
+  key, wrong generation, wrong object count, bad digest, truncated file,
+  trailing bytes inside the sealed body, and superseded `WFX1` magic.
+
+### Measured reopen vs rebuild (host-local, synthetic)
+
+Harness: `cmd/indexbench`, 10,000 objects + 10,000 relations in one group
+commit, 5 samples per measurement, fresh `Store` per sample, `/tmp` tmpfs,
+warm page cache, fuse court, segment 2,423,650 B. Two independent runs:
+
+| measurement (median ms) | run 012125Z | run 012511Z |
+|---|---:|---:|
+| cold build from state | 8.538 | 10.434 |
+| write to disk incl. build | 25.397 | 25.678 |
+| first relation query, segment present | 7.749 | 8.042 |
+| first tag query, segment present | 16.583 | 16.884 |
+| first relation query, segment deleted | 16.838 | 16.852 |
+| first tag query, segment deleted | 24.841 | 23.851 |
+| persisted / rebuild, relation | 0.460 | 0.477 |
+| persisted / rebuild, tag | 0.668 | 0.708 |
+| peak RSS (whole process, KiB) | 423,356 | 418,996 |
+
+So persistence is a real win here: ~2.1-2.2x faster for the first relation
+query and ~1.4-1.5x for the first tag query after a reopen. The tag query is
+slower in absolute terms because it returns 100 authorized matches with
+evidence while the relation query returns one; compare each row against its
+own rebuild row, never across query shapes.
+
+Honest losses and limits:
+
+- The index is rewritten for **every** published commit, so a store doing many
+  small commits pays O(state) time and bytes per commit placed. The measured
+  write is ~17 ms on top of the ~8-10 ms build for a 2.4 MB segment (encode +
+  fsync). The benchmark's group commit is the cheap case.
+- Absolute times are higher than the Rust receipt's 4.70/12.44 ms and
+  6.23/14.21 ms at its own 10k fixture. The fixtures, replay shape, and query
+  result sizes differ, so this is not a like-for-like comparison and no
+  "Go is slower than Rust" claim is made.
+- A query that cannot use the index (`select true`, `score > 5`, ordering by a
+  derived field) still pays the segment load and the O(n) authorization scan
+  after a reopen and gains nothing from it. This case was **not measured**.
+- Index segments are packed when `--pack` is enabled, so with packing they
+  become part of physical pack layout, which then depends on commit
+  timestamps. `store/packs_test.go` now pins the clock in its determinism test
+  to make that explicit (commit-keyed members are an input).
+- Segments are advisory and never verified by `verify`; a corrupted segment is
+  detected only when a query loads it. `MIN`/`MAX` bounds are enforced, but a
+  digest-valid segment that under-selects is accepted (Rust has the same
+  property); the control tests depend on that and are labelled as such.
+- `Store.RequireOne` and the saved-context paths still resolve with the
+  full-scan evaluator, exactly as before; only `Store.Resolve` uses the index.
+  There is no CLI flag to disable index writing.
+- The in-memory cache is per process and not persisted; a read-only handle
+  still pays the first load.
+- Tested value kinds across the boundary: text, u64 (and `>` comparison, which
+  scans), bool/null/bytes in the unit round-trip. Rust's CLI cannot author an
+  I64/Timestamp attribute, so cross-process evidence for the numeric I64 key
+  rests on the shared documented rule and the Go unit test, not on a
+  Rust-written segment.
+- GC's default grace (3600 s) means unreferenced segments survive an hour
+  unless `--gc-grace-secs 0` is configured; the tests set 0.
+- Single host, one synthetic fixture, warm caches. No device, power-loss,
+  fleet, or production claim. No performance claim beyond the numbers above.

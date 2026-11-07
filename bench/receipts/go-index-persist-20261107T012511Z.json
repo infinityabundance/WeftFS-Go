@@ -1,0 +1,98 @@
+{
+  "checks": {
+    "deleted_first_query_builds": 1,
+    "deleted_first_query_disk_loads": 0,
+    "persisted_first_query_builds": 0,
+    "persisted_first_query_disk_loads": 1,
+    "relation_matches_scan": true,
+    "tag_matches_scan": true
+  },
+  "environment": {
+    "court_image": "weft/fuse-court:1",
+    "court_image_id": "sha256:1a0e1337179d9bcc5c05efd00b94b40b674d9586a344dacb977625a1b3273157",
+    "cpus": "4",
+    "kernel": "7.3.1-1-cachyos",
+    "memory_limit": "3g"
+  },
+  "generated_unix_secs": 1794014722,
+  "generated_utc": "20261107T012522Z",
+  "go_version": "go1.23.12",
+  "index": {
+    "commit": "e6c1e70597dab5a53deb73df54c5d53ba72d60bbb4462aa51c0689a4e10ae6ba",
+    "file": "/tmp/weft-go-index-bench/indexes/e6/e6c1e70597dab5a53deb73df54c5d53ba72d60bbb4462aa51c0689a4e10ae6ba.idx",
+    "file_bytes": 2423650,
+    "format": "WFX2",
+    "version": 1
+  },
+  "label": "synthetic, host-local, tmpfs, single host; fresh Go Store instance per sample; OS page cache warm; not a device, fleet, or production claim",
+  "measurements_ms": {
+    "cold_build_from_state": {
+      "median": 10.434,
+      "samples": [
+        11.417,
+        10.781,
+        10.434,
+        9.392,
+        9.078
+      ]
+    },
+    "first_relation_query_index_deleted": {
+      "median": 16.852,
+      "samples": [
+        16.997,
+        15.223,
+        16.852,
+        22.328,
+        15.349
+      ]
+    },
+    "first_relation_query_persisted": {
+      "median": 8.042,
+      "samples": [
+        8.042,
+        7.907,
+        7.684,
+        8.14,
+        9.613
+      ]
+    },
+    "first_tag_query_index_deleted": {
+      "median": 23.851,
+      "samples": [
+        23.851,
+        23.767,
+        29.217,
+        23.929,
+        23.45
+      ]
+    },
+    "first_tag_query_persisted": {
+      "median": 16.884,
+      "samples": [
+        16.826,
+        16.697,
+        17.02,
+        16.884,
+        20.928
+      ]
+    },
+    "trials": 5,
+    "write_to_disk_including_build": {
+      "median": 25.678,
+      "samples": [
+        23.132,
+        26.77,
+        26.135,
+        25.136,
+        25.678
+      ]
+    }
+  },
+  "peak_rss_kib": 418996,
+  "revision": "c4a72c497c41dcc29a00a0a5f43acf0f1944237d",
+  "schema": "weftfs-go.index-persist-bench.v1",
+  "state": {
+    "objects": 10000,
+    "relations": 10000
+  }
+}
