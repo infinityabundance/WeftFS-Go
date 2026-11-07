@@ -22,7 +22,7 @@ import (
 const RebaseTool = "weftfs"
 
 // storeVersion mirrors the module version recorded by the Rust crate.
-const storeVersion = "1.0.0"
+const storeVersion = "1.1.0"
 
 // ProvenanceSchema is the canonical receipt schema.
 const ProvenanceSchema = "weft.provenance.v1"
