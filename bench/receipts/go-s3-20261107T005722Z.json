@@ -1,0 +1,46 @@
+{
+  "schema": "weft-go-s3-court-v1",
+  "generated_utc": "20261107T005722Z",
+  "revision": {
+    "weftfs_go": "3e14f2658e23cb68df21274e73e872a0a1965c62",
+    "note": "WeftFS-Go only; the parent Rust revision and submodule pin were not changed"
+  },
+  "server": {
+    "product": "MinIO",
+    "release": "RELEASE.2025-04-22T22-12-26Z",
+    "version_line": "minio version RELEASE.2025-04-22T22-12-26Z (commit-id=0d7408fc9969caf07de6a8c3a84f9fbb10a6739e)",
+    "binary_sha256": "53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c",
+    "binary_url": "https://github.com/minio/minio/releases/download/RELEASE.2025-04-22T22-12-26Z/minio.linux-amd64.RELEASE.2025-04-22T22-12-26Z",
+    "container_image": "debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+    "container_image_id": "sha256:43f84a0b210f98845ef003912981774c95efe439eaa4b1cb62cf803fd46fc82a",
+    "started_by": "scripts/go-s3-court.sh",
+    "endpoint_form": "http://<container-name>:9000 path-style on a private bridge network"
+  },
+  "court": {
+    "docker_server": "29.9.2",
+    "go_image_id": "sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166",
+    "fuse_image_id": "sha256:1a0e1337179d9bcc5c05efd00b94b40b674d9586a344dacb977625a1b3273157",
+    "memory": "3g",
+    "memory_swap": "3g",
+    "pids": "1024",
+    "cpus": "4",
+    "nproc": "2048",
+    "cap_drop": "ALL",
+    "no_new_privileges": true,
+    "tmpfs": "/tmp 1g; MinIO data tmpfs 1g"
+  },
+  "tests": {
+    "focused_command": "go test -race -count=1 -v -run 'TestS3|...' ./store/ in the go court",
+    "focused_passed": 17,
+    "focused_failed": 0,
+    "focused_skipped": 1,
+    "full_command": "go test -race -count=1 ./... in the fuse court",
+    "full_passed": 4,
+    "full_failed": 0,
+    "full_count_kind": "packages reporting ok",
+    "cross_language_checks": 17,
+    "measured_if_match_form": "quoted-as-returned",
+    "logs": ["bench/receipts/go-s3-focused-20261107T005722Z.log", "bench/receipts/go-s3-full-20261107T005722Z.log", "bench/receipts/go-s3-xlang-20261107T005722Z.log"]
+  },
+  "label": "Single-node MinIO on loopback in the OOM-protected Docker court with a tmpfs data directory. Not a cloud, multi-node, fleet, device-cache, media, power-loss, or production claim."
+}

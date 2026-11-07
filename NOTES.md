@@ -995,7 +995,7 @@ parent file was edited.
 
 - Focused, go court: `gofmt -l`, `go vet ./...`, `CGO_ENABLED=0 go build ./...`
   clean; `go test -race -count=1 -v -run 'TestS3|...' ./store/` ->
-  **16 pass / 0 fail / 1 skip** (the skip is the crash child helper when run
+  **17 pass / 0 fail / 1 skip** (the skip is the crash child helper when run
   directly).
 - Full suite, fuse court: `go test -race -count=1 ./...` -> **all packages ok**
   (`cmd/weftfs`, `fusefs`, `model`, `store`), 0 failures.
@@ -1008,17 +1008,19 @@ parent file was edited.
   gone.
 - Measured on this host (loopback, tmpfs data), from the handles' own HTTP
   counters in the focused log
-  `bench/receipts/go-s3-focused-20261107T005259Z.log`: the writer handle used
+  `bench/receipts/go-s3-focused-20261107T005722Z.log`: the writer handle used
   110 requests (30 writes / 101,104 bytes written; 12 reads / 56,756 bytes
   read; 0 conditional conflicts) across init, three file writes, a snapshot,
   `verify --full`, and the reopen; a fresh read-only handle used 68 requests
   (21 reads / 113,027 bytes). These are diagnostics of one run, not throughput
   or latency measurements, and no performance claim is made from them.
-- Receipts: `bench/receipts/go-s3-20261107T005259Z.json` plus the focused,
-  full, and cross-language logs beside it. The receipt records `focused 16/0/1`,
+- Receipts: `bench/receipts/go-s3-20261107T005722Z.json` plus the focused,
+  full, and cross-language logs beside it. The receipt records `focused 17/0/1`,
   `full 4/0 packages`, `17 cross-language checks`, the exact WeftFS-Go
-  revision, MinIO release/sha256, court image ids, limits, and the measured
-  If-Match form.
+  revision `3e14f26`, MinIO release/sha256, court image ids, limits, and the
+  measured If-Match form. The earlier `...T003839Z` full-suite log is retained
+  as the evidence that the court caught the `tmp/tmp` staging defect fixed in
+  `6fc87cc`.
 
 ### Explicit limitations (not claims)
 
