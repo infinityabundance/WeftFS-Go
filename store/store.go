@@ -608,6 +608,14 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 		_ = store.commits.ReleaseWriterLock()
 		return nil, err
 	}
+	// A writable open repairs the superblock cache from the writer lock record:
+	// the record is the publication point, the cache is a cache. A repair
+	// failure is not fatal (recovery already used the record).
+	if mode == ReadWrite {
+		if generation, commit, commitLen, ok, headErr := store.commits.AttestedHead(); headErr == nil && ok && commitLen != 0 {
+			_ = store.commits.RefreshHeadCache(generation, commit, commitLen, 0)
+		}
+	}
 	base := recovery.Generation
 	if recovery.HighestFileGeneration > base {
 		base = recovery.HighestFileGeneration

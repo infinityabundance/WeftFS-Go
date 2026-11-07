@@ -1,0 +1,54 @@
++ exec docker run --rm --init --name weft-go-court-3632627 --memory=3g --memory-swap=3g --pids-limit=1024 --cpus=4 --ulimit nofile=65536:65536 --security-opt no-new-privileges --tmpfs /tmp:rw,size=1g,nosuid,nodev --cap-drop=ALL -e WEFT_IN_COURT=1 -e WEFT_COURT_IMAGE=weft/go-court:1 -e WEFT_COURT_KERNEL=7.3.1-1-cachyos -e WEFT_COURT_IMAGE_ID=sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166 -e WEFT_COURT_MEMORY=3g -e WEFT_COURT_CPUS=4 -e WEFT_COURT_PIDS=1024 -e WEFT_COURT_NPROC=2048 -e WEFT_DOCKER_SERVER=29.9.2 -e WEFT_DOCKER_CLIENT=29.1.5 -e WEFT_REPO_WEFTFS=eed6e9d8eb51b07a15bede4312e36e0560859dd8 -e WEFT_REPO_WEFTFS_GO=87a7f9e41d4e7c1935616292ca64591e386b8d5c -e WEFT_REPO_WEFTCODEC=d61ed769cab2978416e78441db7e8165163bf890 -e WEFT_REPO_WEFTCODEC_GO=86ded1edf5ca8c62ffd61687a572e924044f0c70 -e RUST_BACKTRACE=1 -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/work/.docker-cache/target-rust -e CARGO_NET_RETRY=3 -e GOCACHE=/work/.docker-cache/go-build -e GOMODCACHE=/work/.docker-cache/go-mod -e 'GOFLAGS=-p=2 -buildvcs=false' -e GOTMPDIR=/work/.docker-cache/go-tmp -e GOMAXPROCS=4 -v /mnt/1tb_kingston/WeftFS:/work -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-registry:/cargo/registry -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-git:/cargo/git -w /work -e WEFT_S3_ENDPOINT=http://weft-go-s3-minio-3632267:9000 -e WEFT_S3_REGION=us-east-1 -e WEFT_S3_ACCESS_KEY=weftcourt -e WEFT_S3_SECRET_KEY=weftcourt-secret -e WEFT_S3_LOCK_LEASE_SECS=60 -e WEFT_S3_TEST_ENDPOINT=http://weft-go-s3-minio-3632267:9000 -e WEFT_S3_TEST_PREFIX=weft-go-s3-20261107t032512z -e 'WEFT_S3_SERVER_LABEL=minio version RELEASE.2025-04-22T22-12-26Z (commit-id=0d7408fc9969caf07de6a8c3a84f9fbb10a6739e)' -e WEFT_S3_SERVER_VERSION=RELEASE.2025-04-22T22-12-26Z -e WEFT_S3_SERVER_SHA256=53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c -e WEFT_S3_CONTAINER_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc --network weft-go-s3-net-3632267 weft/go-court:1 bash -c 'set -Eeuo pipefail; ulimit -n 65536; ulimit -u 2048; export TMPDIR=/tmp; cd /work; cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run '\''TestS3|TestSigV4|TestPayloadHash|TestCanonicalQuery|TestPathAndComponent|TestIfMatchForms|TestLockRecord|TestSchemasDoNot|TestS3Config'\'' ./store/'
+=== RUN   TestS3BlobPlaneCreateOnceRangesAndListing
+--- PASS: TestS3BlobPlaneCreateOnceRangesAndListing (0.02s)
+=== RUN   TestS3CommitVolumeConditionalRecords
+    s3_integration_test.go:255: measured If-Match form: quoted-as-returned
+--- PASS: TestS3CommitVolumeConditionalRecords (0.02s)
+=== RUN   TestS3FencedWriterTakeover
+--- PASS: TestS3FencedWriterTakeover (1.28s)
+=== RUN   TestS3StoreRoundTrip
+    s3_integration_test.go:475: host-local S3 counters (writer, loopback): requests=116 writes=34 bytes_written=101976 reads=12 bytes_read=56756 conflicts=0
+    s3_integration_test.go:508: host-local S3 counters (reader handle, loopback): requests=70 reads=21 bytes_read=113027
+--- PASS: TestS3StoreRoundTrip (0.14s)
+=== RUN   TestS3SplitLayouts
+--- PASS: TestS3SplitLayouts (0.04s)
+=== RUN   TestS3CrashChildProcess
+    s3_integration_test.go:632: S3 crash helper process; not run directly
+--- SKIP: TestS3CrashChildProcess (0.00s)
+=== RUN   TestS3CrashProxy
+=== RUN   TestS3CrashProxy/after_objects
+=== RUN   TestS3CrashProxy/after_commit_file
+=== RUN   TestS3CrashProxy/after_superblock_write
+--- PASS: TestS3CrashProxy (0.17s)
+    --- PASS: TestS3CrashProxy/after_objects (0.05s)
+    --- PASS: TestS3CrashProxy/after_commit_file (0.05s)
+    --- PASS: TestS3CrashProxy/after_superblock_write (0.06s)
+=== RUN   TestS3FencedWriterPausedAfterFenceCannotPublish
+    s3_integration_test.go:766: seed generation=2 commits after seed close: [{commits/1.commit 424 2026-11-07 03:25:28.233 +0000 UTC} {commits/2.commit 609 2026-11-07 03:25:28.237 +0000 UTC}]
+    s3_integration_test.go:866: after-fence child: ok=false phase=publish class=Busy generation=2 head=c20369aaa5fea3be0351b39381ab32e473c86fcb4d503bdd316ee3688eb303c6 message="Busy: S3 writer lease deadline passed 554 ms ago (owner 376-1-1794021928249949335 fence 2); publication refused before the head was touched; the LOCK now names owner 346-1-1794021930789733906 fence 3"
+    s3_integration_test.go:869: commits after the stale publication: [{commits/1.commit 424 2026-11-07 03:25:28.233 +0000 UTC} {commits/2.commit 609 2026-11-07 03:25:28.237 +0000 UTC}]
+    s3_integration_test.go:871: child process log:
+        === RUN   TestS3FenceChildAfterFence
+        --- PASS: TestS3FenceChildAfterFence (2.56s)
+        PASS
+--- PASS: TestS3FencedWriterPausedAfterFenceCannotPublish (3.61s)
+=== RUN   TestS3FenceChildAfterFence
+--- PASS: TestS3FenceChildAfterFence (0.00s)
+=== RUN   TestSigV4MatchesThePublishedAWSVector
+--- PASS: TestSigV4MatchesThePublishedAWSVector (0.00s)
+=== RUN   TestPayloadHashNeverUsesUnsignedPayload
+--- PASS: TestPayloadHashNeverUsesUnsignedPayload (0.00s)
+=== RUN   TestCanonicalQueryEncodesAndSortsLikeAWS
+--- PASS: TestCanonicalQueryEncodesAndSortsLikeAWS (0.00s)
+=== RUN   TestPathAndComponentEncodingPreserveOnlyUnreservedBytes
+--- PASS: TestPathAndComponentEncodingPreserveOnlyUnreservedBytes (0.00s)
+=== RUN   TestIfMatchFormsEncodeETags
+--- PASS: TestIfMatchFormsEncodeETags (0.00s)
+=== RUN   TestLockRecordRoundTripsLegacyAndTombstone
+--- PASS: TestLockRecordRoundTripsLegacyAndTombstone (0.00s)
+=== RUN   TestSchemasDoNotParseAcrossBackends
+--- PASS: TestSchemasDoNotParseAcrossBackends (0.00s)
+=== RUN   TestS3ConfigResolutionAndValidation
+--- PASS: TestS3ConfigResolutionAndValidation (0.00s)
+PASS
+ok  	github.com/infinityabundance/WeftFS-Go/store	6.294s

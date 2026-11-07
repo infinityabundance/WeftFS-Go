@@ -762,16 +762,24 @@ func TestS3FencedWriterPausedAfterFenceCannotPublish(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatalf("close seed writer: %v", err)
 	}
+	if objects, err := mustClient(t, options).listPrefix("commits/"); err == nil {
+		t.Logf("seed generation=%d commits after seed close: %v", seedGeneration, objects)
+	}
 
 	work := t.TempDir()
 	ready := filepath.Join(work, "after-fence.ready.json")
 	statusPath := filepath.Join(work, "after-fence.status.json")
+	gate := filepath.Join(work, "after-fence.gate")
+	if err := syscall.Mkfifo(gate, 0o600); err != nil {
+		t.Fatalf("mkfifo: %v", err)
+	}
 
 	command := exec.Command(os.Args[0], "-test.run=^TestS3FenceChildAfterFence$", "-test.v", "-test.timeout=300s")
 	command.Env = append(os.Environ(),
 		"WEFT_FENCE_CHILD=after-fence",
 		"WEFT_FENCE_PAUSE_AFTER_FENCE=1",
 		"WEFT_FENCE_AFTER_FENCE_READY="+ready,
+		"WEFT_FENCE_AFTER_FENCE_GATE="+gate,
 		"WEFT_FENCE_STATUS="+statusPath,
 		"WEFT_FENCE_BUCKET="+bucket,
 		"WEFT_FENCE_ENDPOINT="+config.Endpoint,
@@ -806,8 +814,8 @@ func TestS3FencedWriterPausedAfterFenceCannotPublish(t *testing.T) {
 	if readyValue.Head != seedHead.Hex() {
 		t.Fatalf("child pre-publication head = %s, want %s", readyValue.Head, seedHead.Hex())
 	}
-	// The record proves the fence wrote successfully. The child raised SIGSTOP
-	// after writing the ready file.
+	// The record proves the fence wrote successfully. The child wrote the ready
+	// file and is now blocked on the gate FIFO.
 	fenced, err := newS3Control(mustClient(t, options)).ReadLockRecord()
 	if err != nil || fenced == nil {
 		t.Fatalf("read LOCK after the fence: %+v err=%v", fenced, err)
@@ -834,10 +842,16 @@ func TestS3FencedWriterPausedAfterFenceCannotPublish(t *testing.T) {
 		t.Fatalf("takeover fence = %d, want %d", reclaimed.fence, childFence+1)
 	}
 
-	// Resume the suspended writer: its publication must fail Busy.
-	if err := syscall.Kill(readyValue.PID, syscall.SIGCONT); err != nil {
-		t.Fatalf("SIGCONT: %v", err)
+	// Resume the suspended writer: its publication must fail Busy. The gate is
+	// the Go court's suspension primitive (see store/fence_pause.go).
+	gateFile, err := os.OpenFile(gate, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open gate: %v", err)
 	}
+	if _, err := gateFile.Write([]byte{1}); err != nil {
+		t.Fatalf("release the gate: %v", err)
+	}
+	_ = gateFile.Close()
 	var status struct {
 		OK         bool   `json:"ok"`
 		Phase      string `json:"phase"`
@@ -849,6 +863,12 @@ func TestS3FencedWriterPausedAfterFenceCannotPublish(t *testing.T) {
 	waitForJSONFile(t, statusPath, &status, 120*time.Second)
 	_ = command.Wait()
 	childDone = true
+	t.Logf("after-fence child: ok=%t phase=%s class=%s generation=%d head=%s message=%q",
+		status.OK, status.Phase, status.Class, status.Generation, status.Head, status.Message)
+	if objects, err := mustClient(t, options).listPrefix("commits/"); err == nil {
+		t.Logf("commits after the stale publication: %v", objects)
+	}
+	t.Logf("child process log:\n%s", childLog.String())
 	if status.OK {
 		t.Fatalf("the after-fence writer published after being fenced; child log:\n%s", childLog.String())
 	}
