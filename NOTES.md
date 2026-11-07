@@ -1136,19 +1136,22 @@ was edited.
 
 - **GCS focused, go court**: `gofmt -l`, `go vet ./...`,
   `CGO_ENABLED=0 go build ./...` clean; `go test -race -count=1 -v -run
-  'TestGCS' ./store/` -> **27 pass / 0 fail / 1 skip** (the skip is the crash
+  'TestGCS' ./store/` -> **28 pass / 0 fail / 1 skip** (the skip is the crash
   child helper run directly). Covers create-once conflict and idempotence,
   matching/stale generation CAS, strict refusal of a stale write, ranged
-  reads, two-object listing paging, a full store round trip (init, files,
-  snapshot, `verify --full`, read-only reopen, unlink + `gc`, verify), the
-  three-phase crash proxy, fence takeover/release, the paused-after-fence
-  interleaving, all four plane layouts, and the RS256 JWT-bearer exchange
-  against an in-process token endpoint.
+  reads, two-object listing paging, a 6.6 MB resumable upload, a full store
+  round trip (init, files, snapshot, `verify --full`, read-only reopen,
+  unlink + `gc`, verify), the three-phase crash proxy, fence
+  takeover/release, the paused-after-fence interleaving, all four plane
+  layouts, and the RS256 JWT-bearer exchange against an in-process token
+  endpoint.
 - **Measured generation behaviour** (fake-gcs-server; one run): create
-  generation `1794052407831645`, matching write accepted at generation
-  `1794052407832530`, stale precondition `1794052407831645` refused and the
-  winner's bytes preserved. The round-trip handle counters were 129 requests,
-  34 writes / 101,985 bytes written, 12 reads / 56,756 bytes read, and 3
+  generation `1794052687749830`, matching write accepted at generation
+  `1794052687750619`, stale precondition `1794052687749830` refused and the
+  winner's bytes preserved. A 6,600,000-byte object used the two-step
+  resumable upload at generation `1794052687721259` and read back
+  byte-identically. The round-trip handle counters were 129 requests, 34
+  writes / 101,985 bytes written, 12 reads / 56,756 bytes read, and 3
   conditional conflicts. These are diagnostics, not throughput claims.
 - **GCS full suite, fuse court**: `go test -race -count=1 ./...` -> **5/5
   packages ok, 0 failures** (`cmd/weftfs`, `fusefs`, `index`, `model`,
@@ -1156,10 +1159,10 @@ was edited.
 - **FUSE over GCS, fuse court**: read-only mount of a GCS store; **3/3 files
   byte-identical and 3/3 SHA-256 matches**, listing digest
   `a4b80dbc58e85f738d794603c30938ecf379d80b1d86b6aa97ff61046ca1189c`, ranged
-  read SHA-256 `77c59b39...c00e`, a write to the mount refused (`Read-only file
+  read SHA-256 `d284cd81...57808`, a write to the mount refused (`Read-only file
   system`), the daemon exited on unmount, and `verify --full` passed after the
   unmount (generation 6, same commit). Receipt
-  `bench/receipts/go-gcs-20261107T115314Z.json` at WeftFS-Go `fb43d27`.
+  `bench/receipts/go-gcs-20261107T115759Z.json` at WeftFS-Go `9f87b16`.
 - **S3 focused**: **20 pass / 0 fail / 1 skip**; measured `If-Match` form
   `quoted-as-returned`.
 - **S3 full + cross-language**: **5/5 packages ok** and **17/17 `XLANG:`
@@ -1232,7 +1235,7 @@ table of an unrelated command.
   empty `--store` are both refused.
 
 `CALIBRATION.md` now documents the install path and the explicit
-`--calibration` consumption. Test counts at `fb43d27`: GCS focused 27/0/1,
+`--calibration` consumption. Test counts at `9f87b16`: GCS focused 28/0/1,
 full suite 5/5 packages, CLI package ok.
 
 ---

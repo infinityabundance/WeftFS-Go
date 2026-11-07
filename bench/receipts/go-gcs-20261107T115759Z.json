@@ -1,8 +1,8 @@
 {
   "schema": "weft-go-gcs-court-v1",
-  "generated_utc": "20261107T115314Z",
+  "generated_utc": "20261107T115759Z",
   "revision": {
-    "weftfs_go": "fb43d27d1fb5733a515c214c2cfc67a5e6b5879b",
+    "weftfs_go": "9f87b16ee0bd6ec2794b5967258ee5bb4b62c38a",
     "note": "WeftFS-Go only; the parent Rust revision and submodule pin were not changed"
   },
   "emulator": {
@@ -32,7 +32,7 @@
   },
   "tests": {
     "command": "go test -race -count=1 -v -run 'TestGCS' ./store/ in the go court",
-    "passed": 27,
+    "passed": 28,
     "failed": 0,
     "skipped": 1,
     "full_command": "go test -race -count=1 ./... in the fuse court",
@@ -42,8 +42,8 @@
     "fuse_files": 3,
     "fuse_sha256_matches": 3,
     "fuse_listing_digest": "a4b80dbc58e85f738d794603c30938ecf379d80b1d86b6aa97ff61046ca1189c",
-    "fuse_ranged_sha256": "77c59b39f3c9c6cc471cb59952d6c7211cfdb2865f51d8b0a35bbb66dc38c00e",
-    "logs": ["bench/receipts/go-gcs-20261107T115314Z.log", "bench/receipts/go-gcs-full-20261107T115314Z.log", "bench/receipts/go-gcs-fuse-20261107T115314Z.log"]
+    "fuse_ranged_sha256": "d284cd818bdc62c92f28ade495853a206b1b7f5a9598b2522baafe9125957808",
+    "logs": ["bench/receipts/go-gcs-20261107T115759Z.log", "bench/receipts/go-gcs-full-20261107T115759Z.log", "bench/receipts/go-gcs-fuse-20261107T115759Z.log"]
   },
   "label": "Single-host GCS-compatible emulator on a private bridge network in the OOM-protected Docker court with a memory backend. Not a cloud, multi-node, fleet, device-cache, media, power-loss, or production claim. The FUSE leg is a read-only mount; no writable FUSE-over-object claim is made."
 }
