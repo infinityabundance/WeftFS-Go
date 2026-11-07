@@ -64,6 +64,9 @@ const (
 	TensorStrategyKvCache TensorStrategy = "kv-cache"
 	// TensorStrategyActivation is one mode-13 frame (readable only).
 	TensorStrategyActivation TensorStrategy = "activation"
+	// TensorStrategyFloatTiled is one mode-17 FLOAT_TILED frame: a per-tile
+	// mode-9 plane split with independent tiles.
+	TensorStrategyFloatTiled TensorStrategy = "float-tiled"
 )
 
 // ParseTensorStrategy parses a canonical planner strategy spelling.
@@ -71,7 +74,8 @@ func ParseTensorStrategy(text string) (TensorStrategy, error) {
 	switch TensorStrategy(text) {
 	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
 		TensorStrategySharded, TensorStrategyWeightDelta, TensorStrategySparseDelta,
-		TensorStrategySemanticDelta, TensorStrategyKvCache, TensorStrategyActivation:
+		TensorStrategySemanticDelta, TensorStrategyKvCache, TensorStrategyActivation,
+		TensorStrategyFloatTiled:
 		return TensorStrategy(text), nil
 	default:
 		return "", werr.Newf(werr.Malformed, "unknown tensor strategy `%s`", text)
@@ -110,6 +114,8 @@ func (s TensorStrategy) frameMode() (uint32, bool) {
 		return 13, true
 	case TensorStrategySemanticDelta:
 		return 14, true
+	case TensorStrategyFloatTiled:
+		return 17, true
 	default:
 		return 0, false
 	}
@@ -126,7 +132,7 @@ func (s TensorStrategy) usesDependency() bool {
 func (s TensorStrategy) IsIndependent() bool {
 	switch s {
 	case TensorStrategyRaw, TensorStrategyZstd, TensorStrategyFloatTensor,
-		TensorStrategySharded:
+		TensorStrategySharded, TensorStrategyFloatTiled:
 		return true
 	default:
 		return false
@@ -153,6 +159,8 @@ func tensorStrategyRank(s TensorStrategy) int {
 		return 7
 	case TensorStrategyActivation:
 		return 8
+	case TensorStrategyFloatTiled:
+		return 9
 	default:
 		return 99
 	}
@@ -195,6 +203,10 @@ func (s TensorStrategy) costClass() CostClass {
 		return CostClassZstd
 	case TensorStrategyFloatTensor:
 		return CostClassFloatTensor
+	case TensorStrategyFloatTiled:
+		// Same per-tile geometry and Huffman exponent decode as mode 15; the
+		// frozen calibration class set has no float-tiled row.
+		return CostClassTensorTiled
 	case TensorStrategySharded:
 		return CostClassTensorSharded
 	case TensorStrategyWeightDelta:
@@ -535,6 +547,9 @@ type TensorPlanOptions struct {
 	// Candidates are explicit tensor ObjectIds for the semantic search (unused
 	// by the B2 writer).
 	Candidates []model.Hash32
+	// TileShape enables the mode-17 FLOAT_TILED candidate. Empty skips it,
+	// matching the Rust planner's explicit opt-in.
+	TileShape []uint64
 }
 
 // TensorWriteSpec is the option set for one tensor write.
@@ -1089,6 +1104,45 @@ func (s *Store) prepareTensorCandidates(
 				},
 			})
 		}
+	}
+
+	// Mode 17 FLOAT_TILED: the per-tile mode-9 plane split. Offered only when
+	// the caller names a tile shape and the dtype has both a mode-9 layout and
+	// a logical-tensor identity (bf16/fp16/fp32).
+	if len(options.TileShape) == 0 {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled, "no tile shape supplied"))
+	} else if floatDtype, ok := floatTensorDtype(dtype); !ok {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled,
+			"dtype "+dtype+" has no mode-9 float layout"))
+	} else if floatDtype.Name != "bf16" && floatDtype.Name != "fp16" && floatDtype.Name != "fp32" {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled,
+			floatDtype.Name+" has no logical-tensor identity layout for mode 17"))
+	} else if frameBytes, err := modes.EncodeFloatTiled(logical, floatDtype, shape, options.TileShape, lim); err != nil {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled, err.Error()))
+	} else if parsed, err := frame.Parse(frameBytes, lim); err != nil {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled, err.Error()))
+	} else if descriptor, err := modes.ParseFloatTiled(parsed, lim); err != nil {
+		out = append(out, skippedTensor(TensorStrategyFloatTiled, err.Error()))
+	} else {
+		physical := uint64(len(frameBytes))
+		estimate := estimatedDecodeNS(TensorStrategyFloatTiled, size, options)
+		out = append(out, preparedTensorCandidate{
+			candidate: TensorPlanCandidate{
+				Strategy: TensorStrategyFloatTiled, Applicable: true,
+				Detail:            "one mode-17 float-tiled frame",
+				PhysicalBytes:     uint64Ptr(physical),
+				EstimatedDecodeNS: uint64Ptr(estimate),
+				Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+			},
+			artifact: &tensorArtifact{
+				Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTiled.String(),
+				Frame: frameBytes,
+				Tensor: &model.TensorRepresentation{
+					Mode: 17, Dtype: dtype, Shape: append([]uint64(nil), shape...),
+					LogicalRoot: descriptor.Meta.LogicalRoot, Layout: layout.WCBValue(dtype, shape),
+				},
+			},
+		})
 	}
 
 	// Mode 10 tensor-sharded, restricted to q8_0 (one whole-tensor shard).

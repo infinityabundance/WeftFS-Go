@@ -79,8 +79,12 @@ func TensorStrategyForMode(mode uint32) (string, bool) {
 		return "activation", true
 	case 14:
 		return "semantic-delta", true
+	case 15:
+		return "tensor-tiled", true
 	case 16:
 		return "sparse-delta", true
+	case 17:
+		return "float-tiled", true
 	default:
 		return "", false
 	}
@@ -102,8 +106,12 @@ func TensorModeForStrategy(strategy string) (uint32, bool) {
 		return 13, true
 	case "semantic-delta":
 		return 14, true
+	case "tensor-tiled":
+		return 15, true
 	case "sparse-delta":
 		return 16, true
+	case "float-tiled":
+		return 17, true
 	default:
 		return 0, false
 	}

@@ -82,6 +82,17 @@ func readTensorRange(
 		logical, err = decodeTensorKvPage(parsed, rep, lim)
 	case 13:
 		logical, err = decodeTensorActivation(parsed, rep, lim)
+	case 15:
+		logical, err = modes.DecodeTiledTensor(parsed, lim)
+	case 17:
+		logical, err = modes.DecodeFloatTiled(parsed, lim)
+		if err == nil {
+			var root model.Hash32
+			root, err = tensor.LogicalRoot(rep.Tensor.Dtype, rep.Tensor.Shape, logical, lim)
+			if err == nil && root != rep.Tensor.LogicalRoot {
+				err = werr.Newf(werr.Corrupt, "mode-17 logical root disagrees with the manifest")
+			}
+		}
 	default:
 		return nil, werr.Newf(werr.Corrupt,
 			"tensor_mode %d is not a defined tensor frame mode", rep.Tensor.Mode)
@@ -133,8 +144,12 @@ func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 		return frame.ModeActivationStream, true
 	case 14:
 		return frame.ModeSemanticDelta, true
+	case 15:
+		return frame.ModeTensorTiled, true
 	case 16:
 		return frame.ModeSparseDelta, true
+	case 17:
+		return frame.ModeFloatTiled, true
 	default:
 		return 0, false
 	}
