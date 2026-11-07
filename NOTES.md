@@ -16,6 +16,8 @@ Revisions recorded for this work:
 | Rust oracle binary | `weftfs 0.1.0`, built from the program-home working tree (parent `HEAD` `66fbf3ec101335b76b3ee7dfbcf2d0680cc8711e`) |
 | Fixture generator revision (recorded inside the fixture) | `61b11a802f3475ecb1723b5c54cb83f49e465f8a` |
 | Frozen fixture copy digest (all files except `PROVENANCE.md`) | `ac73419fb4070c442fec14a960997c10821cd0cea0d92d9180cbf52040a0013e` |
+| v1.1.0 tag | `dc7cfdb7d9bd66ea7a39f38f3b198eb124d20a3d` (`staging == main`) |
+| v1.1.0 GCS and FUSE-over-object evidence | `bench/receipts/go-gcs-20261107T115759Z.json`, `bench/receipts/go-s3-20261107T120121Z.json` |
 
 ---
 
@@ -844,8 +846,8 @@ Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
   declared rows. The command is `weftfs calibrate [--out FILE] [--from FILE]
   [--reps N] [--large-mib N] [--small-kib N]`; `--from` loads and reports
   divergence without measuring, `--json` matches Rust's shape, and the global
-  `--fixed-timestamp-ns` makes the record reproducible. `--install` stays
-  Rust-only (not implemented here).
+  `--fixed-timestamp-ns` makes the record reproducible. At R24 `--install`
+  stayed Rust-only; R27 below closes it.
   Method caveat: Rust measures store reads, Go measures codec frame decodes, so
   absolute rows are not cross-language comparable; the reason is the missing Go
   mode-15/14 writers and the need for one uniform method. See
@@ -1027,16 +1029,16 @@ parent file was edited.
 - Single-node MinIO on loopback with tmpfs data. No AWS, GCS, Azure, S3
   gateway, multi-node, replication, media, power-loss, device-cache, fleet, or
   production claim.
-- The fenced writer is **two conditional writes on two objects** (LOCK, then the
-  superblock), not one atomic fence-and-publish operation; plain S3 has no such
-  primitive. The fence still makes a stale publication impossible because a
-  successor cannot take the lease without rewriting LOCK.
+- At R20/R25 the fenced writer was **two conditional writes on two objects**
+  (LOCK, then the superblock). R27 makes the head publication one conditional
+  write of the LOCK record; the superblock remains a following cache write.
 - No clock-skew defence, no multi-writer protocol, and a lost network reply
   remains at-least-once.
-- No Go GCS or Azure backend; no S3 backend for the Rust-Go *handoff* tests
-  beyond the CLI cross-language leg.
-- No FUSE-over-S3 court was run (the FUSE frontend routes through the store, so
-  the path exists, but it is untested evidence-wise).
+- At R20 there was no Go GCS or Azure backend and no S3 backend for the Rust-Go
+  *handoff* tests beyond the CLI cross-language leg. R26 adds GCS; **Azure is
+  still absent**.
+- At R20 no FUSE-over-S3 court was run. R26 adds read-only FUSE over S3 and
+  GCS; a writable FUSE-over-object run still does not exist.
 - `ListObjectsV2` is used for listing; a server that never truncates more than
   1000 keys per page and returns no continuation token is refused as `Io`.
 - Ranged reads that the server ignores are sliced client-side; the full object
@@ -1185,10 +1187,10 @@ was edited.
   power-loss, device-cache, fleet, or production claim. The service-account
   path is exercised offline (RS256 assertion verified by the token endpoint);
   no live Google token exchange or real key is present.
-- The fence is **two conditional writes on two objects** (LOCK, then the
-  superblock cache), not one atomic operation; GCS has no such primitive. The
-  fence still makes a stale publication impossible because a successor cannot
-  take the lease without rewriting LOCK, which changes its generation.
+- At R26 the fence used two conditional writes on two objects (LOCK, then the
+  superblock cache). R27 makes the LOCK write itself carry the head; the
+  superblock is a following cache write. It is still not one atomic operation
+  across two objects; GCS has no such primitive.
 - Single writer by design; no clock-skew defence, no multi-writer protocol, and
   a lost reply is the usual at-least-once ambiguity.
 - `List` is paginated with `maxResults=1000` in production; the two-object paging
