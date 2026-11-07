@@ -212,6 +212,39 @@ func TestGCSBlobPlaneCreateOnceRangesListingAndPaging(t *testing.T) {
 	expectClass(t, plane.Delete(BlobObject, id), werr.NotFound, "delete twice")
 }
 
+// TestGCSResumableUpload exercises the >5 MiB two-step upload path, reads the
+// bytes back with the generation that was assigned, and deletes them.
+func TestGCSResumableUpload(t *testing.T) {
+	bucket := gcsTestBucket(t)
+	client := gcsTestClient(t, bucket, 0)
+	if err := client.ensureBucket(); err != nil {
+		t.Fatalf("ensure bucket: %v", err)
+	}
+	payload := bytes.Repeat([]byte("weft-resumable-upload-"), 300000) // 6.3 MB > 5 MiB
+	if uint64(len(payload)) <= gcsSimpleUploadMax {
+		t.Fatalf("fixture is %d bytes, not above the %d-byte simple bound", len(payload), gcsSimpleUploadMax)
+	}
+	name := "tmp/resumable-" + strconv.Itoa(os.Getpid())
+	generation, ok, err := client.upload(name, payload, gcsMissing())
+	if err != nil || !ok {
+		t.Fatalf("resumable upload: ok=%t err=%v", ok, err)
+	}
+	read, readGeneration, present, err := client.readWithGeneration(name)
+	if err != nil || !present {
+		t.Fatalf("read back: present=%t err=%v", present, err)
+	}
+	if !bytes.Equal(read, payload) {
+		t.Fatalf("resumable payload differs (%d vs %d bytes)", len(read), len(payload))
+	}
+	if readGeneration != generation {
+		t.Fatalf("generation = %d, want %d", readGeneration, generation)
+	}
+	if err := client.deleteObject(name); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	t.Logf("resumable upload: %d bytes at generation %d, read back byte-identically", len(payload), generation)
+}
+
 // TestGCSCommitVolumeAndGenerationPreconditions measures create-once,
 // matching/stale compare-and-swap, strict generation comparison, commit
 // enumeration, and the diagnostics the court records.
