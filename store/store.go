@@ -124,6 +124,9 @@ type Options struct {
 	// PackOptions is the physical packing policy; zero fields take the
 	// DefaultPackOptions values before validation.
 	PackOptions PackOptions
+	// S3 configures an S3-compatible endpoint. It is required when either
+	// BlobBackend or CommitBackend is `s3` and ignored otherwise.
+	S3 *S3Config
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -189,7 +192,6 @@ type Store struct {
 	root           string
 	mode           OpenMode
 	options        Options
-	lock           *os.File
 	state          *model.State
 	head           model.Hash32
 	generation     uint64
@@ -204,10 +206,14 @@ type Store struct {
 	// historical single-backend layout.
 	blobRoot    string
 	blobs       BlobAccess
-	commits     *commitPlane
-	probeFlat   *flatBlobPlane
+	commits     ControlVolume
+	probeFlat   blobProber
 	packed      *PackedBlobPlane
 	planeReport PlaneReport
+	remoteBlob  bool
+	// writerLockHeld records that this handle acquired the writer lock, whether
+	// that is a local flock or a fenced S3 lease.
+	writerLockHeld bool
 	// Write budgets and the committed blob set used to charge only genuinely
 	// new bytes. Both are derived from committed state.
 	quota     QuotaState
@@ -290,6 +296,15 @@ func validateOptions(opts Options) error {
 	}
 	if _, err := ParsePlaneKind(string(opts.CommitBackend)); err != nil {
 		return err
+	}
+	if opts.BlobBackend == PlaneS3 || opts.CommitBackend == PlaneS3 {
+		if opts.S3 == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `s3` plane needs endpoint, bucket, region, and credentials")
+		}
+		if err := opts.S3.Validate(); err != nil {
+			return err
+		}
 	}
 	if opts.BlobRoot != "" && opts.BlobBackend == PlanePosix {
 		return werr.Newf(werr.InvalidArgument, "a `posix` blob plane cannot be given an explicit root")
@@ -409,37 +424,56 @@ func writeNewFile(path string, data []byte, mode os.FileMode) error {
 	return file.Close()
 }
 
-// Init creates a new store at path. The directory must be absent or empty.
+// Init creates a new store at path. The directory must be absent or empty for
+// a local plane. With an S3 commit plane the path may be empty and the store is
+// addressed by bucket; the create-once FORMAT write is what proves emptiness.
 func Init(path string, opts Options) (*Store, error) {
 	if err := validateOptions(opts); err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(path)
-	if err == nil {
-		if !info.IsDir() {
-			return nil, werr.Newf(werr.Exists, "store path exists and is not a directory")
+	commitKind := opts.CommitBackend
+	if commitKind == "" {
+		commitKind = PlaneLocal
+	}
+	blobKind := opts.BlobBackend
+	if blobKind == "" {
+		if commitKind == PlaneObject {
+			blobKind = PlaneObject
+		} else {
+			blobKind = PlaneLocal
 		}
-		if _, err := os.Stat(filepath.Join(path, "FORMAT")); err == nil {
-			return nil, werr.Newf(werr.Exists, "a WeftFS store already exists at this path")
+	}
+	if commitKind != PlaneS3 && path == "" {
+		return nil, werr.Newf(werr.InvalidArgument, "a local commit plane needs a store directory")
+	}
+	if blobKind != PlaneS3 && opts.BlobRoot == "" && path == "" {
+		return nil, werr.Newf(werr.InvalidArgument, "a local blob plane needs a store directory or --blob-root")
+	}
+	if commitKind != PlaneS3 {
+		info, err := os.Stat(path)
+		if err == nil {
+			if !info.IsDir() {
+				return nil, werr.Newf(werr.Exists, "store path exists and is not a directory")
+			}
+			if _, err := os.Stat(filepath.Join(path, "FORMAT")); err == nil {
+				return nil, werr.Newf(werr.Exists, "a WeftFS store already exists at this path")
+			}
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return nil, werr.Wrap(werr.Io, err, "cannot read %s", path)
+			}
+			if len(entries) != 0 {
+				return nil, werr.Newf(werr.Exists, "store path is not empty")
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			if err := makeDir(path); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, werr.Wrap(werr.Io, err, "cannot stat %s", path)
 		}
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			return nil, werr.Wrap(werr.Io, err, "cannot read %s", path)
-		}
-		if len(entries) != 0 {
-			return nil, werr.Newf(werr.Exists, "store path is not empty")
-		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := makeDir(path); err != nil {
-			return nil, err
-		}
-	} else {
-		return nil, werr.Wrap(werr.Io, err, "cannot stat %s", path)
 	}
 
-	if err := ensureCommitLayout(path); err != nil {
-		return nil, err
-	}
 	store := &Store{root: path, mode: ReadWrite, options: opts}
 	if err := store.buildPlanes(); err != nil {
 		return nil, err
@@ -447,42 +481,26 @@ func Init(path string, opts Options) (*Store, error) {
 	if err := requireWritablePlanes(store.blobs.Capabilities(), store.commits.Capabilities()); err != nil {
 		return nil, err
 	}
-	if err := ensureBlobLayout(store.blobRoot); err != nil {
+	if err := store.commits.EnsureLayout(); err != nil {
 		return nil, err
 	}
-	if err := writeNewFile(filepath.Join(path, "FORMAT"), []byte(model.FormatContents), 0o644); err != nil {
+	if blobKind != PlaneS3 {
+		if err := ensureBlobLayout(store.blobRoot); err != nil {
+			return nil, err
+		}
+	}
+	if err := store.commits.CreateFormat(); err != nil {
+		return nil, err
+	}
+	if err := store.commits.AcquireWriterLock(); err != nil {
+		return nil, err
+	}
+	store.writerLockHeld = true
+	if err := store.commits.CreateSuperblock(); err != nil {
+		_ = store.commits.ReleaseWriterLock()
 		return nil, err
 	}
 
-	lockPath := filepath.Join(path, "LOCK")
-	lock, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return nil, werr.Wrap(werr.Io, err, "cannot open LOCK")
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return nil, werr.Wrap(werr.Busy, err, "store is locked by another writer")
-	}
-
-	superblockPath := filepath.Join(path, "superblock")
-	file, err := os.OpenFile(superblockPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		lock.Close()
-		return nil, werr.Wrap(werr.Io, err, "cannot create superblock")
-	}
-	if err := file.Truncate(model.SuperblockBytes); err != nil {
-		file.Close()
-		lock.Close()
-		return nil, werr.Wrap(werr.Io, err, "cannot size superblock")
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		lock.Close()
-		return nil, werr.Wrap(werr.Io, err, "cannot fsync superblock")
-	}
-	file.Close()
-
-	store.lock = lock
 	store.state = model.NewState()
 	store.head = model.ZeroHash
 	store.generation = 0
@@ -492,19 +510,19 @@ func Init(path string, opts Options) (*Store, error) {
 	store.contentPins = make(map[model.Hash32]uint64)
 	store.quota = newQuotaState()
 	store.blobIndex = map[model.Hash32]uint64{}
-	store.access = loadAccessCounts(path)
+	store.access = loadAccessCountsFrom(store.commits)
 	if err := store.writeGenesis(); err != nil {
-		lock.Close()
+		_ = store.commits.ReleaseWriterLock()
 		return nil, err
 	}
 	if len(opts.Quotas) > 0 {
 		if err := store.InstallQuotaPolicy(opts.Quotas); err != nil {
-			lock.Close()
+			_ = store.commits.ReleaseWriterLock()
 			return nil, err
 		}
 	}
-	if err := fsyncDir(path); err != nil {
-		lock.Close()
+	if err := store.commits.Sync(); err != nil {
+		_ = store.commits.ReleaseWriterLock()
 		return nil, err
 	}
 	return store, nil
@@ -528,51 +546,47 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	if err := validateOptions(opts); err != nil {
 		return nil, err
 	}
-	format, err := os.ReadFile(filepath.Join(path, "FORMAT"))
-	if err != nil {
-		return nil, werr.Wrap(werr.Corrupt, err, "cannot read FORMAT")
-	}
-	if string(format) != model.FormatContents {
-		return nil, werr.Newf(werr.Unsupported, "FORMAT is %q, expected %q", string(format), model.FormatContents)
-	}
 	store := &Store{root: path, mode: mode, options: opts}
 	if err := store.buildPlanes(); err != nil {
 		return nil, err
+	}
+	format, err := store.commits.ReadFormat()
+	if err != nil {
+		return nil, err
+	}
+	if string(format) != model.FormatContents {
+		return nil, werr.Newf(werr.Unsupported, "FORMAT is %q, expected %q", string(format), model.FormatContents)
 	}
 	if mode == ReadWrite {
 		if err := requireWritablePlanes(store.blobs.Capabilities(), store.commits.Capabilities()); err != nil {
 			return nil, err
 		}
-	}
-	var lock *os.File
-	if mode == ReadWrite {
-		lockPath := filepath.Join(path, "LOCK")
-		lock, err = os.OpenFile(lockPath, os.O_RDWR, 0o644)
-		if err != nil {
-			return nil, werr.Wrap(werr.Io, err, "cannot open LOCK")
-		}
-		if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			lock.Close()
-			return nil, werr.Wrap(werr.Busy, err, "store is locked by another writer")
-		}
-		if err := ensureCommitLayout(path); err != nil {
-			lock.Close()
+		if err := store.commits.AcquireWriterLock(); err != nil {
 			return nil, err
 		}
-		if err := ensureBlobLayout(store.blobRoot); err != nil {
-			lock.Close()
+		store.writerLockHeld = true
+		if err := store.commits.EnsureLayout(); err != nil {
+			_ = store.commits.ReleaseWriterLock()
 			return nil, err
 		}
-		if err := cleanStaleTmp(path, DefaultGCGraceSecs); err != nil {
-			lock.Close()
+		if !store.remoteBlob {
+			if err := ensureBlobLayout(store.blobRoot); err != nil {
+				_ = store.commits.ReleaseWriterLock()
+				return nil, err
+			}
+		}
+		if err := store.commits.CleanTmp(DefaultGCGraceSecs); err != nil {
+			_ = store.commits.ReleaseWriterLock()
 			return nil, err
 		}
-		if err := cleanStaleTmp(store.blobRoot, DefaultGCGraceSecs); err != nil {
-			lock.Close()
-			return nil, err
+		if !store.remoteBlob {
+			if err := cleanStaleTmp(store.blobRoot, DefaultGCGraceSecs); err != nil {
+				_ = store.commits.ReleaseWriterLock()
+				return nil, err
+			}
 		}
 		if err := store.probePlanes(); err != nil {
-			lock.Close()
+			_ = store.commits.ReleaseWriterLock()
 			return nil, err
 		}
 	}
@@ -580,16 +594,14 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	var recovery *Recovery
 	switch {
 	case fullScan:
-		recovery, err = recoverFullScan(path, store.blobs)
+		recovery, err = recoverFullScan(store.commits, store.blobs)
 	case mode == ReadWrite:
-		recovery, err = recoverForWrite(path, store.blobs)
+		recovery, err = recoverForWrite(store.commits, store.blobs)
 	default:
-		recovery, err = recoverWithStrategy(path, store.blobs, replayBounded, true)
+		recovery, err = recoverWithStrategy(store.commits, store.blobs, replayBounded, true)
 	}
 	if err != nil {
-		if lock != nil {
-			lock.Close()
-		}
+		_ = store.commits.ReleaseWriterLock()
 		return nil, err
 	}
 	base := recovery.Generation
@@ -597,12 +609,9 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 		base = recovery.HighestFileGeneration
 	}
 	if base == ^uint64(0) {
-		if lock != nil {
-			lock.Close()
-		}
+		_ = store.commits.ReleaseWriterLock()
 		return nil, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
-	store.lock = lock
 	store.state = recovery.State
 	store.head = recovery.Head
 	store.generation = recovery.Generation
@@ -613,7 +622,7 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	store.contentPins = make(map[model.Hash32]uint64)
 	store.quota = newQuotaState()
 	store.blobIndex = map[model.Hash32]uint64{}
-	store.access = loadAccessCounts(path)
+	store.access = loadAccessCountsFrom(store.commits)
 	store.loadQuotaRecord()
 	return store, nil
 }
@@ -697,37 +706,78 @@ func (s *Store) buildPlanes() error {
 	if blobRoot == "" {
 		blobRoot = s.root
 	}
-	blobs, err := newFlatBlobPlane(blobRoot, blobKind)
-	if err != nil {
-		return err
+
+	var client *s3Client
+	if blobKind == PlaneS3 || commitKind == PlaneS3 {
+		if s.options.S3 == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `s3` plane needs an endpoint, bucket, region, and credentials (--s3-endpoint/--s3-bucket/--s3-access-key/--s3-secret-key or the WEFT_S3_*/AWS_* environment)")
+		}
+		created, err := newS3Client(*s.options.S3)
+		if err != nil {
+			return err
+		}
+		client = created
 	}
-	commits, err := newCommitPlane(s.root, commitKind)
-	if err != nil {
-		return err
+
+	var access BlobAccess
+	var prober blobProber
+	if blobKind == PlaneS3 {
+		plane := newS3BlobPlane(client)
+		access = plane
+		prober = plane
+		blobRoot = plane.Root()
+		s.remoteBlob = true
+	} else {
+		blobs, err := newFlatBlobPlane(blobRoot, blobKind)
+		if err != nil {
+			return err
+		}
+		access = blobs
+		prober = blobs
 	}
-	var access BlobAccess = blobs
+
+	var commits ControlVolume
+	var control ControlPlane
+	if commitKind == PlaneS3 {
+		plane := newS3Control(client)
+		commits = plane
+		control = plane
+	} else {
+		local, err := newLocalControl(s.root, commitKind)
+		if err != nil {
+			return err
+		}
+		commits = local
+		control = local
+	}
+
 	var packed *PackedBlobPlane
 	if s.options.Packing {
 		packOptions := s.options.PackOptions
 		if packOptions == (PackOptions{}) {
 			packOptions = DefaultPackOptions()
 		}
-		packed, err = NewPackedBlobPlane(blobs, commits, packOptions)
+		packedPlane, err := NewPackedBlobPlane(access, control, packOptions)
 		if err != nil {
 			return err
 		}
+		packed = packedPlane
 		access = packed
+	}
+	if s.root == "" {
+		s.root = commits.Root()
 	}
 	s.blobs = access
 	s.commits = commits
-	s.probeFlat = blobs
+	s.probeFlat = prober
 	s.packed = packed
 	s.blobRoot = blobRoot
 	s.planeReport = PlaneReport{
 		Blobs:      access.Capabilities(),
 		Commits:    commits.Capabilities(),
 		BlobRoot:   blobRoot,
-		CommitRoot: s.root,
+		CommitRoot: commits.Root(),
 		Packing:    s.options.Packing,
 	}
 	return nil
@@ -776,22 +826,14 @@ func (s *Store) CurrentState() *model.State { return s.state }
 // was durably published before its call returned.
 func (s *Store) Close() error {
 	if s.mode == ReadWrite && s.access != nil {
-		_ = s.access.flush(s.root)
+		_ = s.access.flush(s.commits)
 	}
-	if s.lock != nil {
-		err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
-		closeErr := s.lock.Close()
-		s.lock = nil
-		if err != nil {
-			return werr.Wrap(werr.Io, err, "cannot unlock LOCK")
-		}
-		return closeErr
-	}
-	return nil
+	s.writerLockHeld = false
+	return s.commits.Close()
 }
 
 func (s *Store) maxVisibleGeneration() (uint64, error) {
-	view, err := ReadSuperblock(s.root)
+	view, err := s.commits.ReadSuperblock()
 	if err != nil {
 		return 0, err
 	}
@@ -827,7 +869,7 @@ func (s *Store) StateAt(commit model.Hash32) (*model.State, error) {
 	if err != nil {
 		return nil, err
 	}
-	state, _, err := loadStateAt(s.blobs, s.root, commit, maxVisible, false)
+	state, _, err := loadStateAt(s.blobs, s.commits, commit, maxVisible, false)
 	if err != nil {
 		return nil, err
 	}
@@ -839,7 +881,7 @@ func (s *Store) isPublishedAncestor(target model.Hash32) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	index, err := CommitIndex(s.root, maxVisible)
+	index, err := commitIndexFrom(s.commits, maxVisible)
 	if err != nil {
 		return false, err
 	}
@@ -868,7 +910,7 @@ func (s *Store) CommitLineage(base model.Hash32) ([]LineageEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	index, err := CommitIndex(s.root, maxVisible)
+	index, err := commitIndexFrom(s.commits, maxVisible)
 	if err != nil {
 		return nil, err
 	}
@@ -1389,8 +1431,10 @@ func hashPtr(h model.Hash32) *model.Hash32 {
 	return &copy
 }
 
-// publishCommit writes the commit file, fsyncs it and its directory, publishes
-// the superblock slot, then fsyncs the store root.
+// publishCommit writes the commit record, fences the writer, publishes the
+// superblock slot, then syncs the plane. The order is the durable publication
+// protocol: nothing names the head before the commit record and every blob it
+// names are visible.
 func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 	// Every blob the commit names must be durable and visible before the
 	// commit record is published. A packed plane buffers the open pack.
@@ -1403,23 +1447,7 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 	}
 	hash := model.CommitIDBytes(wcbBytes)
 	fileBytes := EncodeCommitFile(wcbBytes)
-	path := CommitPath(s.root, commit.Generation)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Corrupt, err, "cannot create commit file %s", path)
-	}
-	if _, err := file.Write(fileBytes); err != nil {
-		file.Close()
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot write commit file %s", path)
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot fsync commit file %s", path)
-	}
-	if err := file.Close(); err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot close commit file %s", path)
-	}
-	if err := fsyncDir(filepath.Join(s.root, "commits")); err != nil {
+	if err := s.commits.CreateCommit(commit.Generation, fileBytes); err != nil {
 		return model.Hash32{}, err
 	}
 
@@ -1429,27 +1457,14 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 		Generation: commit.Generation, Commit: hash,
 		CommitLen: uint64(len(wcbBytes)), TimestampNS: commit.TimestampNS,
 	}
-	superblockPath := filepath.Join(s.root, "superblock")
-	superblock, err := os.OpenFile(superblockPath, os.O_RDWR, 0o644)
-	if err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot open superblock")
-	}
-	offset := int64(commit.Generation%2) * int64(model.SlotBytes)
-	if _, err := superblock.WriteAt(slot.Encode(), offset); err != nil {
-		superblock.Close()
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot write superblock slot")
-	}
-	if err := superblock.Sync(); err != nil {
-		superblock.Close()
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot fsync superblock")
-	}
-	if err := superblock.Close(); err != nil {
-		return model.Hash32{}, werr.Wrap(werr.Io, err, "cannot close superblock")
+	index := int(commit.Generation % 2)
+	if err := s.commits.PublishSuperblockSlot(slot, index); err != nil {
+		return model.Hash32{}, err
 	}
 
 	crashPoint("after_superblock_write")
 
-	if err := fsyncDir(s.root); err != nil {
+	if err := s.commits.Sync(); err != nil {
 		return model.Hash32{}, err
 	}
 	return hash, nil
@@ -1607,36 +1622,7 @@ func hashOf(domain string, data []byte) model.Hash32 {
 }
 
 func (s *Store) writeSnapshotPointer(name string, commit model.Hash32) error {
-	dir := filepath.Join(s.root, "refs", "snapshots")
-	if err := makeDir(dir); err != nil {
-		return err
-	}
-	path := filepath.Join(dir, name)
-	tmp := filepath.Join(s.root, "tmp", "snap-"+itoa(uint64(os.Getpid()))+"-"+name+"-"+itoa(tmpCounter.Add(1)))
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return werr.Wrap(werr.Io, err, "cannot create snapshot pointer")
-	}
-	if _, err := file.Write([]byte(commit.Hex() + "\n")); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot write snapshot pointer")
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot fsync snapshot pointer")
-	}
-	file.Close()
-	if _, err := os.Stat(path); err == nil {
-		_ = os.Remove(tmp)
-		return werr.Newf(werr.Exists, "snapshot pointer already exists")
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return werr.Wrap(werr.Io, err, "cannot publish snapshot pointer")
-	}
-	return fsyncDir(dir)
+	return s.commits.WriteRecordNew("refs/snapshots/"+name, []byte(commit.Hex()+"\n"))
 }
 
 // ---- open-handle pins ----------------------------------------------------

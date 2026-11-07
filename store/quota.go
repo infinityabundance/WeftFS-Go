@@ -620,18 +620,8 @@ func ParseQuotaFile(contents string) ([]QuotaBudget, error) {
 	return out, nil
 }
 
-func quotaPath(root string) string         { return filepath.Join(root, "quota") }
-func quotaMigratedPath(root string) string { return filepath.Join(root, "quota.migrated") }
-
-func readStoreRecord(path string) ([]byte, bool, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, werr.Wrap(werr.Io, err, "cannot read %s", path)
-	}
-	return b, true, nil
+func readStoreRecordStore(ctl ControlVolume, name string) ([]byte, bool, error) {
+	return ctl.ReadRecord(name)
 }
 
 // loadQuotaRecord loads the policy-only file and the committed usage. A legacy
@@ -645,11 +635,11 @@ func (s *Store) loadQuotaRecord() {
 }
 
 func (s *Store) loadQuotaRecordInner() error {
-	current, currentPresent, err := readStoreRecord(quotaPath(s.root))
+	current, currentPresent, err := readStoreRecordStore(s.commits, "quota")
 	if err != nil {
 		return err
 	}
-	migrated, migratedPresent, err := readStoreRecord(quotaMigratedPath(s.root))
+	migrated, migratedPresent, err := readStoreRecordStore(s.commits, "quota.migrated")
 	if err != nil {
 		return err
 	}
@@ -770,7 +760,7 @@ func (s *Store) migrateLegacyQuota(record QuotaRecord, raw []byte) error {
 			"legacy quota record named generation %d (%s); usage was recomputed from committed state",
 			record.Generation, record.Commit.Hex()))
 	}
-	if err := writeReplace(quotaMigratedPath(s.root), raw); err != nil {
+	if err := s.commits.WriteRecordReplace("quota.migrated", raw); err != nil {
 		return err
 	}
 	policy, err := NewQuotaPolicyRecord(record.Budgets)
@@ -781,7 +771,7 @@ func (s *Store) migrateLegacyQuota(record QuotaRecord, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := writeReplace(quotaPath(s.root), policyBytes); err != nil {
+	if err := s.commits.WriteRecordReplace("quota", policyBytes); err != nil {
 		return err
 	}
 	s.quota.MigratedPresent = true
@@ -825,7 +815,7 @@ func (s *Store) persistQuotaPolicy() error {
 	if err != nil {
 		return err
 	}
-	return writeReplace(quotaPath(s.root), b)
+	return s.commits.WriteRecordReplace("quota", b)
 }
 
 func (s *Store) headUsageOp() (model.SetQuotaUsageOp, bool, error) {
@@ -833,7 +823,7 @@ func (s *Store) headUsageOp() (model.SetQuotaUsageOp, bool, error) {
 		return model.SetQuotaUsageOp{}, false, nil
 	}
 	generation := s.generation
-	loaded, err := LoadCommitFile(CommitPath(s.root, generation), &generation)
+	loaded, err := s.commits.ReadCommit(generation)
 	if err != nil {
 		return model.SetQuotaUsageOp{}, false, err
 	}
@@ -1065,7 +1055,7 @@ func (s *Store) replayQuotaUsage() (map[string]QuotaCounters, map[model.Hash32]u
 }
 
 func (s *Store) replayQuotaUsageWithCount() (map[string]QuotaCounters, map[model.Hash32]uint64, uint64, error) {
-	index, err := CommitIndex(s.root, ^uint64(0))
+	index, err := commitIndexFrom(s.commits, ^uint64(0))
 	if err != nil {
 		return nil, nil, 0, err
 	}

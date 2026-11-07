@@ -86,7 +86,7 @@ func (s *Store) GCWatch(ctx context.Context, interval time.Duration, maxDeletes 
 	if err := s.requireWritable(); err != nil {
 		return err
 	}
-	if s.lock == nil {
+	if !s.writerLockHeld {
 		return werr.Newf(werr.Busy, "store writer lock is not held")
 	}
 	if interval <= 0 {
@@ -133,7 +133,7 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	if err := s.requireWritable(); err != nil {
 		return report, err
 	}
-	if s.lock == nil {
+	if !s.writerLockHeld {
 		return report, werr.Newf(werr.Busy, "store writer lock is not held")
 	}
 	if err := checkCancel(ctx); err != nil {
@@ -192,7 +192,7 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	// Checkpoints are immutable evidence. They are roots even when the commit
 	// that names them is a valid but unpublished (rejected) tail, so the scan
 	// deliberately ignores the published generation ceiling.
-	commits, err := AllCommits(s.root, ^uint64(0))
+	commits, err := allCommitsFrom(s.commits, ^uint64(0))
 	if err != nil {
 		return report, err
 	}

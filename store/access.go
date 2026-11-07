@@ -8,7 +8,6 @@ package store
 
 import (
 	"encoding/binary"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -149,12 +148,25 @@ func parseAccessJournal(data []byte) (uint64, []accessJournalRecord, bool) {
 
 func accessDir(root string) string { return filepath.Join(root, "access") }
 
-// loadAccessCounts reads the snapshot and journal. Every failure is a note.
+// loadAccessCounts reads the snapshot and journal from a local store root.
 func loadAccessCounts(root string) *accessCounts {
+	ctl, err := newLocalControl(root, PlaneLocal)
+	if err != nil {
+		out := newAccessCounts()
+		out.loadedFromDir = accessDir(root)
+		out.notes = append(out.notes, "access counters: control plane is unusable: "+err.Error())
+		return out
+	}
+	return loadAccessCountsFrom(ctl)
+}
+
+// loadAccessCountsFrom reads the snapshot and journal through the control
+// volume. Every failure is a note; a missing record is an empty counter set.
+func loadAccessCountsFrom(ctl ControlVolume) *accessCounts {
 	out := newAccessCounts()
-	out.loadedFromDir = accessDir(root)
+	out.loadedFromDir = ctl.Root() + "/access"
 	var snapshotEpoch uint64
-	if data, err := os.ReadFile(filepath.Join(accessDir(root), "counts.v1")); err == nil {
+	if data, present, err := ctl.ReadRecord("access/counts.v1"); err == nil && present {
 		if counts, epoch, ok := parseAccessSnapshot(data); ok {
 			out.counts = counts
 			out.epoch = epoch
@@ -162,8 +174,10 @@ func loadAccessCounts(root string) *accessCounts {
 		} else {
 			out.notes = append(out.notes, "access counters: counts snapshot rejected; starting empty")
 		}
+	} else if err != nil {
+		out.notes = append(out.notes, "access counters: counts snapshot unreadable: "+err.Error())
 	}
-	if data, err := os.ReadFile(filepath.Join(accessDir(root), "journal.v1")); err == nil {
+	if data, present, err := ctl.ReadRecord("access/journal.v1"); err == nil && present {
 		if epoch, records, ok := parseAccessJournal(data); ok && epoch == snapshotEpoch {
 			for _, record := range records {
 				out.counts[record.id] = saturatingAdd(out.counts[record.id], record.delta)
@@ -180,6 +194,8 @@ func loadAccessCounts(root string) *accessCounts {
 		} else {
 			out.notes = append(out.notes, "access counters: journal rejected; counts snapshot only")
 		}
+	} else if err != nil {
+		out.notes = append(out.notes, "access counters: journal unreadable: "+err.Error())
 	}
 	if len(out.counts) > MaxTrackedObjects {
 		out.counts = map[model.Hash32]uint64{}
@@ -257,20 +273,17 @@ func (c *accessCounts) noteList() []string {
 
 // flush persists pending increments. A compaction writes a new snapshot epoch
 // and an empty journal; a stale journal is ignored by epoch on the next open.
-func (c *accessCounts) flush(root string) error {
+func (c *accessCounts) flush(ctl ControlVolume) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.pending) == 0 {
 		return nil
 	}
-	if err := makeDir(accessDir(root)); err != nil {
-		return err
-	}
 	compact := c.forceCompact ||
 		(len(c.journal)-accessSnapshotHeader)/accessRecordBytes >= CompactAfterRecords
 	if compact {
 		c.epoch = saturatingAdd(c.epoch, 1)
-		if err := writeAccessFile(root, "counts.v1", encodeAccessSnapshot(c.counts, c.epoch)); err != nil {
+		if err := writeAccessFile(ctl, "counts.v1", encodeAccessSnapshot(c.counts, c.epoch)); err != nil {
 			return err
 		}
 		c.journal = accessJournalHeader(c.epoch)
@@ -284,7 +297,7 @@ func (c *accessCounts) flush(root string) error {
 			c.journal = append(c.journal, id.Bytes()...)
 			c.journal = binary.LittleEndian.AppendUint64(c.journal, c.pending[id])
 		}
-		if err := writeAccessFile(root, "journal.v1", c.journal); err != nil {
+		if err := writeAccessFile(ctl, "journal.v1", c.journal); err != nil {
 			return err
 		}
 	}
@@ -294,36 +307,8 @@ func (c *accessCounts) flush(root string) error {
 	return nil
 }
 
-func writeAccessFile(root, name string, data []byte) error {
-	dir := accessDir(root)
-	tmpDir := filepath.Join(root, "tmp")
-	if err := makeDir(tmpDir); err != nil {
-		return err
-	}
-	tmp := filepath.Join(tmpDir, "access-"+itoa(uint64(os.Getpid()))+"-"+name)
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, name)); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return fsyncDir(dir)
+func writeAccessFile(ctl ControlVolume, name string, data []byte) error {
+	return ctl.WriteRecordReplace("access/"+name, data)
 }
 
 // AccessReads returns the retained read counter for one object.
@@ -343,12 +328,12 @@ func (s *Store) FlushAccessCounts() error {
 	if s.mode != ReadWrite {
 		return nil
 	}
-	return s.access.flush(s.root)
+	return s.access.flush(s.commits)
 }
 
 func (s *Store) noteObjectRead(id model.Hash32) {
 	s.access.noteRead(id)
 	if s.access.shouldFlush() && s.mode == ReadWrite {
-		_ = s.access.flush(s.root)
+		_ = s.access.flush(s.commits)
 	}
 }

@@ -101,12 +101,22 @@ type SuperblockView struct {
 // ReadSuperblock reads both slots. An all-zero slot is empty; a non-zero
 // invalid slot is recorded as a recovery note.
 func ReadSuperblock(root string) (SuperblockView, error) {
-	var view SuperblockView
 	path := filepath.Join(root, "superblock")
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return view, werr.Wrap(werr.Corrupt, err, "cannot read superblock %s", path)
+		return SuperblockView{}, werr.Wrap(werr.Corrupt, err, "cannot read superblock %s", path)
 	}
+	view, err := decodeSuperblockView(b)
+	if err != nil {
+		return SuperblockView{}, err
+	}
+	return view, nil
+}
+
+// decodeSuperblockView decodes an 8192-byte superblock object. Both the local
+// file and the S3 object use it, so slot acceptance cannot drift.
+func decodeSuperblockView(b []byte) (SuperblockView, error) {
+	var view SuperblockView
 	if len(b) != model.SuperblockBytes {
 		return view, werr.Newf(werr.Corrupt, "superblock is %d bytes, expected %d", len(b), model.SuperblockBytes)
 	}
@@ -253,17 +263,27 @@ func ScanCommitFiles(root string) (map[uint64]string, error) {
 // non-nil, the commit's declared generation must match it. Every call is
 // counted by CommitFileReads for open-path diagnostics.
 func LoadCommitFile(path string, expected *uint64) (LoadedCommit, error) {
-	commitFileReads.Add(1)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return LoadedCommit{}, werr.Wrap(werr.Corrupt, err, "cannot read %s", path)
 	}
+	loaded, err := ParseCommitBytes(b, expected)
+	if err != nil {
+		return LoadedCommit{}, err
+	}
+	return loaded, nil
+}
+
+// ParseCommitBytes validates a decoded commit object. The local file and the
+// S3 object share this parser, so acceptance cannot drift between planes.
+func ParseCommitBytes(b []byte, expected *uint64) (LoadedCommit, error) {
+	commitFileReads.Add(1)
 	wcbBytes, commit, err := DecodeCommitFile(b)
 	if err != nil {
 		return LoadedCommit{}, err
 	}
 	if expected != nil && commit.Generation != *expected {
-		return LoadedCommit{}, werr.Newf(werr.Corrupt, "commit file %s declares generation %d but the filename says %d", path, commit.Generation, *expected)
+		return LoadedCommit{}, werr.Newf(werr.Corrupt, "commit object declares generation %d but the key says %d", commit.Generation, *expected)
 	}
 	hash := model.CommitIDBytes(wcbBytes)
 	recomputed, err := commit.ID()

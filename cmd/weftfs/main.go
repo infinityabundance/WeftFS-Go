@@ -91,6 +91,14 @@ var (
 	blobBackend   = store.PlaneLocal
 	commitBackend = store.PlaneLocal
 	blobRoot      string
+	// S3 endpoint and credentials. Explicit flags take precedence over the
+	// WEFT_S3_*/AWS_* environment; resolution happens once per store open.
+	s3Endpoint     string
+	s3Bucket       string
+	s3Region       string
+	s3AccessKey    string
+	s3SecretKey    string
+	s3SessionToken string
 	// Pack-plane policy. `--pack` enables it; the bounds default to the Rust
 	// values and are always validated.
 	packing      bool
@@ -124,6 +132,27 @@ func applyPlanePolicy(opts *store.Options) {
 		CatalogSegments:      packSegments,
 		MaxMembersPerPack:    store.DefaultPackOptions().MaxMembersPerPack,
 	}
+}
+
+// remotePlaneConfigured reports whether either plane is S3, in which case a
+// local store directory is optional.
+func remotePlaneConfigured() bool {
+	return blobBackend == store.PlaneS3 || commitBackend == store.PlaneS3
+}
+
+// applyS3Policy resolves the S3 configuration when either plane is S3. A
+// resolution failure is fatal: there is no local fallback.
+func applyS3Policy(opts *store.Options) error {
+	if !remotePlaneConfigured() {
+		opts.S3 = nil
+		return nil
+	}
+	config, err := store.ResolveS3(s3Endpoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey, s3SessionToken)
+	if err != nil {
+		return err
+	}
+	opts.S3 = &config
+	return nil
 }
 
 func applyRepresentationPolicy(opts *store.Options) {
@@ -283,6 +312,48 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			i++
 		case strings.HasPrefix(args[i], "--blob-root="):
 			blobRoot = strings.TrimPrefix(args[i], "--blob-root=")
+		case args[i] == "--s3-endpoint" || strings.HasPrefix(args[i], "--s3-endpoint="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-endpoint")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3Endpoint = value
+			i += consumed
+		case args[i] == "--s3-bucket" || strings.HasPrefix(args[i], "--s3-bucket="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-bucket")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3Bucket = value
+			i += consumed
+		case args[i] == "--s3-region" || strings.HasPrefix(args[i], "--s3-region="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-region")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3Region = value
+			i += consumed
+		case args[i] == "--s3-access-key" || strings.HasPrefix(args[i], "--s3-access-key="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-access-key")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3AccessKey = value
+			i += consumed
+		case args[i] == "--s3-secret-key" || strings.HasPrefix(args[i], "--s3-secret-key="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-secret-key")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3SecretKey = value
+			i += consumed
+		case args[i] == "--s3-session-token" || strings.HasPrefix(args[i], "--s3-session-token="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--s3-session-token")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			s3SessionToken = value
+			i += consumed
 		case args[i] == "--planner-cost-model" || args[i] == "-planner-cost-model":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--planner-cost-model requires a value")
@@ -493,13 +564,36 @@ func requireStore(storeDir string) error {
 	return nil
 }
 
+// requireStoreOrRemote accepts an empty --store only for an S3 plane.
+// s3FlagValue parses `--flag value` and `--flag=value`. The returned consumed
+// count is 1 for the separate form and 0 for the joined form.
+func s3FlagValue(args []string, index int, name string) (string, int, error) {
+	if joined, ok := strings.CutPrefix(args[index], name+"="); ok {
+		return joined, 0, nil
+	}
+	if index+1 >= len(args) {
+		return "", 0, werr.Newf(werr.InvalidArgument, "%s requires a value", name)
+	}
+	return args[index+1], 1, nil
+}
+
+func requireStoreOrRemote(storeDir string) error {
+	if storeDir == "" && !remotePlaneConfigured() {
+		return werr.Newf(werr.InvalidArgument, "--store <DIR> is required for this command")
+	}
+	return nil
+}
+
 func openStore(storeDir string, mode store.OpenMode) (*store.Store, error) {
-	if err := requireStore(storeDir); err != nil {
+	if err := requireStoreOrRemote(storeDir); err != nil {
 		return nil, err
 	}
 	opts := store.DefaultOptions()
 	applyRepresentationPolicy(&opts)
 	applyQuotaPolicy(&opts)
+	if err := applyS3Policy(&opts); err != nil {
+		return nil, err
+	}
 	if fixedTimestampNS != nil {
 		opts.FixedTimestampNS = fixedTimestampNS
 	}
@@ -523,7 +617,7 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	if err := requireStore(storeDir); err != nil {
+	if err := requireStoreOrRemote(storeDir); err != nil {
 		return err
 	}
 	opts := store.DefaultOptions()
@@ -533,6 +627,9 @@ func cmdInit(args []string, storeDir string, jsonOut bool) error {
 	opts.CheckpointInterval = *checkpoint
 	applyRepresentationPolicy(&opts)
 	applyQuotaPolicy(&opts)
+	if err := applyS3Policy(&opts); err != nil {
+		return err
+	}
 	if fixedTimestampNS != nil {
 		opts.FixedTimestampNS = fixedTimestampNS
 	}
@@ -2229,7 +2326,7 @@ func cmdMount(args []string, storeDir string) error {
 	if *contextName != "" && *at != "" {
 		return werr.Newf(werr.InvalidArgument, "--context pins its own snapshot; --at cannot be combined with it")
 	}
-	if err := requireStore(storeDir); err != nil {
+	if err := requireStoreOrRemote(storeDir); err != nil {
 		return err
 	}
 	var capability *auth.Capability
@@ -2263,6 +2360,9 @@ func cmdMount(args []string, storeDir string) error {
 	}
 	mountOpts := store.DefaultOptions()
 	applyRepresentationPolicy(&mountOpts)
+	if err := applyS3Policy(&mountOpts); err != nil {
+		return err
+	}
 	if fixedTimestampNS != nil {
 		mountOpts.FixedTimestampNS = fixedTimestampNS
 	}

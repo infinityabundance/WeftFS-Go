@@ -1,7 +1,6 @@
 package store
 
 import (
-	"os"
 	"path/filepath"
 	"sort"
 	"sync/atomic"
@@ -170,20 +169,29 @@ func readStateManifest(src blobSource, manifestID model.Hash32) (*model.State, e
 	return model.DecodeState(value)
 }
 
-// CommitIndex parses every commit file up to maxGeneration (inclusive),
-// ignoring files that fail to parse. The index is keyed by commit hash.
-func CommitIndex(root string, maxGeneration uint64) (map[model.Hash32]LoadedCommit, error) {
-	files, err := ScanCommitFiles(root)
+// commitSource is the read side of a control plane: the superblock and the
+// commit records. Both the local filesystem and S3 implement it, so recovery
+// never depends on a local path when the plane is remote.
+type commitSource interface {
+	ReadSuperblock() (SuperblockView, error)
+	HasCommit(generation uint64) (bool, error)
+	ReadCommit(generation uint64) (LoadedCommit, error)
+	ListCommitGenerations() ([]uint64, error)
+}
+
+// commitIndexFrom parses every commit up to maxGeneration (inclusive),
+// ignoring records that fail to parse. The index is keyed by commit hash.
+func commitIndexFrom(ctl commitSource, maxGeneration uint64) (map[model.Hash32]LoadedCommit, error) {
+	generations, err := ctl.ListCommitGenerations()
 	if err != nil {
 		return nil, err
 	}
-	index := make(map[model.Hash32]LoadedCommit, len(files))
-	for generation, path := range files {
+	index := make(map[model.Hash32]LoadedCommit, len(generations))
+	for _, generation := range generations {
 		if generation > maxGeneration {
 			continue
 		}
-		expected := generation
-		loaded, err := LoadCommitFile(path, &expected)
+		loaded, err := ctl.ReadCommit(generation)
 		if err != nil {
 			continue
 		}
@@ -192,15 +200,29 @@ func CommitIndex(root string, maxGeneration uint64) (map[model.Hash32]LoadedComm
 	return index, nil
 }
 
+// CommitIndex parses every commit file up to maxGeneration (inclusive),
+// ignoring files that fail to parse. The index is keyed by commit hash.
+func CommitIndex(root string, maxGeneration uint64) (map[model.Hash32]LoadedCommit, error) {
+	ctl, err := newLocalControl(root, PlaneLocal)
+	if err != nil {
+		return nil, err
+	}
+	return commitIndexFrom(ctl, maxGeneration)
+}
+
 // LoadStateAt rebuilds state by replaying the parent chain ending at headHash.
 // When checkCatalog is true, every file object's manifest and chunk files are
 // checked for existence, hash, and length.
 func LoadStateAt(root string, headHash model.Hash32, maxGeneration uint64, checkCatalog bool) (*model.State, []string, error) {
-	return loadStateAt(flatSource(root), root, headHash, maxGeneration, checkCatalog)
+	ctl, err := newLocalControl(root, PlaneLocal)
+	if err != nil {
+		return nil, nil, err
+	}
+	return loadStateAt(flatSource(root), ctl, headHash, maxGeneration, checkCatalog)
 }
 
-func loadStateAt(src blobSource, root string, headHash model.Hash32, maxGeneration uint64, checkCatalog bool) (*model.State, []string, error) {
-	index, err := CommitIndex(root, maxGeneration)
+func loadStateAt(src blobSource, ctl commitSource, headHash model.Hash32, maxGeneration uint64, checkCatalog bool) (*model.State, []string, error) {
+	index, err := commitIndexFrom(ctl, maxGeneration)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -267,7 +289,7 @@ func loadStateAt(src blobSource, root string, headHash model.Hash32, maxGenerati
 	}
 
 	if checkCatalog {
-		if err := validateCatalog(src, root, state); err != nil {
+		if err := validateCatalog(src, "", state); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -352,25 +374,29 @@ type Recovery struct {
 // generation-addressed bounded replay. It never invents data and never deletes
 // rejected generations.
 func Recover(root string) (*Recovery, error) {
-	return recoverWithStrategy(root, flatSource(root), replayBounded, true)
+	ctl, err := newLocalControl(root, PlaneLocal)
+	if err != nil {
+		return nil, err
+	}
+	return recoverWithStrategy(ctl, flatSource(root), replayBounded, true)
 }
 
-// recoverForWrite is the writable-open path. It needs one commit-directory
-// enumeration so next_generation never reuses a rejected generation; the commit
-// decode window is still bounded by the checkpoint interval.
-func recoverForWrite(root string, src blobSource) (*Recovery, error) {
-	return recoverWithStrategy(root, src, replayBounded, false)
+// recoverForWrite is the writable-open path. It needs one commit enumeration
+// so next_generation never reuses a rejected generation; the commit decode
+// window is still bounded by the checkpoint interval.
+func recoverForWrite(ctl commitSource, src blobSource) (*Recovery, error) {
+	return recoverWithStrategy(ctl, src, replayBounded, false)
 }
 
-// recoverFullScan is the original full commit-directory recovery. It stays
+// recoverFullScan is the original full commit scan recovery. It stays
 // authoritative for its rejected set and notes, and is the fallback for every
 // bounded-replay inconsistency.
-func recoverFullScan(root string, src blobSource) (*Recovery, error) {
-	return recoverWithStrategy(root, src, replayFullScan, false)
+func recoverFullScan(ctl commitSource, src blobSource) (*Recovery, error) {
+	return recoverWithStrategy(ctl, src, replayFullScan, false)
 }
 
-func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, allowDirectoryFree bool) (*Recovery, error) {
-	view, err := ReadSuperblock(root)
+func recoverWithStrategy(ctl commitSource, src blobSource, strategy replayStrategy, allowDirectoryFree bool) (*Recovery, error) {
+	view, err := ctl.ReadSuperblock()
 	if err != nil {
 		return nil, err
 	}
@@ -392,28 +418,30 @@ func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, a
 	}
 
 	if allowDirectoryFree && strategy == replayBounded {
-		recovery, err := recoverDirectoryFree(root, src, view, validSlots, maxVisible, slotByGen)
+		recovery, err := recoverDirectoryFree(ctl, src, view, validSlots, maxVisible, slotByGen)
 		if err == nil {
 			return recovery, nil
 		}
 		// Do not reuse anything from the fast attempt: the scan-based recovery
 		// is authoritative, including its rejected set and notes. Record that
 		// the fallback happened.
-		recovery, fallbackErr := recoverWithStrategy(root, src, replayBounded, false)
+		recovery, fallbackErr := recoverWithStrategy(ctl, src, replayBounded, false)
 		if fallbackErr != nil {
 			return nil, fallbackErr
 		}
-		recovery.Notes = append(recovery.Notes, "open fast path fell back to full commit-directory recovery: "+err.Error())
+		recovery.Notes = append(recovery.Notes, "open fast path fell back to full commit recovery: "+err.Error())
 		return recovery, nil
 	}
 
-	files, err := ScanCommitFiles(root)
+	generations, err := ctl.ListCommitGenerations()
 	if err != nil {
 		return nil, err
 	}
-	candidates := make([]uint64, 0, len(files))
+	present := make(map[uint64]bool, len(generations))
+	candidates := make([]uint64, 0, len(generations))
 	highestFileGeneration := uint64(0)
-	for generation := range files {
+	for _, generation := range generations {
+		present[generation] = true
 		if generation > highestFileGeneration {
 			highestFileGeneration = generation
 		}
@@ -425,19 +453,17 @@ func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, a
 
 	rejected := make([]uint64, 0)
 	// Iterate the sorted slots so the notes are deterministic. A published
-	// generation whose commit file is absent is a rejection, never an
-	// invitation to invent a head.
+	// generation whose commit is absent is a rejection, never an invitation to
+	// invent a head.
 	for _, slot := range validSlots {
-		if _, ok := files[slot.Generation]; !ok {
-			notes = append(notes, "generation "+itoa(slot.Generation)+" rejected: published slot has no commit file")
+		if !present[slot.Generation] {
+			notes = append(notes, "generation "+itoa(slot.Generation)+" rejected: published slot has no commit record")
 			rejected = append(rejected, slot.Generation)
 		}
 	}
 
 	for _, generation := range candidates {
-		path := CommitPath(root, generation)
-		expected := generation
-		loaded, err := LoadCommitFile(path, &expected)
+		loaded, err := ctl.ReadCommit(generation)
 		if err != nil {
 			notes = append(notes, "generation "+itoa(generation)+" rejected: "+err.Error())
 			rejected = append(rejected, generation)
@@ -458,13 +484,13 @@ func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, a
 		var state *model.State
 		var loadNotes []string
 		if strategy == replayBounded {
-			state, loadNotes, err = loadStateBounded(root, src, loaded.Hash, loaded.Generation, maxVisible)
+			state, loadNotes, err = loadStateBounded(ctl, src, loaded.Hash, loaded.Generation, maxVisible)
 			if err != nil {
 				notes = append(notes, "generation "+itoa(generation)+": bounded replay fell back to full scan: "+err.Error())
-				state, loadNotes, err = loadStateAt(src, root, loaded.Hash, maxVisible, true)
+				state, loadNotes, err = loadStateAt(src, ctl, loaded.Hash, maxVisible, true)
 			}
 		} else {
-			state, loadNotes, err = loadStateAt(src, root, loaded.Hash, maxVisible, true)
+			state, loadNotes, err = loadStateAt(src, ctl, loaded.Hash, maxVisible, true)
 		}
 		if err != nil {
 			notes = append(notes, "generation "+itoa(generation)+" rejected: "+err.Error())
@@ -485,23 +511,21 @@ func recoverWithStrategy(root string, src blobSource, strategy replayStrategy, a
 // must be the head, its commit file must exist and match the slot hash and
 // length, and the bounded chain replay must complete. Anything else returns an
 // error so the caller can fall back to the full directory scan.
-func recoverDirectoryFree(root string, src blobSource, view SuperblockView, validSlots []SuperblockSlot, maxVisible uint64, slotByGen map[uint64]SuperblockSlot) (*Recovery, error) {
+func recoverDirectoryFree(ctl commitSource, src blobSource, view SuperblockView, validSlots []SuperblockSlot, maxVisible uint64, slotByGen map[uint64]SuperblockSlot) (*Recovery, error) {
 	// The scan-based path records a rejection for every published slot whose
-	// commit file is missing. Reproducing that note without enumerating is not
+	// commit is missing. Reproducing that note without enumerating is not
 	// possible, so fall back when it happens.
 	for _, slot := range validSlots {
-		path := CommitPath(root, slot.Generation)
-		info, err := os.Stat(path)
+		present, err := ctl.HasCommit(slot.Generation)
 		if err != nil {
-			return nil, werr.Wrap(werr.Corrupt, err, "published generation %d has no commit file", slot.Generation)
+			return nil, err
 		}
-		if !info.Mode().IsRegular() {
-			return nil, werr.Newf(werr.Corrupt, "published generation %d commit path %s is not a regular file", slot.Generation, path)
+		if !present {
+			return nil, werr.Newf(werr.Corrupt, "published generation %d has no commit record", slot.Generation)
 		}
 	}
 
-	expected := maxVisible
-	loaded, err := LoadCommitFile(CommitPath(root, maxVisible), &expected)
+	loaded, err := ctl.ReadCommit(maxVisible)
 	if err != nil {
 		return nil, err
 	}
@@ -514,7 +538,7 @@ func recoverDirectoryFree(root string, src blobSource, view SuperblockView, vali
 		}
 	}
 
-	state, loadNotes, err := loadStateBounded(root, src, loaded.Hash, loaded.Generation, maxVisible)
+	state, loadNotes, err := loadStateBounded(ctl, src, loaded.Hash, loaded.Generation, maxVisible)
 	if err != nil {
 		return nil, err
 	}
@@ -549,7 +573,7 @@ func recoverDirectoryFree(root string, src blobSource, view SuperblockView, vali
 // back to LoadStateAt; this function never accepts a shorter or partial chain
 // as a substitute. The walk is bounded by headGeneration steps and by
 // maxGeneration, so a hostile chain cannot force unbounded work.
-func loadStateBounded(root string, src blobSource, headHash model.Hash32, headGeneration, maxGeneration uint64) (*model.State, []string, error) {
+func loadStateBounded(ctl commitSource, src blobSource, headHash model.Hash32, headGeneration, maxGeneration uint64) (*model.State, []string, error) {
 	if headGeneration == 0 {
 		return nil, nil, werr.Newf(werr.Corrupt, "bounded replay requires a non-zero head generation")
 	}
@@ -573,14 +597,13 @@ func loadStateBounded(root string, src blobSource, headHash model.Hash32, headGe
 			return nil, nil, werr.Newf(werr.Corrupt, "commit parent chain contains a cycle")
 		}
 		seen[cursorHash] = true
-		expected := cursorGeneration
-		loaded, err := LoadCommitFile(CommitPath(root, cursorGeneration), &expected)
+		loaded, err := ctl.ReadCommit(cursorGeneration)
 		if err != nil {
 			return nil, nil, err
 		}
 		if loaded.Hash != cursorHash {
-			return nil, nil, werr.Newf(werr.Corrupt, "commit %s hashes to %s but the child or superblock declares %s",
-				CommitPath(root, cursorGeneration), loaded.Hash.Hex(), cursorHash.Hex())
+			return nil, nil, werr.Newf(werr.Corrupt, "commit generation %d hashes to %s but the child or superblock declares %s",
+				cursorGeneration, loaded.Hash.Hex(), cursorHash.Hex())
 		}
 		steps++
 		if steps > headGeneration {
@@ -658,7 +681,7 @@ func loadStateBounded(root string, src blobSource, headHash model.Hash32, headGe
 		state.Generation = loaded.Generation
 	}
 
-	if err := validateCatalog(src, root, state); err != nil {
+	if err := validateCatalog(src, "", state); err != nil {
 		return nil, nil, err
 	}
 	// Honest recovery note: a bounded open does not enumerate commit files below
@@ -674,21 +697,28 @@ func loadStateBounded(root string, src blobSource, headHash model.Hash32, headGe
 	return state, notes, nil
 }
 
-// AllCommits lists every valid parsed commit file up to maxGeneration. It
-// always enumerates the commit directory; verify --full and GC roots rely on
-// it and must never inherit the bounded open's window.
+// AllCommits lists every valid parsed commit up to maxGeneration. It always
+// enumerates the commit namespace; verify --full and GC roots rely on it and
+// must never inherit the bounded open's window.
 func AllCommits(root string, maxGeneration uint64) ([]LoadedCommit, error) {
-	files, err := ScanCommitFiles(root)
+	ctl, err := newLocalControl(root, PlaneLocal)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]LoadedCommit, 0, len(files))
-	for generation, path := range files {
+	return allCommitsFrom(ctl, maxGeneration)
+}
+
+func allCommitsFrom(ctl commitSource, maxGeneration uint64) ([]LoadedCommit, error) {
+	generations, err := ctl.ListCommitGenerations()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LoadedCommit, 0, len(generations))
+	for _, generation := range generations {
 		if generation > maxGeneration {
 			continue
 		}
-		expected := generation
-		loaded, err := LoadCommitFile(path, &expected)
+		loaded, err := ctl.ReadCommit(generation)
 		if err != nil {
 			continue
 		}

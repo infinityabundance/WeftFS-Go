@@ -1,8 +1,6 @@
 package store
 
 import (
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -53,7 +51,7 @@ func (r *VerifyReport) problem(class, detail string) {
 func (s *Store) Verify(full bool) (*VerifyReport, error) {
 	report := &VerifyReport{Full: full, Generation: s.generation, Commit: hashPtr(s.head)}
 
-	view, err := ReadSuperblock(s.root)
+	view, err := s.commits.ReadSuperblock()
 	if err != nil {
 		return nil, err
 	}
@@ -78,21 +76,15 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		report.problem(string(werr.Corrupt), "no valid superblock slot")
 	}
 
-	files, err := ScanCommitFiles(s.root)
+	generations, err := s.commits.ListCommitGenerations()
 	if err != nil {
 		return nil, err
 	}
-	generations := make([]uint64, 0, len(files))
-	for generation := range files {
-		generations = append(generations, generation)
-	}
 	sort.Slice(generations, func(i, j int) bool { return generations[i] < generations[j] })
 	for _, generation := range generations {
-		path := files[generation]
-		expected := generation
-		loaded, err := LoadCommitFile(path, &expected)
+		loaded, err := s.commits.ReadCommit(generation)
 		if err != nil {
-			report.problem(string(werr.ClassOf(err)), "commit file "+path+": "+err.Error())
+			report.problem(string(werr.ClassOf(err)), "commit generation "+itoa(generation)+": "+err.Error())
 			continue
 		}
 		report.CheckedCommits++
@@ -112,7 +104,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
-	recovered, err := recoverWithStrategy(s.root, s.blobs, replayBounded, true)
+	recovered, err := recoverWithStrategy(s.commits, s.blobs, replayBounded, true)
 	if err != nil {
 		report.problem(string(werr.ClassOf(err)), "recovery failed: "+err.Error())
 	} else {
@@ -129,10 +121,9 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 			// the highest published state too, without the catalog gate, so a
 			// representation decode failure names the affected object instead of
 			// only the resulting generation gap.
-			if path, ok := files[maxVisible]; ok {
-				expected := maxVisible
-				if loaded, loadErr := LoadCommitFile(path, &expected); loadErr == nil {
-					if highest, loadNotes, stateErr := loadStateAt(s.blobs, s.root, loaded.Hash, maxVisible, false); stateErr == nil {
+			if _, ok := slotByGen[maxVisible]; ok {
+				if loaded, loadErr := s.commits.ReadCommit(maxVisible); loadErr == nil {
+					if highest, loadNotes, stateErr := loadStateAt(s.blobs, s.commits, loaded.Hash, maxVisible, false); stateErr == nil {
 						for _, note := range loadNotes {
 							report.problem(string(werr.Corrupt), note)
 						}
@@ -142,7 +133,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 				}
 			}
 		}
-		state, notes, err := loadStateAt(s.blobs, s.root, recovered.Head, maxVisible, true)
+		state, notes, err := loadStateAt(s.blobs, s.commits, recovered.Head, maxVisible, true)
 		if err != nil {
 			report.problem(string(werr.ClassOf(err)), "state replay failed: "+err.Error())
 		} else {
@@ -154,7 +145,7 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
-	commits, err := AllCommits(s.root, maxVisible)
+	commits, err := allCommitsFrom(s.commits, maxVisible)
 	if err != nil {
 		return nil, err
 	}
@@ -175,11 +166,10 @@ func (s *Store) Verify(full bool) (*VerifyReport, error) {
 		}
 	}
 
-	// Snapshot pointer files are caches; report mismatches, not absence.
+	// Snapshot pointer records are caches; report mismatches, not absence.
 	for name, hash := range s.state.Snapshots {
-		path := filepath.Join(s.root, "refs", "snapshots", name)
-		text, err := os.ReadFile(path)
-		if err != nil {
+		text, present, err := s.commits.ReadRecord("refs/snapshots/" + name)
+		if err != nil || !present {
 			continue
 		}
 		parsed, err := parseHashHex(strings.TrimSpace(string(text)))

@@ -55,16 +55,19 @@ const (
 	// PlanePosix declares absent atomic publication and conditional update. It
 	// is never usable for a writable store; it exists to prove the refusal.
 	PlanePosix PlaneKind = "posix"
+	// PlaneS3 is an S3-compatible object endpoint. Every blob and control
+	// record maps to one logical key and is published with a conditional write.
+	PlaneS3 PlaneKind = "s3"
 )
 
-// ParsePlaneKind parses `local|object|posix`.
+// ParsePlaneKind parses `local|object|posix|s3`.
 func ParsePlaneKind(text string) (PlaneKind, error) {
 	switch PlaneKind(text) {
-	case PlaneLocal, PlaneObject, PlanePosix:
+	case PlaneLocal, PlaneObject, PlanePosix, PlaneS3:
 		return PlaneKind(text), nil
 	default:
 		return "", werr.Newf(werr.InvalidArgument,
-			"backend must be `local`, `object`, or `posix` (got `%s`)", text)
+			"backend must be `local`, `object`, `posix`, or `s3` (got `%s`)", text)
 	}
 }
 
@@ -149,6 +152,11 @@ type BlobEntry struct {
 	Rel     string
 	Size    uint64
 	ModTime time.Time
+}
+
+// probe is the capability proof a blob plane must provide on a writable open.
+type blobProber interface {
+	probe() (BlobProbe, error)
 }
 
 // BlobAccess is the logical immutable blob namespace. Every reader, writer,
