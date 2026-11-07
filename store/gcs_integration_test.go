@@ -269,6 +269,8 @@ func TestGCSCommitVolumeAndGenerationPreconditions(t *testing.T) {
 	} else if ok {
 		t.Fatal("a stale generation was accepted")
 	}
+	t.Logf("generation CAS measured: create generation %d, matching write accepted at generation %d, stale precondition %d refused",
+		firstMeta.Generation, secondGeneration, firstMeta.Generation)
 	stored, present, err := control.ReadRecord("refs/snapshots/s1")
 	if err != nil || !present || string(stored) != "second\n" {
 		t.Fatalf("refused stale write changed the bytes: %q present=%t err=%v", stored, present, err)
