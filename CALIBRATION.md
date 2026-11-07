@@ -77,6 +77,25 @@ therefore stated as 25% on `ns_per_mib` and max(100%, 150 µs) on `fixed_ns`.
 Declared rows are identical by construction; reused rows move with
 `weight-delta`.
 
+## Installing a document
+
+`weftfs calibrate --install --store DIR` (or `--from FILE --install`) validates
+the document through the same strict loader and atomically writes it to
+`DIR/calibrations/<calibration_id>.json` (temporary file, `fsync`, `rename`,
+directory `fsync`). Re-installing the same document is idempotent because the
+file name is the content digest. The directory is advisory and is ignored by
+replay, verify, and GC, exactly as in Rust. An installed document is consumed
+explicitly:
+
+```
+weftfs --calibration DIR/calibrations/<id>.json --planner-cost-model measured \
+    write --tensor ... --lambda-ns N
+```
+
+A malformed document fails the loader before anything is written, so
+`calibrations/` is not even created. `--install` requires a local `--store`; a
+remote plane is refused.
+
 ## Non-claims
 
 - Not a cross-machine constant. Re-run `weftfs calibrate` on the target host.

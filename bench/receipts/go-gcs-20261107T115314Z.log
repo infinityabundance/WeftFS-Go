@@ -1,0 +1,64 @@
++ exec docker run --rm --init --name weft-go-court-4109178 --memory=3g --memory-swap=3g --pids-limit=1024 --cpus=4 --ulimit nofile=65536:65536 --security-opt no-new-privileges --tmpfs /tmp:rw,size=1g,nosuid,nodev --cap-drop=ALL -e WEFT_IN_COURT=1 -e WEFT_COURT_IMAGE=weft/go-court:1 -e WEFT_COURT_KERNEL=7.3.1-1-cachyos -e WEFT_COURT_IMAGE_ID=sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166 -e WEFT_COURT_MEMORY=3g -e WEFT_COURT_CPUS=4 -e WEFT_COURT_PIDS=1024 -e WEFT_COURT_NPROC=2048 -e WEFT_DOCKER_SERVER=29.9.2 -e WEFT_DOCKER_CLIENT=29.1.5 -e WEFT_REPO_WEFTFS=7e04aab3beca1c861cb95438486b21716b8a0649 -e WEFT_REPO_WEFTFS_GO=fb43d27d1fb5733a515c214c2cfc67a5e6b5879b -e WEFT_REPO_WEFTCODEC=46713726cd454f587c4db006ae723bd4bd4474a2 -e WEFT_REPO_WEFTCODEC_GO=bf6bb70e827fe801fbe83c9e352d0ff3621dc704 -e RUST_BACKTRACE=1 -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/work/.docker-cache/target-rust -e CARGO_NET_RETRY=3 -e GOCACHE=/work/.docker-cache/go-build -e GOMODCACHE=/work/.docker-cache/go-mod -e 'GOFLAGS=-p=2 -buildvcs=false' -e GOTMPDIR=/work/.docker-cache/go-tmp -e GOMAXPROCS=4 -v /mnt/1tb_kingston/WeftFS:/work -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-registry:/cargo/registry -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-git:/cargo/git -w /work -e WEFT_GCS_TEST_ENDPOINT=http://weft-go-gcs-emulator-4108895:4443 -e WEFT_GCS_TEST_BUCKET=weft-go-gcs-20261107t115314z -e WEFT_GCS_PROJECT=weft-court -e WEFT_GCS_ANONYMOUS=1 -e WEFT_GCS_LOCK_LEASE_SECS=60 -e WEFT_GCS_FENCE_LEASE_SECS=3 -e WEFT_GCS_SERVER_LABEL=fake-gcs-server -e WEFT_GCS_SERVER_VERSION=v1.56.1 -e WEFT_GCS_SERVER_SHA256=0f2f9f6884417acd5cc27126a9aa237ccc627372a4aa5008b399641de6db9469 --network weft-go-gcs-net-4108895 weft/go-court:1 bash -c 'set -Eeuo pipefail; ulimit -n 65536; ulimit -u 2048; export TMPDIR=/tmp; cd /work; cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run '\''TestGCS'\'' ./store/'
+=== RUN   TestGCSBlobPlaneCreateOnceRangesListingAndPaging
+--- PASS: TestGCSBlobPlaneCreateOnceRangesListingAndPaging (0.01s)
+=== RUN   TestGCSCommitVolumeAndGenerationPreconditions
+    gcs_integration_test.go:232: measured GCS precondition behaviour: ifGenerationMatch=0 create-once, matching generation accepted, stale generation refused
+    gcs_integration_test.go:272: generation CAS measured: create generation 1794052407831645, matching write accepted at generation 1794052407832530, stale precondition 1794052407831645 refused
+--- PASS: TestGCSCommitVolumeAndGenerationPreconditions (0.01s)
+=== RUN   TestGCSFencedWriterTakeover
+--- PASS: TestGCSFencedWriterTakeover (1.24s)
+=== RUN   TestGCSStoreRoundTrip
+    gcs_integration_test.go:427: host-local GCS counters (writer, emulator): requests=129 reads=12 range_reads=0 bytes_read=56756 writes=34 bytes_written=101985 conflicts=3
+--- PASS: TestGCSStoreRoundTrip (0.08s)
+=== RUN   TestGCSCrashChildProcess
+    gcs_integration_test.go:493: GCS crash helper process; not run directly
+--- SKIP: TestGCSCrashChildProcess (0.00s)
+=== RUN   TestGCSCrashProxy
+=== RUN   TestGCSCrashProxy/after_objects
+=== RUN   TestGCSCrashProxy/after_commit_file
+=== RUN   TestGCSCrashProxy/after_superblock_write
+--- PASS: TestGCSCrashProxy (0.08s)
+    --- PASS: TestGCSCrashProxy/after_objects (0.03s)
+    --- PASS: TestGCSCrashProxy/after_commit_file (0.03s)
+    --- PASS: TestGCSCrashProxy/after_superblock_write (0.03s)
+=== RUN   TestGCSFencedWriterPausedAfterFenceCannotPublish
+    gcs_integration_test.go:710: after-fence child: ok=false phase=publish class=Busy generation=2 head=d21d0e9e934116b526651386ee89623b4ec66b77f9378f4768ae6a07adea6622 message="Busy: GCS writer lease deadline passed 526 ms ago (owner 322-2-1794052409253541245 fence 2); publication refused before the head was touched; the LOCK now names owner 295-2-1794052411772803359 fence 3"
+--- PASS: TestGCSFencedWriterPausedAfterFenceCannotPublish (3.56s)
+=== RUN   TestGCSFenceChildAfterFence
+--- PASS: TestGCSFenceChildAfterFence (0.00s)
+=== RUN   TestGCSSplitLayouts
+=== RUN   TestGCSSplitLayouts/local/local
+=== RUN   TestGCSSplitLayouts/gcs/gcs
+=== RUN   TestGCSSplitLayouts/gcs-blobs/local-commits
+=== RUN   TestGCSSplitLayouts/local-blobs/gcs-commits
+--- PASS: TestGCSSplitLayouts (0.06s)
+    --- PASS: TestGCSSplitLayouts/local/local (0.00s)
+    --- PASS: TestGCSSplitLayouts/gcs/gcs (0.02s)
+    --- PASS: TestGCSSplitLayouts/gcs-blobs/local-commits (0.01s)
+    --- PASS: TestGCSSplitLayouts/local-blobs/gcs-commits (0.02s)
+=== RUN   TestGCSPreconditionParameters
+--- PASS: TestGCSPreconditionParameters (0.00s)
+=== RUN   TestGCSPctEncodesOnePathSegment
+--- PASS: TestGCSPctEncodesOnePathSegment (0.00s)
+=== RUN   TestGCSLockRecordIsSeparateFromS3
+--- PASS: TestGCSLockRecordIsSeparateFromS3 (0.00s)
+=== RUN   TestGCSConfigResolutionAndCredentialForms
+--- PASS: TestGCSConfigResolutionAndCredentialForms (0.00s)
+=== RUN   TestGCSServiceAccountAssertionAndExchange
+--- PASS: TestGCSServiceAccountAssertionAndExchange (0.13s)
+=== RUN   TestGCSServiceAccountRejectsBadKeys
+=== RUN   TestGCSServiceAccountRejectsBadKeys/no_email
+=== RUN   TestGCSServiceAccountRejectsBadKeys/no_key
+=== RUN   TestGCSServiceAccountRejectsBadKeys/bad_pem
+=== RUN   TestGCSServiceAccountRejectsBadKeys/not_json
+=== RUN   TestGCSServiceAccountRejectsBadKeys/wrong_type
+--- PASS: TestGCSServiceAccountRejectsBadKeys (0.00s)
+    --- PASS: TestGCSServiceAccountRejectsBadKeys/no_email (0.00s)
+    --- PASS: TestGCSServiceAccountRejectsBadKeys/no_key (0.00s)
+    --- PASS: TestGCSServiceAccountRejectsBadKeys/bad_pem (0.00s)
+    --- PASS: TestGCSServiceAccountRejectsBadKeys/not_json (0.00s)
+    --- PASS: TestGCSServiceAccountRejectsBadKeys/wrong_type (0.00s)
+=== RUN   TestGCSweepSkipsSymlinksAndNonRegularEntries
+--- PASS: TestGCSweepSkipsSymlinksAndNonRegularEntries (0.00s)
+PASS
+ok  	github.com/infinityabundance/WeftFS-Go/store	6.163s

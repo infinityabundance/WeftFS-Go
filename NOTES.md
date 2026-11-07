@@ -1048,6 +1048,195 @@ parent file was edited.
 
 ---
 
+## R26 — GCS backend, generation-fenced writer, and read-only FUSE over objects (2026-11-07)
+
+Go now has a real GCS JSON-API backend with the same plane contract as the S3
+backend, plus the first evidenced read-only FUSE mount over object storage. The
+Rust reference is `src/gcs.rs`, `src/service_account.rs`, and
+`src/writer_fence.rs`; the Go port keeps the logical key layout and the fence
+fields identical. No parent file and no submodule pin was changed.
+
+### What is implemented
+
+1. **Request layer** (`store/gcsclient.go`, stdlib `net/http` only): URL form
+   is `GET /storage/v1/b/<bucket>/o/<pct(name)>?alt=media` for bytes and the
+   object resource for metadata; uploads are
+   `POST /upload/storage/v1/b/<bucket>/o?uploadType=media&name=...&
+   ifGenerationMatch=...` up to 5 MiB and the documented two-step resumable
+   upload above it (the precondition travels on session initiation). Range
+   reads send `Range`; a server that ignores it is sliced client-side. Listing
+   follows `nextPageToken` to exhaustion with a bounded page body. Object names
+   are percent-encoded as one path segment (`/` becomes `%2F`). Every response
+   body is bounded (8 MiB JSON, 1 GiB object); a transport failure stays `Io`,
+   not `Corrupt`.
+2. **Generation semantics**: `ifGenerationMatch=0` is create-once;
+   `ifGenerationMatch=<n>` is compare-and-swap; HTTP 412 is `Busy` at the store.
+   `readWithGeneration` reads metadata, media, then metadata again and accepts
+   only an unchanged generation, so a concurrent replacement is never mistaken
+   for the observed value. The writable open *measures* the endpoint: a fresh
+   create must succeed, a second create must be refused, a matching generation
+   must succeed, and a stale generation must be refused. An endpoint that
+   accepts a stale generation or ignores create-once is `UnsupportedVersion`;
+   there is no fallback.
+3. **Authentication** (`store/gcs_auth.go`): exactly one of a bearer token
+   (`--gcs-token`, `WEFT_GCS_ACCESS_TOKEN`, `GOOGLE_OAUTH_ACCESS_TOKEN`), a
+   service-account key (`--gcs-credentials`, `WEFT_GCS_CREDENTIALS`,
+   `GOOGLE_APPLICATION_CREDENTIALS`), or `--gcs-anonymous` for an emulator.
+   Service-account auth is a real RS256 JWT-bearer flow with
+   `crypto/rsa`, `crypto/x509`, `encoding/pem`: PKCS#8 or PKCS#1 keys,
+   2048..=8192 bits, a one-hour assertion with `iss/scope/aud/iat/exp`, a
+   bounded token exchange, and a refresh window of `min(300 s, lifetime/2)`.
+   Mixed forms are `UnsupportedVersion`; none is `InvalidArgument`. Tokens and
+   key material never appear in diagnostics, which print only a key
+   fingerprint and bit length.
+4. **Fenced writer**: `LOCK` is `weftfs-gcs-lock v3` with `owner`, monotonic
+   `fence`, `sequence`, absolute `lease_deadline_ns`, `renewed_ns`,
+   `pending_generation`, `pending_commit`, `pending_commit_len`. Takeover,
+   renewal, and release are all generation-conditioned. The single publication
+   point is one conditional upload of `LOCK` (`ifGenerationMatch=<the
+   generation this handle last published>`) immediately before the superblock
+   cache CAS; it carries both the fence and the new head. A successor's
+   takeover changes the object's generation, so the stale writer's upload is
+   412 -> `Busy` and the head is never touched. Release is a content-addressed
+   tombstone with `ifGenerationMatch`, never an unconditional delete. The
+   superblock remains a validated cache that is repaired from the lock record
+   on a writable open.
+5. **Store integration**: `--backend gcs` sets both planes;
+   `--blob-backend gcs` and `--commit-backend gcs` select one, so all four
+   layouts are supported (local/local, gcs/gcs, gcs-blobs/local-commits,
+   local-blobs/gcs-commits). Init needs no local directory for a remote commit
+   plane. Read-only opens never probe and never write. Packing, snapshots, GC,
+   verify, quotas, access counters, and checkpoints use the existing paths.
+   S3's lock codec moved to the shared `store/fence_record.go` with no wire
+   change; the GCS and S3 schema sets are separate and cross-parsing is
+   rejected.
+
+### Exact commands and environment
+
+```
+cd /mnt/1tb_kingston/WeftFS/WeftFS-Go
+scripts/go-gcs-court.sh                 # focused + full -race + FUSE over GCS
+scripts/go-gcs-court.sh --focused-only  # focused only
+scripts/go-gcs-court.sh --no-full       # focused + FUSE, skip the full suite
+scripts/go-s3-court.sh                  # focused + full -race + xlang + FUSE over S3
+```
+
+The GCS court downloads `fake-gcs-server_1.56.1_Linux_amd64.tar.gz`
+(sha256 `0f2f9f6884417acd5cc27126a9aa237ccc627372a4aa5008b399641de6db9469`)
+into `.docker-cache/gcs`, verifies the tarball, and runs the binary in
+`debian@sha256:734a72b3...` as a **sibling container** on a private Docker
+network with memory 3g / swap 3g / pids 1024 / cpus 4 / a 1 GiB tmpfs data
+directory / `no-new-privileges` / `cap-drop=ALL`. Its backend is `memory`. The
+Go court joins that network and uses container-name DNS:
+`http://<container>:4443`. `--network` and every `WEFT_GCS_*`/`WEFT_S3_*`
+variable arrive through the parent `scripts/docker-court.sh`; no parent file
+was edited.
+
+### Evidence (final receipts)
+
+- **GCS focused, go court**: `gofmt -l`, `go vet ./...`,
+  `CGO_ENABLED=0 go build ./...` clean; `go test -race -count=1 -v -run
+  'TestGCS' ./store/` -> **27 pass / 0 fail / 1 skip** (the skip is the crash
+  child helper run directly). Covers create-once conflict and idempotence,
+  matching/stale generation CAS, strict refusal of a stale write, ranged
+  reads, two-object listing paging, a full store round trip (init, files,
+  snapshot, `verify --full`, read-only reopen, unlink + `gc`, verify), the
+  three-phase crash proxy, fence takeover/release, the paused-after-fence
+  interleaving, all four plane layouts, and the RS256 JWT-bearer exchange
+  against an in-process token endpoint.
+- **Measured generation behaviour** (fake-gcs-server; one run): create
+  generation `1794052407831645`, matching write accepted at generation
+  `1794052407832530`, stale precondition `1794052407831645` refused and the
+  winner's bytes preserved. The round-trip handle counters were 129 requests,
+  34 writes / 101,985 bytes written, 12 reads / 56,756 bytes read, and 3
+  conditional conflicts. These are diagnostics, not throughput claims.
+- **GCS full suite, fuse court**: `go test -race -count=1 ./...` -> **5/5
+  packages ok, 0 failures** (`cmd/weftfs`, `fusefs`, `index`, `model`,
+  `store`).
+- **FUSE over GCS, fuse court**: read-only mount of a GCS store; **3/3 files
+  byte-identical and 3/3 SHA-256 matches**, listing digest
+  `a4b80dbc58e85f738d794603c30938ecf379d80b1d86b6aa97ff61046ca1189c`, ranged
+  read SHA-256 `77c59b39...c00e`, a write to the mount refused (`Read-only file
+  system`), the daemon exited on unmount, and `verify --full` passed after the
+  unmount (generation 6, same commit). Receipt
+  `bench/receipts/go-gcs-20261107T115314Z.json` at WeftFS-Go `fb43d27`.
+- **S3 focused**: **20 pass / 0 fail / 1 skip**; measured `If-Match` form
+  `quoted-as-returned`.
+- **S3 full + cross-language**: **5/5 packages ok** and **17/17 `XLANG:`
+  checks**.
+- **FUSE over S3, fuse court**: read-only mount of a MinIO-backed store;
+  **3/3 files byte-identical and 3/3 SHA-256 matches**, listing digest
+  `eeaf8a4d...e19ed0`, a write refused, daemon exited, and `verify --full`
+  after unmount (generation 6). Receipt
+  `bench/receipts/go-s3-20261107T114957Z.json` at WeftFS-Go `08fda6f` (the
+  next commit changes only a GCS test log).
+
+### Explicit limitations (not claims)
+
+- **No writable FUSE-over-object court.** The read-only mount is the only
+  evidenced configuration. The writable store path over S3/GCS is exercised by
+  the CLI and unit/integration courts, but a writable FUSE mount over a remote
+  plane is not claimed safe or unsafe; it was not run.
+- No live Google Cloud run: the emulator is `fake-gcs-server` with a memory
+  backend on a private bridge. No cloud, multi-node, replication, media,
+  power-loss, device-cache, fleet, or production claim. The service-account
+  path is exercised offline (RS256 assertion verified by the token endpoint);
+  no live Google token exchange or real key is present.
+- The fence is **two conditional writes on two objects** (LOCK, then the
+  superblock cache), not one atomic operation; GCS has no such primitive. The
+  fence still makes a stale publication impossible because a successor cannot
+  take the lease without rewriting LOCK, which changes its generation.
+- Single writer by design; no clock-skew defence, no multi-writer protocol, and
+  a lost reply is the usual at-least-once ambiguity.
+- `List` is paginated with `maxResults=1000` in production; the two-object paging
+  proof uses a test-only client page-size knob.
+- `durable_fsync` means "the provider acknowledged the upload"; GCS has no
+  fsync, and the court's data is memory/tmpfs.
+- Go still has **no Azure backend**. The `--backend azure` spelling remains
+  Rust-only; choosing it in Go is `InvalidArgument`.
+
+---
+
+## R27 — `calibrate --install` (2026-11-07)
+
+`weftfs calibrate --install --store DIR` now matches Rust
+`Calibration::install`: the document (measured, or `--from FILE`) is validated
+by the existing strict loader, written to a temporary file in
+`DIR/calibrations/`, `fsync`ed, renamed to `<calibration_id>.json`, and the
+directory is `fsync`ed. The directory is advisory like `indexes/`: replay,
+verify, and GC ignore it. Re-installing the same document is idempotent.
+
+As in Rust, installation is **advisory**: a later `plan`/`write` uses the
+document only through the existing `--calibration <file>` path (which requires
+`--planner-cost-model measured`). Installation does not silently swap the cost
+table of an unrelated command.
+
+### Evidence
+
+- Store test `TestCalibrationInstallRoundTripsAndIsIdempotent`: installed path,
+  mode `0644`, reload through the strict loader, identical rows, one file after
+  re-install.
+- Store test `TestInstalledCalibrationChangesPlannerSelection`: a signed
+  document whose `zstd` and `float-tensor` rows disagree with the baked table
+  is installed, loaded from the installed path, and used with
+  `--lambda-ns`-equivalent pricing. On the BF16 fixture the baked measured
+  table chooses **raw** (2,097,152 B, 625,795 ns) and the installed document
+  chooses **float-tensor** (1,311,519 B, 2 ns); the chosen decode estimate
+  equals the installed row, not the baked row.
+- CLI test `TestCalibrateCLIInstallsValidatedDocument`: `--from` + `--install`
+  reports `installed=<DIR>/calibrations/<id>.json` in JSON and text output, and
+  the file reloads.
+- CLI test `TestCalibrateCLIInstallRejectsMalformedAndWritesNothing`: a
+  malformed document fails and `calibrations/` is not created.
+- CLI test `TestCalibrateCLIInstallRefusesARemoteStore`: `--backend gcs` and an
+  empty `--store` are both refused.
+
+`CALIBRATION.md` now documents the install path and the explicit
+`--calibration` consumption. Test counts at `fb43d27`: GCS focused 27/0/1,
+full suite 5/5 packages, CLI package ok.
+
+---
+
 ## Selector-index persistence (WFX2) — implemented
 
 This closes the last storage-surface gap against the Rust reference's advisory

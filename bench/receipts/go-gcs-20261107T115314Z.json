@@ -1,0 +1,49 @@
+{
+  "schema": "weft-go-gcs-court-v1",
+  "generated_utc": "20261107T115314Z",
+  "revision": {
+    "weftfs_go": "fb43d27d1fb5733a515c214c2cfc67a5e6b5879b",
+    "note": "WeftFS-Go only; the parent Rust revision and submodule pin were not changed"
+  },
+  "emulator": {
+    "product": "fake-gcs-server (fsouza/fake-gcs-server)",
+    "release": "v1.56.1",
+    "version_line": "fake-gcs-server 1.56.1 (the binary exposes no -version flag; the tarball sha256 above is the identity)",
+    "tarball": "fake-gcs-server_1.56.1_Linux_amd64.tar.gz",
+    "tarball_sha256": "0f2f9f6884417acd5cc27126a9aa237ccc627372a4aa5008b399641de6db9469",
+    "container_image": "debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc",
+    "container_image_id": "sha256:43f84a0b210f98845ef003912981774c95efe439eaa4b1cb62cf803fd46fc82a",
+    "backend": "memory",
+    "started_by": "scripts/go-gcs-court.sh",
+    "endpoint_form": "http://<container-name>:4443 on a private bridge network"
+  },
+  "court": {
+    "docker_server": "29.9.2",
+    "go_image_id": "sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166",
+    "fuse_image_id": "sha256:1a0e1337179d9bcc5c05efd00b94b40b674d9586a344dacb977625a1b3273157",
+    "memory": "3g",
+    "memory_swap": "3g",
+    "pids": "1024",
+    "cpus": "4",
+    "nproc": "2048",
+    "cap_drop": "ALL",
+    "no_new_privileges": true,
+    "tmpfs": "/tmp 1g; emulator data tmpfs 1g"
+  },
+  "tests": {
+    "command": "go test -race -count=1 -v -run 'TestGCS' ./store/ in the go court",
+    "passed": 27,
+    "failed": 0,
+    "skipped": 1,
+    "full_command": "go test -race -count=1 ./... in the fuse court",
+    "full_packages_ok": 5,
+    "full_packages_failed": 0,
+    "fuse_command": "bash scripts/go-object-fuse-court.sh gcs in the fuse court",
+    "fuse_files": 3,
+    "fuse_sha256_matches": 3,
+    "fuse_listing_digest": "a4b80dbc58e85f738d794603c30938ecf379d80b1d86b6aa97ff61046ca1189c",
+    "fuse_ranged_sha256": "77c59b39f3c9c6cc471cb59952d6c7211cfdb2865f51d8b0a35bbb66dc38c00e",
+    "logs": ["bench/receipts/go-gcs-20261107T115314Z.log", "bench/receipts/go-gcs-full-20261107T115314Z.log", "bench/receipts/go-gcs-fuse-20261107T115314Z.log"]
+  },
+  "label": "Single-host GCS-compatible emulator on a private bridge network in the OOM-protected Docker court with a memory backend. Not a cloud, multi-node, fleet, device-cache, media, power-loss, or production claim. The FUSE leg is a read-only mount; no writable FUSE-over-object claim is made."
+}
