@@ -17,12 +17,17 @@ package store
 // control state. The court destroys the server (tmpfs data) on exit.
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -725,5 +730,245 @@ func TestS3CrashProxy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestS3FencedWriterPausedAfterFenceCannotPublish injects the interleaving the
+// external review found uncovered in the old two-object protocol:
+//
+//  1. writer A fences (a conditional write on LOCK);
+//  2. A is SIGSTOPped after the fence and before the publication write;
+//  3. A's lease expires; writer B reclaims the fence without publishing a head;
+//  4. A resumes; its publication must fail Busy and the head must not move;
+//  5. B then publishes and succeeds.
+//
+// The hook is `WEFT_FENCE_PAUSE_AFTER_FENCE=1` in store/fence_pause.go; it
+// writes `WEFT_FENCE_AFTER_FENCE_READY` and raises SIGSTOP exactly once.
+func TestS3FencedWriterPausedAfterFenceCannotPublish(t *testing.T) {
+	bucket := s3TestBucket(t)
+	lease := 2 * time.Second
+	options := s3TestOptions(t, bucket, lease)
+	config := *options.S3
+
+	first, err := Init("", options)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, err := first.CreateFile(model.RootID, []byte("seed"), []byte("seed"), 0o644, 0, 0, nil); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	seedGeneration := first.Generation()
+	seedHead := first.Head()
+	if err := first.Close(); err != nil {
+		t.Fatalf("close seed writer: %v", err)
+	}
+
+	work := t.TempDir()
+	ready := filepath.Join(work, "after-fence.ready.json")
+	statusPath := filepath.Join(work, "after-fence.status.json")
+
+	command := exec.Command(os.Args[0], "-test.run=^TestS3FenceChildAfterFence$", "-test.v", "-test.timeout=300s")
+	command.Env = append(os.Environ(),
+		"WEFT_FENCE_CHILD=after-fence",
+		"WEFT_FENCE_PAUSE_AFTER_FENCE=1",
+		"WEFT_FENCE_AFTER_FENCE_READY="+ready,
+		"WEFT_FENCE_STATUS="+statusPath,
+		"WEFT_FENCE_BUCKET="+bucket,
+		"WEFT_FENCE_ENDPOINT="+config.Endpoint,
+		"WEFT_FENCE_ACCESS_KEY="+config.AccessKey,
+		"WEFT_FENCE_SECRET_KEY="+config.SecretKey,
+		"WEFT_FENCE_REGION="+config.Region,
+		"WEFT_FENCE_LEASE_SECS="+strconv.Itoa(int(lease/time.Second)),
+	)
+	var childLog bytes.Buffer
+	command.Stdout = &childLog
+	command.Stderr = &childLog
+	if err := command.Start(); err != nil {
+		t.Fatalf("spawn the after-fence writer: %v", err)
+	}
+	childDone := false
+	defer func() {
+		if !childDone {
+			_ = command.Process.Kill()
+			_, _ = command.Process.Wait()
+		}
+	}()
+
+	var readyValue struct {
+		PID        int    `json:"pid"`
+		Generation uint64 `json:"generation"`
+		Head       string `json:"head"`
+	}
+	waitForJSONFile(t, ready, &readyValue, 120*time.Second)
+	if readyValue.Generation != seedGeneration {
+		t.Fatalf("child pre-publication generation = %d, want %d", readyValue.Generation, seedGeneration)
+	}
+	if readyValue.Head != seedHead.Hex() {
+		t.Fatalf("child pre-publication head = %s, want %s", readyValue.Head, seedHead.Hex())
+	}
+	// The record proves the fence wrote successfully. The child raised SIGSTOP
+	// after writing the ready file.
+	fenced, err := newS3Control(mustClient(t, options)).ReadLockRecord()
+	if err != nil || fenced == nil {
+		t.Fatalf("read LOCK after the fence: %+v err=%v", fenced, err)
+	}
+	if fenced.pendingGeneration != seedGeneration {
+		t.Fatalf("the fence record must attest the published head: %+v", fenced)
+	}
+	childFence := fenced.fence
+
+	// Let the lease expire, then take over without publishing a head.
+	time.Sleep(lease + 500*time.Millisecond)
+	second, err := OpenWithOptions("", ReadWrite, options)
+	if err != nil {
+		t.Fatalf("takeover open: %v", err)
+	}
+	if second.Generation() != seedGeneration {
+		t.Fatalf("the takeover itself moved the head: %d -> %d", seedGeneration, second.Generation())
+	}
+	reclaimed, err := newS3Control(mustClient(t, options)).ReadLockRecord()
+	if err != nil || reclaimed == nil {
+		t.Fatalf("read LOCK after takeover: %+v err=%v", reclaimed, err)
+	}
+	if reclaimed.fence != childFence+1 {
+		t.Fatalf("takeover fence = %d, want %d", reclaimed.fence, childFence+1)
+	}
+
+	// Resume the suspended writer: its publication must fail Busy.
+	if err := syscall.Kill(readyValue.PID, syscall.SIGCONT); err != nil {
+		t.Fatalf("SIGCONT: %v", err)
+	}
+	var status struct {
+		OK         bool   `json:"ok"`
+		Phase      string `json:"phase"`
+		Class      string `json:"class"`
+		Message    string `json:"message"`
+		Generation uint64 `json:"generation"`
+		Head       string `json:"head"`
+	}
+	waitForJSONFile(t, statusPath, &status, 120*time.Second)
+	_ = command.Wait()
+	childDone = true
+	if status.OK {
+		t.Fatalf("the after-fence writer published after being fenced; child log:\n%s", childLog.String())
+	}
+	if status.Class != "Busy" {
+		t.Fatalf("stale publication class = %q, want Busy (message %q)", status.Class, status.Message)
+	}
+	if status.Generation != seedGeneration || status.Head != seedHead.Hex() {
+		t.Fatalf("the fenced writer moved its own view: generation %d head %s", status.Generation, status.Head)
+	}
+	if !strings.Contains(status.Message, "LOCK now names") && !strings.Contains(status.Message, "taken over") {
+		t.Fatalf("the refusal must name the takeover: %q", status.Message)
+	}
+	if second.Head() != seedHead || second.Generation() != seedGeneration {
+		t.Fatalf("the head moved while the writers interleaved")
+	}
+	if _, err := second.ResolvePath("/fenced"); err == nil {
+		t.Fatal("the fenced writer's file became visible")
+	}
+
+	// The successor publishes and succeeds.
+	if _, err := second.CreateFile(model.RootID, []byte("successor"), []byte("successor"), 0o644, 0, 0, nil); err != nil {
+		t.Fatalf("successor publish: %v", err)
+	}
+	if second.Generation() != seedGeneration+1 {
+		t.Fatalf("successor generation = %d, want %d", second.Generation(), seedGeneration+1)
+	}
+	report, err := second.Verify(true)
+	if err != nil || !report.OK {
+		t.Fatalf("verify after the interleaving: %v %+v", err, report.Problems)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("close successor: %v", err)
+	}
+}
+
+// TestS3FenceChildAfterFence is the child half. It returns immediately unless
+// WEFT_FENCE_CHILD is set.
+func TestS3FenceChildAfterFence(t *testing.T) {
+	if os.Getenv("WEFT_FENCE_CHILD") != "after-fence" {
+		return
+	}
+	leaseSecs := 2
+	if text := os.Getenv("WEFT_FENCE_LEASE_SECS"); text != "" {
+		if parsed, err := strconv.Atoi(text); err == nil && parsed > 0 {
+			leaseSecs = parsed
+		}
+	}
+	config := S3Config{
+		Endpoint:       os.Getenv("WEFT_FENCE_ENDPOINT"),
+		Bucket:         os.Getenv("WEFT_FENCE_BUCKET"),
+		Region:         os.Getenv("WEFT_FENCE_REGION"),
+		AccessKey:      os.Getenv("WEFT_FENCE_ACCESS_KEY"),
+		SecretKey:      os.Getenv("WEFT_FENCE_SECRET_KEY"),
+		PathStyle:      true,
+		LockLease:      time.Duration(leaseSecs) * time.Second,
+		RequestTimeout: 30 * time.Second,
+	}
+	if config.Region == "" {
+		config.Region = "us-east-1"
+	}
+	options := DefaultOptions()
+	options.BlobBackend = PlaneS3
+	options.CommitBackend = PlaneS3
+	options.S3 = &config
+	options.GCGraceSecs = 0
+	writer, err := OpenWithOptions("", ReadWrite, options)
+	if err != nil {
+		writeFenceStatus(t, map[string]any{"ok": false, "phase": "open", "class": string(werr.ClassOf(err)), "message": err.Error(), "generation": 0, "head": ""})
+		return
+	}
+	generation := writer.Generation()
+	head := writer.Head()
+	_, writeErr := writer.CreateFile(model.RootID, []byte("fenced"), []byte("must-not-publish"), 0o644, 0, 0, nil)
+	status := map[string]any{
+		"generation": writer.Generation(),
+		"head":       writer.Head().Hex(),
+	}
+	if writeErr != nil {
+		status["ok"] = false
+		status["phase"] = "publish"
+		status["class"] = string(werr.ClassOf(writeErr))
+		status["message"] = writeErr.Error()
+	} else {
+		status["ok"] = true
+		status["phase"] = "published"
+		status["class"] = ""
+		status["message"] = fmt.Sprintf("published from generation %d head %s", generation, head.Hex())
+	}
+	writeFenceStatus(t, status)
+	_ = writer.Close()
+}
+
+func writeFenceStatus(t *testing.T, value map[string]any) {
+	t.Helper()
+	path := os.Getenv("WEFT_FENCE_STATUS")
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode status: %v", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatalf("write status: %v", err)
+	}
+}
+
+func waitForJSONFile(t *testing.T, path string, out any, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			if jsonErr := json.Unmarshal(data, out); jsonErr == nil {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", path)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

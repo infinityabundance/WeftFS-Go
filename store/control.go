@@ -54,6 +54,18 @@ type ControlVolume interface {
 
 	AcquireWriterLock() error
 	VerifyWriteLease() error
+	// CheckLeaseDeadline is a local own-deadline check with no network write.
+	CheckLeaseDeadline() error
+	// PublishFencedHead publishes a head through the writer lock record in one
+	// conditional write (fence + head). Returns true when the plane did it; a
+	// POSIX plane returns false and the store writes the superblock slot.
+	PublishFencedHead(generation uint64, commit model.Hash32, commitLen uint64) (bool, error)
+	// AttestedHead returns the head the writer lock record names, when the plane
+	// uses its lock record as the publication point.
+	AttestedHead() (uint64, model.Hash32, uint64, bool, error)
+	// RefreshHeadCache keeps the superblock cache current after a fenced head
+	// publication. It never moves the cache backwards.
+	RefreshHeadCache(generation uint64, commit model.Hash32, commitLen uint64, timestampNS int64) error
 	ReleaseWriterLock() error
 
 	probe() (CommitProbe, error)
@@ -280,6 +292,21 @@ func (c *localControl) AcquireWriterLock() error {
 }
 
 func (c *localControl) VerifyWriteLease() error { return nil }
+
+// A POSIX plane has no lease record: the exclusive flock is the ownership proof,
+// a suspended process keeps it, and nothing can reclaim it. The store writes the
+// superblock slot as the publication point.
+func (c *localControl) CheckLeaseDeadline() error { return nil }
+
+func (c *localControl) PublishFencedHead(uint64, model.Hash32, uint64) (bool, error) {
+	return false, nil
+}
+
+func (c *localControl) AttestedHead() (uint64, model.Hash32, uint64, bool, error) {
+	return 0, model.ZeroHash, 0, false, nil
+}
+
+func (c *localControl) RefreshHeadCache(uint64, model.Hash32, uint64, int64) error { return nil }
 
 func (c *localControl) ReleaseWriterLock() error {
 	if c.lock == nil {

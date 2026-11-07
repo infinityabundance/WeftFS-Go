@@ -169,6 +169,12 @@ func readStateManifest(src blobSource, manifestID model.Hash32) (*model.State, e
 	return model.DecodeState(value)
 }
 
+// headAttester is implemented by a commit plane whose writer lock record is
+// the head's publication point.
+type headAttester interface {
+	AttestedHead() (uint64, model.Hash32, uint64, bool, error)
+}
+
 // commitSource is the read side of a control plane: the superblock and the
 // commit records. Both the local filesystem and S3 implement it, so recovery
 // never depends on a local path when the plane is remote.
@@ -407,14 +413,49 @@ func recoverWithStrategy(ctl commitSource, src blobSource, strategy replayStrate
 			validSlots = append(validSlots, view.Slots[index])
 		}
 	}
-	if len(validSlots) == 0 {
-		return nil, werr.Newf(werr.Corrupt, "no valid superblock slot")
-	}
 	sort.Slice(validSlots, func(i, j int) bool { return validSlots[i].Generation < validSlots[j].Generation })
-	maxVisible := validSlots[len(validSlots)-1].Generation
+	maxVisible := uint64(0)
+	if len(validSlots) > 0 {
+		maxVisible = validSlots[len(validSlots)-1].Generation
+	}
 	slotByGen := make(map[uint64]SuperblockSlot, len(validSlots))
 	for _, slot := range validSlots {
 		slotByGen[slot.Generation] = slot
+	}
+
+	// An object-store commit plane publishes the head by writing its LOCK record
+	// and then writes the two-slot superblock as a cache. The record is the
+	// authority: a head ahead of the cache was published before a crash. A cache
+	// ahead of the record means a pre-v3 writer published after the upgrade;
+	// refusing is the only honest answer.
+	if attester, ok := ctl.(headAttester); ok {
+		generation, commit, commitLen, attested, err := attester.AttestedHead()
+		if err != nil {
+			return nil, err
+		}
+		if attested && generation != 0 {
+			if existing, ok := slotByGen[generation]; ok && existing.Commit != commit {
+				return nil, werr.Newf(werr.Corrupt,
+					"the writer lock record attests generation %d commit %s but the superblock slot names %s",
+					generation, commit.Hex(), existing.Commit.Hex())
+			}
+			switch {
+			case generation > maxVisible:
+				notes = append(notes, "recovered head generation "+itoa(generation)+
+					" from the writer lock record; the superblock cache named generation "+itoa(maxVisible))
+				maxVisible = generation
+				attestedSlot := SuperblockSlot{Generation: generation, Commit: commit, CommitLen: commitLen}
+				slotByGen[generation] = attestedSlot
+				validSlots = append(validSlots, attestedSlot)
+			case generation < maxVisible:
+				return nil, werr.Newf(werr.Unsupported,
+					"the superblock cache names generation %d but the writer lock record attests generation %d; this store was written by a pre-v3 writer after the lock record was upgraded",
+					maxVisible, generation)
+			}
+		}
+	}
+	if maxVisible == 0 {
+		return nil, werr.Newf(werr.Corrupt, "no valid superblock slot")
 	}
 
 	if allowDirectoryFree && strategy == replayBounded {
@@ -475,7 +516,7 @@ func recoverWithStrategy(ctl commitSource, src blobSource, strategy replayStrate
 				rejected = append(rejected, generation)
 				continue
 			}
-			if slot.CommitLen != loaded.WCBLength {
+			if slot.CommitLen != 0 && slot.CommitLen != loaded.WCBLength {
 				notes = append(notes, "generation "+itoa(generation)+" rejected: superblock length "+itoa(slot.CommitLen)+" does not match commit length "+itoa(loaded.WCBLength))
 				rejected = append(rejected, generation)
 				continue
@@ -533,7 +574,7 @@ func recoverDirectoryFree(ctl commitSource, src blobSource, view SuperblockView,
 		if slot.Commit != loaded.Hash {
 			return nil, werr.Newf(werr.Corrupt, "superblock hash for generation %d does not match the commit record", maxVisible)
 		}
-		if slot.CommitLen != loaded.WCBLength {
+		if slot.CommitLen != 0 && slot.CommitLen != loaded.WCBLength {
 			return nil, werr.Newf(werr.Corrupt, "superblock length for generation %d does not match the commit record", maxVisible)
 		}
 	}

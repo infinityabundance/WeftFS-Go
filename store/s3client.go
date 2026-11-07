@@ -50,6 +50,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/infinityabundance/WeftCodec-Go/hash"
+	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
 
@@ -61,9 +63,11 @@ const (
 	// and empty PUTs exactly like the Rust client.
 	s3EmptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-	s3LockSchema     = "weftfs-s3-lock v2"
-	s3LockSchemaV1   = "weftfs-s3-lock v1"
-	s3ReleasedSchema = "weftfs-s3-lock-released v1"
+	s3LockSchema       = "weftfs-s3-lock v3"
+	s3LockSchemaV2     = "weftfs-s3-lock v2"
+	s3LockSchemaV1     = "weftfs-s3-lock v1"
+	s3ReleasedSchema   = "weftfs-s3-lock-released v2"
+	s3ReleasedSchemaV1 = "weftfs-s3-lock-released v1"
 )
 
 // S3Config is the endpoint, bucket, and credentials of one S3-compatible store.
@@ -325,6 +329,11 @@ type s3LockLease struct {
 	deadlineNS int64
 	renewedNS  int64
 	etag       string
+	// The head this handle last published. Every LOCK rewrite carries it
+	// forward so a crash never loses the attestation.
+	headGeneration uint64
+	headCommit     string
+	headCommitLen  uint64
 }
 
 func newS3Client(config S3Config) (*s3Client, error) {
@@ -874,6 +883,7 @@ func xmlEscape(value string) string {
 
 // publishedLock is a parsed LOCK object.
 type publishedLock struct {
+	schemaVersion     uint8
 	owner             string
 	fence             uint64
 	sequence          uint64
@@ -881,6 +891,7 @@ type publishedLock struct {
 	renewedNS         int64
 	pendingGeneration uint64
 	pendingCommit     string
+	pendingCommitLen  uint64
 	released          bool
 	releasedFrom      string
 }
@@ -890,21 +901,43 @@ func (l publishedLock) isLive(nowNS int64) bool {
 	return !l.released && nowNS <= l.deadlineNS
 }
 
-func encodeS3Lock(owner string, fence, sequence uint64, deadlineNS, renewedNS int64, pendingGeneration uint64, pendingCommit string) string {
+// attestedHead returns the head the record names, when it names a complete one.
+func (l publishedLock) attestedHead() (uint64, model.Hash32, bool) {
+	if l.pendingGeneration == 0 || l.pendingCommit == "" || l.pendingCommit == "-" {
+		return 0, model.Hash32{}, false
+	}
+	commit, err := hash.FromHex(l.pendingCommit)
+	if err != nil {
+		return 0, model.Hash32{}, false
+	}
+	return l.pendingGeneration, commit, true
+}
+
+func encodeS3Lock(owner string, fence, sequence uint64, deadlineNS, renewedNS int64, pendingGeneration uint64, pendingCommit string, pendingCommitLen uint64) string {
 	if pendingCommit == "" {
 		pendingCommit = "-"
 	}
-	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nlease_deadline_ns=%d\nrenewed_ns=%d\npending_generation=%d\npending_commit=%s\n",
-		s3LockSchema, owner, fence, sequence, deadlineNS, renewedNS, pendingGeneration, pendingCommit)
+	if pendingGeneration == 0 {
+		pendingCommitLen = 0
+	}
+	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nlease_deadline_ns=%d\nrenewed_ns=%d\npending_generation=%d\npending_commit=%s\npending_commit_len=%d\n",
+		s3LockSchema, owner, fence, sequence, deadlineNS, renewedNS, pendingGeneration, pendingCommit, pendingCommitLen)
 }
 
-func encodeS3Released(owner string, fence, sequence uint64, releasedNS int64, releasedFrom string) string {
-	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nreleased_ns=%d\nreleased_from=%s\n",
-		s3ReleasedSchema, owner, fence, sequence, releasedNS, releasedFrom)
+func encodeS3Released(owner string, fence, sequence uint64, releasedNS int64, releasedFrom string, pendingGeneration uint64, pendingCommit string, pendingCommitLen uint64) string {
+	if pendingCommit == "" {
+		pendingCommit = "-"
+	}
+	if pendingGeneration == 0 {
+		pendingCommitLen = 0
+	}
+	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nreleased_ns=%d\nreleased_from=%s\npending_generation=%d\npending_commit=%s\npending_commit_len=%d\n",
+		s3ReleasedSchema, owner, fence, sequence, releasedNS, releasedFrom, pendingGeneration, pendingCommit, pendingCommitLen)
 }
 
-// parseS3Lock accepts the fenced v2 record, the legacy v1 record (fence 0), and
-// the released tombstone. It is a direct port of Rust `writer_fence::parse_lock`.
+// parseS3Lock accepts the v3 publication record, the fenced v2 record, the
+// legacy v1 record (fence 0), and both released tombstones. It is a direct port
+// of Rust `writer_fence::parse_lock`.
 func parseS3Lock(bytes []byte) (publishedLock, bool) {
 	var out publishedLock
 	text := string(bytes)
@@ -972,12 +1005,52 @@ func parseS3Lock(bytes []byte) (publishedLock, bool) {
 		if !ok {
 			return out, false
 		}
+		pendingLen, ok := unsigned("pending_commit_len")
+		if !ok {
+			return out, false
+		}
 		commit, ok := fields["pending_commit"]
 		if !ok {
 			commit = "-"
 		}
 		return publishedLock{
-			owner: owner, fence: fence, sequence: sequence, deadlineNS: deadline,
+			schemaVersion: 3,
+			owner:         owner, fence: fence, sequence: sequence, deadlineNS: deadline,
+			renewedNS: renewed, pendingGeneration: pending, pendingCommit: commit,
+			pendingCommitLen: pendingLen,
+		}, true
+	case s3LockSchemaV2:
+		owner, ok := fields["owner"]
+		if !ok {
+			return out, false
+		}
+		fence, ok := unsigned("fence")
+		if !ok {
+			return out, false
+		}
+		sequence, ok := unsigned("sequence")
+		if !ok {
+			return out, false
+		}
+		deadline, ok := number("lease_deadline_ns")
+		if !ok {
+			return out, false
+		}
+		renewed, ok := number("renewed_ns")
+		if !ok {
+			return out, false
+		}
+		pending, ok := unsigned("pending_generation")
+		if !ok {
+			return out, false
+		}
+		commit, ok := fields["pending_commit"]
+		if !ok {
+			commit = "-"
+		}
+		return publishedLock{
+			schemaVersion: 2,
+			owner:         owner, fence: fence, sequence: sequence, deadlineNS: deadline,
 			renewedNS: renewed, pendingGeneration: pending, pendingCommit: commit,
 		}, true
 	case s3LockSchemaV1:
@@ -989,7 +1062,7 @@ func parseS3Lock(bytes []byte) (publishedLock, bool) {
 		if !ok {
 			return out, false
 		}
-		return publishedLock{owner: owner, deadlineNS: deadline, pendingCommit: "-"}, true
+		return publishedLock{schemaVersion: 1, owner: owner, deadlineNS: deadline, pendingCommit: "-"}, true
 	case s3ReleasedSchema:
 		owner, ok := fields["owner"]
 		if !ok {
@@ -1007,8 +1080,45 @@ func parseS3Lock(bytes []byte) (publishedLock, bool) {
 		if !ok {
 			return out, false
 		}
+		pending, ok := unsigned("pending_generation")
+		if !ok {
+			return out, false
+		}
+		pendingLen, ok := unsigned("pending_commit_len")
+		if !ok {
+			return out, false
+		}
+		commit, ok := fields["pending_commit"]
+		if !ok {
+			commit = "-"
+		}
 		return publishedLock{
-			owner: owner, fence: fence, sequence: sequence, deadlineNS: released,
+			schemaVersion: 3,
+			owner:         owner, fence: fence, sequence: sequence, deadlineNS: released,
+			renewedNS: released, pendingGeneration: pending, pendingCommit: commit,
+			pendingCommitLen: pendingLen, released: true,
+			releasedFrom: fields["released_from"],
+		}, true
+	case s3ReleasedSchemaV1:
+		owner, ok := fields["owner"]
+		if !ok {
+			return out, false
+		}
+		fence, ok := unsigned("fence")
+		if !ok {
+			return out, false
+		}
+		sequence, ok := unsigned("sequence")
+		if !ok {
+			return out, false
+		}
+		released, ok := number("released_ns")
+		if !ok {
+			return out, false
+		}
+		return publishedLock{
+			schemaVersion: 2,
+			owner:         owner, fence: fence, sequence: sequence, deadlineNS: released,
 			renewedNS: released, pendingCommit: "-", released: true,
 			releasedFrom: fields["released_from"],
 		}, true

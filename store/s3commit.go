@@ -219,7 +219,7 @@ func (c *s3Control) PublishSuperblockSlot(slot SuperblockSlot, index int) error 
 		updated := append([]byte(nil), current.Body...)
 		offset := index * model.SlotBytes
 		copy(updated[offset:offset+model.SlotBytes], slot.Encode())
-		if err := c.fenceLock(slot.Generation, slot.Commit); err != nil {
+		if err := c.fenceLock(slot.Generation, slot.Commit, slot.CommitLen); err != nil {
 			return err
 		}
 		etag := current.ETag
@@ -231,6 +231,92 @@ func (c *s3Control) PublishSuperblockSlot(slot SuperblockSlot, index int) error 
 		c.client.note("conditional superblock update lost a race; retrying from a fresh read")
 	}
 	return werr.Newf(werr.Busy, "superblock conditional update kept losing to another writer")
+}
+
+// PublishFencedHead publishes a head through the LOCK record in one
+// conditional write that carries both the fence and the head. It is the
+// publication point for an object-store commit plane; the superblock is only a
+// cache afterwards.
+func (c *s3Control) PublishFencedHead(generation uint64, commit model.Hash32, commitLen uint64) (bool, error) {
+	if err := c.fenceLock(generation, commit, commitLen); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// AttestedHead returns the head the published LOCK record names.
+func (c *s3Control) AttestedHead() (uint64, model.Hash32, uint64, bool, error) {
+	response, err := c.client.get("LOCK", 0, 0)
+	if err != nil {
+		return 0, model.Hash32{}, 0, false, err
+	}
+	if response.Status == http.StatusNotFound {
+		return 0, model.Hash32{}, 0, false, nil
+	}
+	if response.Status != http.StatusOK {
+		return 0, model.Hash32{}, 0, false,
+			werr.Newf(werr.Io, "S3 LOCK read returned HTTP %d", response.Status)
+	}
+	record, ok := parseS3Lock(response.Body)
+	if !ok {
+		return 0, model.Hash32{}, 0, false, nil
+	}
+	generation, commit, ok := record.attestedHead()
+	if !ok {
+		return 0, model.Hash32{}, 0, false, nil
+	}
+	return generation, commit, record.pendingCommitLen, true, nil
+}
+
+// RefreshHeadCache keeps the two-slot superblock cache current after a
+// lock-record publication. It never moves the cache backwards, and a lost race
+// is retried from a fresh read. A failure is a diagnostic, never a publication
+// failure (the LOCK write is the publication).
+func (c *s3Control) RefreshHeadCache(generation uint64, commit model.Hash32, commitLen uint64, timestampNS int64) error {
+	if commitLen == 0 {
+		c.client.note("superblock cache not refreshed: the lock record does not attest the commit length")
+		return nil
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		current, err := c.client.get(s3SuperblockKey, 0, 0)
+		if err != nil {
+			return err
+		}
+		if current.Status != http.StatusOK {
+			return werr.Newf(werr.Io, "S3 cache read superblock returned HTTP %d", current.Status)
+		}
+		if len(current.Body) != model.SuperblockBytes {
+			return werr.Newf(werr.Corrupt, "superblock is %d bytes, expected %d", len(current.Body), model.SuperblockBytes)
+		}
+		view, err := decodeSuperblockView(current.Body)
+		if err != nil {
+			return err
+		}
+		highest := uint64(0)
+		for index := 0; index < 2; index++ {
+			if view.Valid[index] && view.Slots[index].Generation > highest {
+				highest = view.Slots[index].Generation
+			}
+		}
+		if highest >= generation {
+			return nil
+		}
+		if current.ETag == "" {
+			return werr.Newf(werr.Unsupported, "S3 endpoint did not return an ETag for a cache update")
+		}
+		updated := append([]byte(nil), current.Body...)
+		g := SuperblockSlot{Generation: generation, Commit: commit, CommitLen: commitLen, TimestampNS: timestampNS}
+		offset := int(generation%2) * model.SlotBytes
+		copy(updated[offset:offset+model.SlotBytes], g.Encode())
+		etag := current.ETag
+		if _, ok, err := c.client.putConditional(s3SuperblockKey, updated, &etag, true); err != nil {
+			return err
+		} else if ok {
+			return nil
+		}
+		c.client.note("conditional superblock cache update lost a race; retrying from a fresh read")
+	}
+	return werr.Newf(werr.Busy, "superblock cache update kept losing to another writer")
 }
 
 func (c *s3Control) commitKey(generation uint64) string {
@@ -479,7 +565,8 @@ func (c *s3Control) AcquireWriterLock() error {
 		}
 		switch existing.Status {
 		case http.StatusNotFound:
-			body := encodeS3Lock(owner, 1, 1, deadline, now, 0, "")
+			headGen, headCommit, headLen, headOK := c.superblockHead()
+			body := encodeS3LockHead(owner, 1, 1, deadline, now, headGen, headCommit, headLen, headOK)
 			etag, ok, err := c.client.putConditional("LOCK", []byte(body), nil, true)
 			if err != nil {
 				return err
@@ -487,7 +574,10 @@ func (c *s3Control) AcquireWriterLock() error {
 			if !ok {
 				continue
 			}
-			c.installLease(&s3LockLease{owner: owner, fence: 1, sequence: 1, deadlineNS: deadline, renewedNS: now, etag: etag})
+			c.installLease(&s3LockLease{
+				owner: owner, fence: 1, sequence: 1, deadlineNS: deadline, renewedNS: now,
+				etag: etag, headGeneration: headGen, headCommit: headCommit, headCommitLen: headLen,
+			})
 			return nil
 		case http.StatusOK:
 			observed, ok := parseS3Lock(existing.Body)
@@ -505,7 +595,15 @@ func (c *s3Control) AcquireWriterLock() error {
 				return werr.Newf(werr.LimitExceeded, "S3 fencing token would overflow u64")
 			}
 			fence := observed.fence + 1
-			body := encodeS3Lock(owner, fence, 1, deadline, now, 0, "")
+			// Carry the head the old record names forward. A v1/v2 tombstone has
+			// no head, so fall back to the superblock cache. The same conditional
+			// write upgrades an expired v2/v1 record to v3.
+			headGen, headCommit, headLen := observed.pendingGeneration, observed.pendingCommit, observed.pendingCommitLen
+			headOK := headGen != 0 && headCommit != "" && headCommit != "-"
+			if !headOK {
+				headGen, headCommit, headLen, headOK = c.superblockHead()
+			}
+			body := encodeS3LockHead(owner, fence, 1, deadline, now, headGen, headCommit, headLen, headOK)
 			if existing.ETag == "" {
 				return werr.Newf(werr.Unsupported,
 					"S3-compatible endpoint did not return an ETag for the writer lock; refusing a writable store because a fenced reclaim cannot be proven")
@@ -524,7 +622,13 @@ func (c *s3Control) AcquireWriterLock() error {
 			}
 			c.client.note(verb + " S3 writer lock: fence " + strconv.FormatUint(observed.fence, 10) +
 				" -> " + strconv.FormatUint(fence, 10))
-			c.installLease(&s3LockLease{owner: owner, fence: fence, sequence: 1, deadlineNS: deadline, renewedNS: now, etag: newETag})
+			if observed.schemaVersion < 3 {
+				c.client.note("upgraded the S3 writer lock record to v3 (single conditional write; the head it attests is carried forward)")
+			}
+			c.installLease(&s3LockLease{
+				owner: owner, fence: fence, sequence: 1, deadlineNS: deadline, renewedNS: now,
+				etag: newETag, headGeneration: headGen, headCommit: headCommit, headCommitLen: headLen,
+			})
 			return nil
 		case http.StatusForbidden:
 			return werr.Newf(werr.Unauthorized, "S3 denied GET s3://%s/LOCK", c.client.config.Bucket)
@@ -536,11 +640,36 @@ func (c *s3Control) AcquireWriterLock() error {
 }
 
 // VerifyWriteLease proves this handle may publish right now, renewing when one
-// publication budget remains.
-func (c *s3Control) VerifyWriteLease() error { return c.fenceLock(0, model.ZeroHash) }
+// publication budget remains. The conditional write carries forward the head
+// this handle last published, so a pre-publication fence never erases the
+// record's attestation.
+func (c *s3Control) VerifyWriteLease() error { return c.fenceLock(0, model.ZeroHash, 0) }
+
+// CheckLeaseDeadline is a local own-deadline check: no network write and no
+// renewal. It refuses before a commit record is written, so a writer suspended
+// past its own deadline leaves no unpublished commit tail.
+func (c *s3Control) CheckLeaseDeadline() error {
+	c.client.lockMu.Lock()
+	lease := c.client.lease
+	c.client.lockMu.Unlock()
+	if lease == nil {
+		return werr.Newf(werr.Busy, "S3 writer holds no lease; refusing to publish without a fenced lease")
+	}
+	now := nowNS()
+	if now >= lease.deadlineNS {
+		expired := (now - lease.deadlineNS) / 1_000_000
+		observed := c.readLockRecordNoFail()
+		return werr.Newf(werr.Busy,
+			"S3 writer lease deadline passed %d ms ago (owner %s fence %d); publication refused before the head was touched%s",
+			expired, lease.owner, lease.fence, describeObserved(observed, lease.owner, lease.fence))
+	}
+	return nil
+}
 
 // fenceLock is the conditional rewrite of LOCK that gates every publication.
-func (c *s3Control) fenceLock(pendingGeneration uint64, pendingCommit model.Hash32) error {
+// With `pendingGeneration != 0` it is also the publication point: the same
+// `If-Match` write carries the fence and the new head.
+func (c *s3Control) fenceLock(pendingGeneration uint64, pendingCommit model.Hash32, pendingCommitLen uint64) error {
 	c.client.lockMu.Lock()
 	defer c.client.lockMu.Unlock()
 	lease := c.client.lease
@@ -561,11 +690,13 @@ func (c *s3Control) fenceLock(pendingGeneration uint64, pendingCommit model.Hash
 		deadline = now + c.leaseNS()
 	}
 	sequence := lease.sequence + 1
-	pendingText := ""
+	// The head this record will attest: the new one when publishing, or the one
+	// already published when this is only a pre-publication fence.
+	headGeneration, headCommit, headCommitLen := lease.headGeneration, lease.headCommit, lease.headCommitLen
 	if pendingGeneration != 0 {
-		pendingText = pendingCommit.Hex()
+		headGeneration, headCommit, headCommitLen = pendingGeneration, pendingCommit.Hex(), pendingCommitLen
 	}
-	body := encodeS3Lock(lease.owner, lease.fence, sequence, deadline, now, pendingGeneration, pendingText)
+	body := encodeS3Lock(lease.owner, lease.fence, sequence, deadline, now, headGeneration, headCommit, headCommitLen)
 	etag := lease.etag
 	newETag, ok, err := c.client.putConditional("LOCK", []byte(body), &etag, true)
 	if err != nil {
@@ -581,7 +712,45 @@ func (c *s3Control) fenceLock(pendingGeneration uint64, pendingCommit model.Hash
 	lease.deadlineNS = deadline
 	lease.renewedNS = now
 	lease.etag = newETag
+	lease.headGeneration = headGeneration
+	lease.headCommit = headCommit
+	lease.headCommitLen = headCommitLen
 	return nil
+}
+
+// superblockHead reads the head the two-slot cache attests. Used only to carry
+// a head forward when the LOCK record does not name one.
+func (c *s3Control) superblockHead() (uint64, string, uint64, bool) {
+	response, err := c.client.get(s3SuperblockKey, 0, 0)
+	if err != nil || response.Status != http.StatusOK {
+		return 0, "", 0, false
+	}
+	view, err := decodeSuperblockView(response.Body)
+	if err != nil {
+		return 0, "", 0, false
+	}
+	var best SuperblockSlot
+	found := false
+	for index := 0; index < 2; index++ {
+		if !view.Valid[index] || view.Slots[index].Generation == 0 {
+			continue
+		}
+		if !found || view.Slots[index].Generation > best.Generation {
+			best = view.Slots[index]
+			found = true
+		}
+	}
+	if !found {
+		return 0, "", 0, false
+	}
+	return best.Generation, best.Commit.Hex(), best.CommitLen, true
+}
+
+func encodeS3LockHead(owner string, fence, sequence uint64, deadlineNS, renewedNS int64, generation uint64, commit string, commitLen uint64, ok bool) string {
+	if !ok {
+		return encodeS3Lock(owner, fence, sequence, deadlineNS, renewedNS, 0, "", 0)
+	}
+	return encodeS3Lock(owner, fence, sequence, deadlineNS, renewedNS, generation, commit, commitLen)
 }
 
 func (c *s3Control) readLockRecordNoFail() *publishedLock {
@@ -653,7 +822,13 @@ func (c *s3Control) ReleaseWriterLock() error {
 		c.client.note("refusing to release the S3 writer lock: no ETag to condition on")
 		return nil
 	}
-	tombstone := encodeS3Released(lease.owner, lease.fence, lease.sequence+1, nowNS(), sha256HexBytes(observed.Body))
+	// Carry the head forward so a crash between the publication and the
+	// superblock cache can still be recovered from the tombstone.
+	headGeneration, headCommit, headCommitLen := record.pendingGeneration, record.pendingCommit, record.pendingCommitLen
+	if headGeneration == 0 || headCommit == "-" {
+		headGeneration, headCommit, headCommitLen = lease.headGeneration, lease.headCommit, lease.headCommitLen
+	}
+	tombstone := encodeS3Released(lease.owner, lease.fence, lease.sequence+1, nowNS(), sha256HexBytes(observed.Body), headGeneration, headCommit, headCommitLen)
 	etag := observed.ETag
 	if _, ok, err := c.client.putConditional("LOCK", []byte(tombstone), &etag, true); err != nil {
 		c.client.note("conditional release of the S3 writer lock failed, nothing was deleted: " + err.Error())

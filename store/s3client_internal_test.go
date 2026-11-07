@@ -100,49 +100,75 @@ func TestIfMatchFormsEncodeETags(t *testing.T) {
 }
 
 func TestLockRecordRoundTripsLegacyAndTombstone(t *testing.T) {
-	release := encodeS3Lock("owner-a", 3, 9, 1000, 900, 12, strings.Repeat("ab", 32))
+	release := encodeS3Lock("owner-a", 3, 9, 1000, 900, 12, strings.Repeat("ab", 32), 4096)
 	record, ok := parseS3Lock([]byte(release))
 	if !ok {
-		t.Fatal("v2 record must parse")
+		t.Fatal("v3 record must parse")
 	}
-	if record.owner != "owner-a" || record.fence != 3 || record.sequence != 9 ||
+	if record.schemaVersion != 3 || record.owner != "owner-a" || record.fence != 3 || record.sequence != 9 ||
 		record.deadlineNS != 1000 || record.renewedNS != 900 ||
-		record.pendingGeneration != 12 || record.pendingCommit != strings.Repeat("ab", 32) {
-		t.Fatalf("v2 round trip mismatch: %+v", record)
+		record.pendingGeneration != 12 || record.pendingCommit != strings.Repeat("ab", 32) ||
+		record.pendingCommitLen != 4096 {
+		t.Fatalf("v3 round trip mismatch: %+v", record)
 	}
 	if record.released {
-		t.Fatal("v2 record must not be released")
+		t.Fatal("v3 record must not be released")
 	}
 	if !record.isLive(1000) || record.isLive(1001) {
 		t.Fatal("lease liveness must be inclusive at the deadline")
 	}
+	if generation, _, ok := record.attestedHead(); !ok || generation != 12 {
+		t.Fatalf("v3 record must attest its head: %+v", record)
+	}
 
-	idle := encodeS3Lock("owner-a", 3, 10, 1000, 950, 0, "")
+	idle := encodeS3Lock("owner-a", 3, 10, 1000, 950, 0, "", 0)
 	idleRecord, ok := parseS3Lock([]byte(idle))
-	if !ok || idleRecord.pendingGeneration != 0 || idleRecord.pendingCommit != "-" {
+	if !ok || idleRecord.pendingGeneration != 0 || idleRecord.pendingCommit != "-" || idleRecord.pendingCommitLen != 0 {
 		t.Fatalf("idle record: %+v ok=%t", idleRecord, ok)
+	}
+	if _, _, ok := idleRecord.attestedHead(); ok {
+		t.Fatal("an idle record must not attest a head")
+	}
+
+	// A v2 record is still readable and reports an unknown head length.
+	v2 := s3LockSchemaV2 + "\nowner=y\nfence=1\nsequence=1\nlease_deadline_ns=10\nrenewed_ns=9\npending_generation=4\npending_commit=" + strings.Repeat("cd", 32) + "\n"
+	v2Record, ok := parseS3Lock([]byte(v2))
+	if !ok || v2Record.schemaVersion != 2 || v2Record.pendingCommitLen != 0 {
+		t.Fatalf("v2 record: %+v ok=%t", v2Record, ok)
+	}
+	if generation, _, ok := v2Record.attestedHead(); !ok || generation != 4 {
+		t.Fatalf("v2 record must attest its head: %+v", v2Record)
 	}
 
 	legacy := s3LockSchemaV1 + "\nowner=x\nexpires_ns=42\n"
 	legacyRecord, ok := parseS3Lock([]byte(legacy))
-	if !ok || legacyRecord.fence != 0 || legacyRecord.deadlineNS != 42 || legacyRecord.sequence != 0 {
+	if !ok || legacyRecord.schemaVersion != 1 || legacyRecord.fence != 0 || legacyRecord.deadlineNS != 42 || legacyRecord.sequence != 0 {
 		t.Fatalf("legacy record: %+v ok=%t", legacyRecord, ok)
 	}
 
-	tombstone := encodeS3Released("owner-a", 4, 11, 5000, "deadbeef")
+	tombstone := encodeS3Released("owner-a", 4, 11, 5000, "deadbeef", 12, strings.Repeat("ab", 32), 4096)
 	released, ok := parseS3Lock([]byte(tombstone))
 	if !ok || !released.released || released.fence != 4 || released.sequence != 11 ||
-		released.releasedFrom != "deadbeef" {
+		released.releasedFrom != "deadbeef" || released.pendingGeneration != 12 ||
+		released.pendingCommitLen != 4096 {
 		t.Fatalf("tombstone: %+v ok=%t", released, ok)
 	}
 	if released.isLive(0) || released.isLive(1<<62) {
 		t.Fatal("a tombstone is never live")
 	}
 
+	legacyTombstone := s3ReleasedSchemaV1 + "\nowner=a\nfence=4\nsequence=11\nreleased_ns=5000\nreleased_from=deadbeef\n"
+	legacyReleased, ok := parseS3Lock([]byte(legacyTombstone))
+	if !ok || !legacyReleased.released || legacyReleased.pendingGeneration != 0 || legacyReleased.releasedFrom != "deadbeef" {
+		t.Fatalf("legacy tombstone: %+v ok=%t", legacyReleased, ok)
+	}
+
 	for _, bad := range []string{
 		"garbage",
 		s3LockSchema + "\nowner=x\n",
-		s3LockSchema + "\nowner=x\nfence=-1\nsequence=1\nlease_deadline_ns=1\nrenewed_ns=1\npending_generation=0\npending_commit=-\n",
+		s3LockSchemaV2 + "\nowner=x\nfence=-1\nsequence=1\nlease_deadline_ns=1\nrenewed_ns=1\npending_generation=0\npending_commit=-\n",
+		// v3 without the length field is not a v3 record.
+		s3LockSchema + "\nowner=x\nfence=1\nsequence=1\nlease_deadline_ns=1\nrenewed_ns=1\npending_generation=0\npending_commit=-\n",
 	} {
 		if _, ok := parseS3Lock([]byte(bad)); ok {
 			t.Fatalf("malformed record accepted: %q", bad)
@@ -151,8 +177,8 @@ func TestLockRecordRoundTripsLegacyAndTombstone(t *testing.T) {
 }
 
 func TestSchemasDoNotParseAcrossBackends(t *testing.T) {
-	body := encodeS3Lock("o", 1, 1, 1, 1, 0, "")
-	if _, ok := parseS3Lock([]byte("weftfs-gcs-lock v2\nowner=o\nfence=1\nsequence=1\nlease_deadline_ns=1\nrenewed_ns=1\npending_generation=0\npending_commit=-\n")); ok {
+	body := encodeS3Lock("o", 1, 1, 1, 1, 0, "", 0)
+	if _, ok := parseS3Lock([]byte("weftfs-gcs-lock v3\nowner=o\nfence=1\nsequence=1\nlease_deadline_ns=1\nrenewed_ns=1\npending_generation=0\npending_commit=-\npending_commit_len=0\n")); ok {
 		t.Fatal("a foreign schema must not parse; body=" + body)
 	}
 }

@@ -1482,6 +1482,15 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 	if err := s.commits.VerifyWriteLease(); err != nil {
 		return model.Hash32{}, err
 	}
+	// Court hook: suspend after the fence and before the publication. Inert
+	// unless the fencing court arms it.
+	fencePauseAfterFence(s.generation, s.head)
+	// Local deadline re-check: a writer suspended past its own lease refuses
+	// here, before it leaves an unpublished commit tail. The publication write
+	// below is still the authority.
+	if err := s.commits.CheckLeaseDeadline(); err != nil {
+		return model.Hash32{}, err
+	}
 	wcbBytes, err := commit.Encode()
 	if err != nil {
 		return model.Hash32{}, err
@@ -1499,7 +1508,18 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 		CommitLen: uint64(len(wcbBytes)), TimestampNS: commit.TimestampNS,
 	}
 	index := int(commit.Generation % 2)
-	if err := s.commits.PublishSuperblockSlot(slot, index); err != nil {
+	published, err := s.commits.PublishFencedHead(commit.Generation, hash, uint64(len(wcbBytes)))
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if published {
+		// The head is published. The two-slot superblock is now only a cache:
+		// refresh it if this writer still owns the lease and the cache is
+		// behind. A cache failure never turns a published head into a reported
+		// failure.
+		crashPoint("after_fenced_head")
+		_ = s.commits.RefreshHeadCache(commit.Generation, hash, uint64(len(wcbBytes)), commit.TimestampNS)
+	} else if err := s.commits.PublishSuperblockSlot(slot, index); err != nil {
 		return model.Hash32{}, err
 	}
 
