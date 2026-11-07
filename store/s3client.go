@@ -426,11 +426,7 @@ func (c *s3Client) urlPath(keyPath string) string {
 func (c *s3Client) do(method, keyPath string, query []s3Query, body []byte, extra []s3Header) (*s3Response, error) {
 	host := c.host()
 	path := c.urlPath(keyPath)
-	payloadHash := s3EmptySHA256
-	if len(body) > 0 {
-		sum := sha256.Sum256(body)
-		payloadHash = hex.EncodeToString(sum[:])
-	}
+	payloadHash := s3PayloadHash(body)
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
@@ -507,6 +503,18 @@ func (c *s3Client) describe(keyPath string) string {
 		return "bucket " + c.config.Bucket
 	}
 	return "s3://" + c.config.Bucket + "/" + keyPath
+}
+
+// s3PayloadHash is the `x-amz-content-sha256` value: the exact SHA-256 of the
+// body, or the standard empty-body digest. This client never signs
+// `UNSIGNED-PAYLOAD`, matching the Rust client; a body that hashed to anything
+// else would let the endpoint accept bytes the signature did not cover.
+func s3PayloadHash(body []byte) string {
+	if len(body) == 0 {
+		return s3EmptySHA256
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }
 
 // s3SignatureInput is everything SigV4 signs. Keeping it a pure value lets a

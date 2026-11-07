@@ -159,7 +159,7 @@ echo "go-s3-court: MinIO $minio_release sha256=$actual_sha256 endpoint=$endpoint
 echo "go-s3-court: focused S3 tests in the go court" >&2
 set +e
 "$weft_root/scripts/docker-court.sh" go \
-  "cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run 'TestS3|TestSigV4|TestCanonicalQuery|TestPathAndComponent|TestIfMatchForms|TestLockRecord|TestSchemasDoNot|TestS3Config' ./store/" \
+  "cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run 'TestS3|TestSigV4|TestPayloadHash|TestCanonicalQuery|TestPathAndComponent|TestIfMatchForms|TestLockRecord|TestSchemasDoNot|TestS3Config' ./store/" \
   >"$focused_log" 2>&1
 focused_status=$?
 set -e
@@ -212,7 +212,7 @@ fi
 focused_passed="$(grep -c -- '--- PASS' "$focused_log" || true)"
 focused_failed="$(grep -c -- '--- FAIL' "$focused_log" || true)"
 focused_skipped="$(grep -c -- '--- SKIP' "$focused_log" || true)"
-measured_form="$(grep -o 'measured If-Match form: [a-z-]*' "$focused_log" | head -1 || true)"
+measured_form="$(grep -o 'measured If-Match form: [a-z-]*' "$focused_log" | sed 's/measured If-Match form: //' | head -1 || true)"
 
 full_passed=0
 full_failed=0
@@ -277,5 +277,5 @@ cat > "$receipt" <<JSON
 JSON
 
 echo "go-s3-court: focused pass=$focused_passed fail=$focused_failed skip=$focused_skipped" >&2
-echo "go-s3-court: ${measured_form:-If-Match form not recorded}" >&2
+echo "go-s3-court: If-Match form ${measured_form:-not recorded}" >&2
 echo "go-s3-court: receipt $receipt" >&2

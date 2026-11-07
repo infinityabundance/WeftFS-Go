@@ -913,9 +913,12 @@ changed.
    component-encoded and sorted query). `host`, `x-amz-content-sha256`,
    `x-amz-date`, `x-amz-security-token`, and every extra header
    (`range`, `if-match`, `if-none-match`) are signed. Empty bodies hash to the
-   standard empty SHA-256. `TestSigV4MatchesThePublishedAWSVector` pins the
-   canonical request, string to sign, and signature against the AWS "GET
-   Object" example. Config resolution is `WEFT_S3_*` first, then `AWS_*`, with
+   standard empty SHA-256; a non-empty body is always hashed. The client never
+   signs `UNSIGNED-PAYLOAD`, matching the Rust client (which has no such mode),
+   so the endpoint can never accept bytes the signature did not cover.
+   `TestSigV4MatchesThePublishedAWSVector` pins the canonical request, string to
+   sign, and signature against the AWS "GET Object" example;
+   `TestPayloadHashNeverUsesUnsignedPayload` pins the body-digest rule. Config resolution is `WEFT_S3_*` first, then `AWS_*`, with
    explicit `--s3-endpoint/--s3-bucket/--s3-region/--s3-access-key/
    --s3-secret-key/--s3-session-token` winning. Path-style addressing is used
    for a custom endpoint (virtual-hosted is implemented by the signer too).

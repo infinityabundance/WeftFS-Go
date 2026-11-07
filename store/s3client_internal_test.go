@@ -40,6 +40,18 @@ func TestSigV4MatchesThePublishedAWSVector(t *testing.T) {
 	}
 }
 
+func TestPayloadHashNeverUsesUnsignedPayload(t *testing.T) {
+	if got := s3PayloadHash(nil); got != s3EmptySHA256 {
+		t.Fatalf("empty body hash: %s", got)
+	}
+	if got := s3PayloadHash([]byte("abc")); got != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+		t.Fatalf("body hash: %s", got)
+	}
+	if got := s3PayloadHash([]byte("abc")); got == "UNSIGNED-PAYLOAD" {
+		t.Fatal("the client must never sign UNSIGNED-PAYLOAD")
+	}
+}
+
 func TestCanonicalQueryEncodesAndSortsLikeAWS(t *testing.T) {
 	query := []s3Query{
 		{"prefix", "objects/ab/"},
