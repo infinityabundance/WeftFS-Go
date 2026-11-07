@@ -68,7 +68,60 @@ func TestFloatTiledWriteAndRead(t *testing.T) {
 	}
 }
 
-// TestFloatTiledPlannerOffersTheCandidate checks the explicit opt-in rule.
+// weightLikeBf16 mirrors the Rust test fixture byte for byte: a clustered
+// exponent byte and a random mantissa byte.
+func weightLikeBf16(elements int, seed uint64) []byte {
+	state := seed | 1
+	out := make([]byte, 0, elements*2)
+	for index := 0; index < elements; index++ {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		high := byte(0x3f)
+		if state%16 == 0 {
+			high = 0x40
+		}
+		out = append(out, byte(state>>8), high)
+	}
+	return out
+}
+
+// TestAccessPatternMatchesRustChoices runs the same fixture definition as the
+// Rust access-pattern test and asserts the same selected strategies.
+func TestAccessPatternMatchesRustChoices(t *testing.T) {
+	shape := []uint64{512, 512}
+	payload := weightLikeBf16(512*512, 0x1234)
+	dir := t.TempDir()
+	s, err := store.Init(dir, v2Options())
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer s.Close()
+
+	whole, err := s.PlanTensor("bf16", shape, payload, store.RowMajorTensorLayout(), nil,
+		store.TensorPlanOptions{TileShape: []uint64{16, 32}})
+	if err != nil {
+		t.Fatalf("whole plan: %v", err)
+	}
+	if whole.Chosen != store.TensorStrategyFloatTensor {
+		t.Fatalf("whole chosen = %s (candidates: %+v)", whole.Chosen, whole.Candidates)
+	}
+
+	region, err := s.PlanTensor("bf16", shape, payload, store.RowMajorTensorLayout(), nil,
+		store.TensorPlanOptions{
+			TileShape: []uint64{16, 32},
+			LambdaNS:  1,
+			AccessPattern: store.AccessPattern{
+				Kind: store.AccessPatternRegion, RegionBytes: 2 * 32, ReadsPerWrite: 1000,
+			},
+		})
+	if err != nil {
+		t.Fatalf("region plan: %v", err)
+	}
+	if region.Chosen != store.TensorStrategyFloatTiled {
+		t.Fatalf("region chosen = %s (candidates: %+v)", region.Chosen, region.Candidates)
+	}
+}
 func TestFloatTiledPlannerOffersTheCandidate(t *testing.T) {
 	shape := []uint64{64, 64}
 	payload := smoothBf16Tensor(64*64, 0x77)

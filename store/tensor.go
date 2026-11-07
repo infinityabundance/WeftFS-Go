@@ -25,6 +25,8 @@ import (
 	"math"
 	"math/bits"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/infinityabundance/WeftCodec-Go/frame"
 	"github.com/infinityabundance/WeftCodec-Go/limits"
@@ -42,6 +44,58 @@ const DefaultTensorMaxCandidates = 16
 
 // TensorStrategy is a physical representation strategy the planner considers.
 type TensorStrategy string
+
+// AccessPattern kinds accepted by the planner.
+const (
+	AccessPatternWhole  = "whole"
+	AccessPatternRegion = "region"
+	AccessPatternMixed  = "mixed"
+)
+
+// AccessPattern is the access pattern a plan is priced for.
+type AccessPattern struct {
+	Kind          string
+	RegionBytes   uint64
+	ReadsPerWrite uint64
+	WholeReads    uint64
+	RegionReads   uint64
+}
+
+// ParseAccessPattern parses whole | region:BYTES:READS | mixed:WHOLE:BYTES:READS.
+func ParseAccessPattern(text string) (AccessPattern, error) {
+	parts := strings.Split(text, ":")
+	switch {
+	case len(parts) == 1 && parts[0] == "whole":
+		return AccessPattern{Kind: AccessPatternWhole}, nil
+	case len(parts) == 3 && parts[0] == "region":
+		bytesValue, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return AccessPattern{}, werr.Newf(werr.InvalidArgument, "bad region bytes %q", parts[1])
+		}
+		reads, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil {
+			return AccessPattern{}, werr.Newf(werr.InvalidArgument, "bad region reads %q", parts[2])
+		}
+		return AccessPattern{Kind: AccessPatternRegion, RegionBytes: bytesValue, ReadsPerWrite: reads}, nil
+	case len(parts) == 4 && parts[0] == "mixed":
+		whole, err := strconv.ParseUint(parts[1], 10, 64)
+		if err != nil {
+			return AccessPattern{}, werr.Newf(werr.InvalidArgument, "bad whole reads %q", parts[1])
+		}
+		bytesValue, err := strconv.ParseUint(parts[2], 10, 64)
+		if err != nil {
+			return AccessPattern{}, werr.Newf(werr.InvalidArgument, "bad region bytes %q", parts[2])
+		}
+		reads, err := strconv.ParseUint(parts[3], 10, 64)
+		if err != nil {
+			return AccessPattern{}, werr.Newf(werr.InvalidArgument, "bad region reads %q", parts[3])
+		}
+		return AccessPattern{Kind: AccessPatternMixed, WholeReads: whole, RegionBytes: bytesValue, RegionReads: reads}, nil
+	default:
+		return AccessPattern{}, werr.Newf(werr.InvalidArgument,
+			"access pattern must be whole, region:BYTES:READS, or mixed:WHOLE:BYTES:READS (got %q)", text)
+	}
+}
 
 const (
 	// TensorStrategyRaw is concatenated raw chunk blobs (v2 kind:"raw").
@@ -224,13 +278,41 @@ func (s TensorStrategy) costClass() CostClass {
 	}
 }
 
-// estimatedDecodeNS prices a candidate with the shared table.
+// estimatedDecodeNS prices a candidate with the shared table, at the
+// configured access pattern.
 func estimatedDecodeNS(strategy TensorStrategy, size uint64, options TensorPlanOptions) uint64 {
 	model := options.CostModel
 	if model == "" {
 		model = DefaultCostModel
 	}
-	return EstimateDecodeNSWith(strategy.costClass(), size, model, options.Cost)
+	full := EstimateDecodeNSWith(strategy.costClass(), size, model, options.Cost)
+	tileIndependent := strategy == TensorStrategyFloatTiled
+	regionCost := func(regionBytes uint64) uint64 {
+		if regionBytes > size {
+			regionBytes = size
+		}
+		if tileIndependent {
+			return EstimateDecodeNSWith(strategy.costClass(), regionBytes, model, options.Cost)
+		}
+		return full
+	}
+	switch options.AccessPattern.Kind {
+	case AccessPatternRegion:
+		reads := options.AccessPattern.ReadsPerWrite
+		if reads == 0 {
+			reads = 1
+		}
+		return saturatingMul(regionCost(options.AccessPattern.RegionBytes), reads)
+	case AccessPatternMixed:
+		whole := saturatingMul(full, options.AccessPattern.WholeReads)
+		region := saturatingMul(regionCost(options.AccessPattern.RegionBytes), options.AccessPattern.RegionReads)
+		if math.MaxUint64-whole < region {
+			return math.MaxUint64
+		}
+		return whole + region
+	default:
+		return full
+	}
 }
 
 // isIndependent reports whether a representation stands alone.
@@ -550,6 +632,9 @@ type TensorPlanOptions struct {
 	// TileShape enables the mode-17 FLOAT_TILED candidate. Empty skips it,
 	// matching the Rust planner's explicit opt-in.
 	TileShape []uint64
+	// AccessPattern is the pattern the decode estimate is priced for. The zero
+	// value is Whole and reproduces the historical plan exactly.
+	AccessPattern AccessPattern
 }
 
 // TensorWriteSpec is the option set for one tensor write.

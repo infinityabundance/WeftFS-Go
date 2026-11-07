@@ -899,6 +899,7 @@ func cmdWrite(args []string, storeDir string) error {
 	shardIndex := fs.Uint("shard-index", 0, "sharded layout shard index")
 	strategyText := fs.String("strategy", "auto", "auto, or a required tensor strategy")
 	tileShapeText := fs.String("tile-shape", "", "mode-17 FLOAT_TILED tile extents as comma-separated u64 values")
+	accessPatternText := fs.String("access-pattern", "whole", "whole, region:BYTES:READS, or mixed:WHOLE:BYTES:READS")
 	lambdaNS := fs.Uint64("lambda-ns", 0, "bytes charged per estimated decode nanosecond")
 	if err := parseFlags(fs, args); err != nil {
 		return err
@@ -951,6 +952,10 @@ func cmdWrite(args []string, storeDir string) error {
 				return err
 			}
 		}
+		accessPattern, err := store.ParseAccessPattern(*accessPatternText)
+		if err != nil {
+			return err
+		}
 		parent, name, err := parentAndName(s, fs.Arg(0))
 		if err != nil {
 			return err
@@ -960,7 +965,7 @@ func cmdWrite(args []string, storeDir string) error {
 			Causal:       causalIDs,
 			Plan: store.TensorPlanOptions{
 				LambdaNS: *lambdaNS, CostModel: plannerCostModel, Cost: activeCostTable(),
-				TileShape: tileShape,
+				TileShape: tileShape, AccessPattern: accessPattern,
 			},
 		})
 		if err != nil {
