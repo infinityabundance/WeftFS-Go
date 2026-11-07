@@ -195,6 +195,24 @@ func (c GCSConfig) Validate() error {
 	if c.Bucket == "" {
 		return werr.Newf(werr.InvalidArgument, "GCS bucket must not be empty")
 	}
+	forms := 0
+	if c.Token != "" {
+		forms++
+	}
+	if c.ServiceAccountPath != "" {
+		forms++
+	}
+	if c.Anonymous {
+		forms++
+	}
+	if forms > 1 {
+		return werr.Newf(werr.Unsupported,
+			"GCS backend was given more than one credential form (bearer token, service-account key, anonymous); refusing to guess which one the endpoint should see")
+	}
+	if forms == 0 {
+		return werr.Newf(werr.InvalidArgument,
+			"GCS backend needs one credential form: a bearer token, a service-account key, or anonymous")
+	}
 	if len(c.Bucket) > 222 {
 		return werr.Newf(werr.InvalidArgument,
 			"GCS bucket name is longer than the 222-byte service limit")
