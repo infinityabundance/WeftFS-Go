@@ -57,7 +57,7 @@ func usage() {
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
-  context causal uri tensor quota merge rebase compact
+  context causal uri tensor quota merge rebase compact calibrate
 `)
 }
 
@@ -479,6 +479,8 @@ func run(command string, args []string, storeDir string, jsonOut bool) error {
 		return cmdRebase(args, storeDir, jsonOut)
 	case "compact":
 		return cmdCompact(args, storeDir, jsonOut)
+	case "calibrate":
+		return cmdCalibrate(args, storeDir, jsonOut)
 	default:
 		return werr.Newf(werr.InvalidArgument, "unknown command `%s`", command)
 	}

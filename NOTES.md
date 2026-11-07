@@ -832,3 +832,67 @@ Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
 - **Gaps.** No Go S3/GCS backend (the split is filesystem-only), no Go
   `calibrate` measurement command, packs are never rewritten, overlay refuses
   shrinking/collapse/insert, and there is still no on-disk selector index.
+
+## R24 — Go `calibrate` measurement + packed/split FUSE coverage (2026-11-07)
+
+- **`weftfs calibrate` (measurement half).** `store/calibrate.go` measures the
+  seven planner classes with the shipped `WeftCodec-Go` encoders/decoders at
+  128 KiB and 16 MiB (default 7 reps, medians, one warm-up), fits the same
+  affine `fixed_ns + ns_per_mib * bytes / 2^20` model with Rust's rounding, and
+  subtracts the measured base decode for delta rows. `sparse-delta` reuses
+  `weight-delta` (`reused`, 0 samples); `kv-cache`/`activation` keep the
+  declared rows. The command is `weftfs calibrate [--out FILE] [--from FILE]
+  [--reps N] [--large-mib N] [--small-kib N]`; `--from` loads and reports
+  divergence without measuring, `--json` matches Rust's shape, and the global
+  `--fixed-timestamp-ns` makes the record reproducible. `--install` stays
+  Rust-only (not implemented here).
+  Method caveat: Rust measures store reads, Go measures codec frame decodes, so
+  absolute rows are not cross-language comparable; the reason is the missing Go
+  mode-15/14 writers and the need for one uniform method. See
+  `CALIBRATION.md` for the default run (4.42 s wall, host-local) and every
+  non-claim.
+- **Defect found and fixed.** `q8BlockSize` preferred the smallest dividing
+  block (16), while Rust prefers the largest (256). At 8 MiB a q8_0 tensor then
+  needed 1,048,576 scale/zero-point entries and the mode-10 write failed
+  `LimitExceeded: WCB item count 1000001 exceeds limit 1000000`; Go and Rust
+  mode-10 bytes also differed. The order is now `256,128,64,32,16`, matching
+  `q8_0_block_size` in `src/tensor_store.rs`. Existing mode-10 round trips and
+  the Rust/Go tensor handoff still pass.
+- **Acceptance: the Rust loader accepts a Go document.** In the fuse court,
+  `weftfs calibrate --json --out go-calibration.json` (Go) followed by
+  `weftfs --json calibrate --from go-calibration.json` (Rust reference at
+  `.docker-cache/target-rust/release/weftfs`) exits 0, reports schema
+  `weft.calibration.v1`, the **identical** `calibration_id`
+  `b07fbff6f59d6bbd284f15520673ac5d51635a7a2d86d1bd230c9f0b56a9bec7`, 10 rows
+  (7 measured), and 10 divergence rows. The test
+  `TestRustAcceptsGoCalibrationDocument` guards on `WEFTFS_RUST_BIN`/the cache
+  path and skip-passes with a printed reason when no Rust binary is runnable.
+- **FUSE coverage for CLI layouts.** `fusefs/packed_mount_test.go` builds the Go
+  CLI, then for each of `--pack`, `--blob-backend object --commit-backend
+  local`, and `--pack` over that split: creates 9 files (12 B … 300,000 B,
+  three directories) through the CLI, asserts `info --json` reports the
+  requested planes/packs (pack layout: 9 sealed packs, 23 members, 382,385
+  packed bytes), starts `weftfs mount --read-only` as a real daemon, compares
+  every file byte-for-byte and by SHA-256, does one 8 KiB `ReadAt` at offset
+  100,000, checks the root and `docs/` listing digests, unmounts, then runs
+  `verify --full` (`ok=true`, three times). All three layouts are expressible
+  with the existing Go CLI; nothing needed a workaround. Root listing digest
+  `b38654c6bf72cb587dc877f5b6dd692c5bbc3bcdf7ddfaabea51a5e11f910f5b` and docs
+  digest `728438125350a8ed79c27ce06e19f5f9dd3c0edb1ea2b6b2faf9fbeb085891ab`
+  are identical across layouts.
+- **Court evidence (exact commands).**
+  `scripts/docker-court.sh fuse "cd /work/WeftFS-Go && go test -race -count=1
+  ./..."` → `ok` for `cmd/weftfs` (25.024 s), `fusefs` (7.702 s), `model`
+  (1.008 s), `store` (186.047 s), 0 failures. Top-level test counts in the fuse
+  court: store 173, cmd/weftfs 17, fusefs 25 (before this work: 168 / 15 / 24).
+  `go vet ./...` and `CGO_ENABLED=0 go build ./...` clean.
+- **New tests.** `store/calibrate_test.go` 4 (document round trip + row labels,
+  deterministic within the stated tolerance, corruption rejection, option
+  bounds); `store/calibrate_handoff_test.go` 1 (Rust loader); `cmd/weftfs/
+  calibrate_test.go` 2 (CLI measure + `--from`, invalid use); `fusefs/
+  packed_mount_test.go` 1 (three layouts, 3 mounts).
+- **Still uncovered.** No Go `calibrate --install`; no `--calibration` document
+  produced on a machine with a mode-15 store (the codec measurement cannot
+  exercise a store-side mode-15 read path because Go has no writer); the FUSE
+  test does not cover a packed *writable* mount (all mounts are `--read-only`);
+  no power-loss, multi-host, or fleet claim.

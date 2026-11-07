@@ -99,6 +99,37 @@ func (c *Calibration) Rows() [10]CalibrationRow { return c.rows }
 // Table returns the validated affine table used for pricing.
 func (c *Calibration) Table() *CostTable { return c.table }
 
+// Document returns a deep copy of the validated in-memory document (including
+// `digest`). Copying prevents a caller from mutating the record the digest was
+// computed over.
+func (c *Calibration) Document() map[string]any {
+	data, err := json.Marshal(c.document)
+	if err != nil {
+		return c.document
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var clone map[string]any
+	if err := decoder.Decode(&clone); err != nil {
+		return c.document
+	}
+	return clone
+}
+
+// WriteFile writes the document as indented JSON. The digest is over the
+// compact key-sorted form, so indentation cannot change it.
+func (c *Calibration) WriteFile(path string) error {
+	data, err := json.MarshalIndent(c.document, "", "  ")
+	if err != nil {
+		return calibrationError("cannot serialise calibration: %s", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return werr.Wrap(werr.Io, err, "calibration `%s`", path)
+	}
+	return nil
+}
+
 // Row returns one class's row.
 func (c *Calibration) Row(class CostClass) CalibrationRow { return c.rows[class.Index()] }
 

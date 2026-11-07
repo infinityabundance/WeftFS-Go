@@ -1317,8 +1317,14 @@ func floatTensorDtype(dtype string) (modes.FloatDtype, bool) {
 	return parsed, true
 }
 
+// q8BlockSize selects the mode-10 block size. It prefers the largest block
+// that divides the payload, matching Rust's `q8_0_block_size`: the scale plane
+// costs one 4-byte record per block, so 16-element blocks add 25 % metadata
+// while 256-element blocks add about 1.6 %. The previous ascending order picked
+// 16 for every even element count and made large q8_0 tensors exceed the WCB
+// item bound (mode-10 descriptors of 8 MiB and above failed).
 func q8BlockSize(elementCount uint64) uint64 {
-	for _, block := range []uint64{16, 32, 64, 128, 256} {
+	for _, block := range []uint64{256, 128, 64, 32, 16} {
 		if elementCount%block == 0 {
 			return block
 		}
