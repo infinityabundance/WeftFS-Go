@@ -55,6 +55,9 @@ func writeRustTensorStore(t *testing.T, bin, dir, payloadDir string) map[string]
 	writeTensor("/pair-derived-weight.bin", derived, "--causal", versionID,
 		"--strategy", "weight-delta")
 	writeTensor("/incompressible.bin", incompressible)
+	// A forced mode-18 multi-stream float-tiled object, written by Rust.
+	writeTensor("/streams.bin", independent, "--strategy", "float-tiled-streams",
+		"--tile-shape", "64,128")
 
 	return map[string][]byte{
 		"/independent.bin":         independent,
@@ -62,6 +65,7 @@ func writeRustTensorStore(t *testing.T, bin, dir, payloadDir string) map[string]
 		"/pair-derived.bin":        derived,
 		"/pair-derived-weight.bin": derived,
 		"/incompressible.bin":      incompressible,
+		"/streams.bin":             independent,
 	}
 }
 
@@ -114,6 +118,17 @@ func writeGoTensorStore(t *testing.T, dir string) (map[string][]byte, *store.Sto
 		quantized, store.RowMajorTensorLayout(), nil); err != nil {
 		t.Fatalf("go write q8_0: %v", err)
 	}
+	streamsHint := store.TensorStrategyFloatTiledStreams
+	if _, err := s.WriteTensorFileWithSpec(model.RootID, []byte("streams.bin"), "bf16", tensorShape,
+		independent, store.RowMajorTensorLayout(), store.TensorWriteSpec{
+			StrategyHint: &streamsHint,
+			Plan: store.TensorPlanOptions{
+				TileShape: []uint64{64, 128},
+				NStreams:  4,
+			},
+		}); err != nil {
+		t.Fatalf("go write mode-18 streams: %v", err)
+	}
 	rep := tensorRepresentation(t, dir, s, "/pair-derived.bin")
 	if rep == nil || rep.Kind != model.RepresentationTensor || rep.Tensor == nil ||
 		rep.Tensor.Mode != 16 || rep.Strategy != model.StrategySparseDelta {
@@ -135,6 +150,7 @@ func writeGoTensorStore(t *testing.T, dir string) (map[string][]byte, *store.Sto
 		"/pair-derived-weight.bin": derived,
 		"/incompressible.bin":      incompressible,
 		"/quantized.bin":           quantized,
+		"/streams.bin":             independent,
 	}, s, derivedID
 }
 
@@ -222,6 +238,14 @@ func TestTensorHandoffRustThenGo(t *testing.T) {
 	if want := expected["/pair-derived.bin"][10*512*2 : 12*512*2]; !bytes.Equal(read.Bytes, want) {
 		t.Fatal("go region read of a Rust tensor returned the wrong bytes")
 	}
+	streamsID, _ := s.ResolvePath("/streams.bin")
+	read, err = s.ReadTensorRegion(streamsID, tensor.NewRegion([]uint64{10, 0}, []uint64{12, 512}))
+	if err != nil {
+		t.Fatalf("go region read of the Rust mode-18 tensor: %v", err)
+	}
+	if want := expected["/streams.bin"][10*512*2 : 12*512*2]; !bytes.Equal(read.Bytes, want) {
+		t.Fatal("go region read of a Rust mode-18 tensor returned the wrong bytes")
+	}
 }
 
 func TestTensorHandoffGoThenRust(t *testing.T) {
@@ -254,6 +278,11 @@ func TestTensorHandoffGoThenRust(t *testing.T) {
 		"--region", "10,0:12,512")
 	if want := expected["/pair-derived.bin"][10*512*2 : 12*512*2]; !bytes.Equal(gotRegion, want) {
 		t.Fatal("rust region read of a Go tensor returned the wrong bytes")
+	}
+	gotStreams := runRustBytes(t, bin, "--store", dir, "cat", "/streams.bin",
+		"--region", "10,0:12,512")
+	if want := expected["/streams.bin"][10*512*2 : 12*512*2]; !bytes.Equal(gotStreams, want) {
+		t.Fatal("rust region read of a Go mode-18 tensor returned the wrong bytes")
 	}
 }
 
