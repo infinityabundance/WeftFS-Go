@@ -159,6 +159,13 @@ type blobProber interface {
 	probe() (BlobProbe, error)
 }
 
+// blobLayoutEnsurer is implemented by a plane that owns a remote namespace and
+// must create it before the first publication (S3 creates the bucket). A
+// filesystem plane needs no such step; ensureBlobLayout creates its directories.
+type blobLayoutEnsurer interface {
+	EnsureBlobLayout() error
+}
+
 // BlobAccess is the logical immutable blob namespace. Every reader, writer,
 // verifier, and collector uses it, so packing and routing cannot be bypassed.
 type BlobAccess interface {

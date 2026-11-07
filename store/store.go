@@ -484,10 +484,8 @@ func Init(path string, opts Options) (*Store, error) {
 	if err := store.commits.EnsureLayout(); err != nil {
 		return nil, err
 	}
-	if blobKind != PlaneS3 {
-		if err := ensureBlobLayout(store.blobRoot); err != nil {
-			return nil, err
-		}
+	if err := store.ensureBlobPlaneLayout(); err != nil {
+		return nil, err
 	}
 	if err := store.commits.CreateFormat(); err != nil {
 		return nil, err
@@ -496,6 +494,11 @@ func Init(path string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	store.writerLockHeld = true
+	if err := store.probePlanes(); err != nil {
+		_ = store.commits.ReleaseWriterLock()
+		store.writerLockHeld = false
+		return nil, err
+	}
 	if err := store.commits.CreateSuperblock(); err != nil {
 		_ = store.commits.ReleaseWriterLock()
 		return nil, err
@@ -569,11 +572,9 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 			_ = store.commits.ReleaseWriterLock()
 			return nil, err
 		}
-		if !store.remoteBlob {
-			if err := ensureBlobLayout(store.blobRoot); err != nil {
-				_ = store.commits.ReleaseWriterLock()
-				return nil, err
-			}
+		if err := store.ensureBlobPlaneLayout(); err != nil {
+			_ = store.commits.ReleaseWriterLock()
+			return nil, err
 		}
 		if err := store.commits.CleanTmp(DefaultGCGraceSecs); err != nil {
 			_ = store.commits.ReleaseWriterLock()
@@ -830,6 +831,18 @@ func (s *Store) Close() error {
 	}
 	s.writerLockHeld = false
 	return s.commits.Close()
+}
+
+func (s *Store) ensureBlobPlaneLayout() error {
+	if s.probeFlat != nil {
+		if ensurer, ok := s.probeFlat.(blobLayoutEnsurer); ok {
+			return ensurer.EnsureBlobLayout()
+		}
+	}
+	if s.remoteBlob {
+		return werr.Newf(werr.Unsupported, "remote blob plane has no layout creator")
+	}
+	return ensureBlobLayout(s.blobRoot)
 }
 
 func (s *Store) maxVisibleGeneration() (uint64, error) {
@@ -1439,6 +1452,12 @@ func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
 	// Every blob the commit names must be durable and visible before the
 	// commit record is published. A packed plane buffers the open pack.
 	if err := s.blobs.Flush(); err != nil {
+		return model.Hash32{}, err
+	}
+	// Stop before writing any commit record once this writer's own lease has
+	// expired. The fence before the head CAS catches a takeover; this earlier
+	// check also keeps a stale writer from leaving an unpublished commit tail.
+	if err := s.commits.VerifyWriteLease(); err != nil {
 		return model.Hash32{}, err
 	}
 	wcbBytes, err := commit.Encode()

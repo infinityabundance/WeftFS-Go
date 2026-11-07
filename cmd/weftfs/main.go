@@ -91,6 +91,12 @@ var (
 	blobBackend   = store.PlaneLocal
 	commitBackend = store.PlaneLocal
 	blobRoot      string
+	// backendBase is the `--backend` shorthand. It selects both planes unless
+	// an explicit `--blob-backend`/`--commit-backend` overrides that plane.
+	backendBase           = store.PlaneKind("")
+	backendExplicit       bool
+	blobBackendExplicit   bool
+	commitBackendExplicit bool
 	// S3 endpoint and credentials. Explicit flags take precedence over the
 	// WEFT_S3_*/AWS_* environment; resolution happens once per store open.
 	s3Endpoint     string
@@ -120,9 +126,24 @@ func activeCostTable() *store.CostTable {
 	return calibration.Table()
 }
 
+// effectivePlanes resolves `--backend` plus the explicit per-plane overrides.
+func effectivePlanes() (store.PlaneKind, store.PlaneKind) {
+	blob, commit := blobBackend, commitBackend
+	if backendExplicit {
+		if !blobBackendExplicit {
+			blob = backendBase
+		}
+		if !commitBackendExplicit {
+			commit = backendBase
+		}
+	}
+	return blob, commit
+}
+
 func applyPlanePolicy(opts *store.Options) {
-	opts.BlobBackend = blobBackend
-	opts.CommitBackend = commitBackend
+	blob, commit := effectivePlanes()
+	opts.BlobBackend = blob
+	opts.CommitBackend = commit
 	opts.BlobRoot = blobRoot
 	opts.Packing = packing
 	opts.PackOptions = store.PackOptions{
@@ -137,7 +158,8 @@ func applyPlanePolicy(opts *store.Options) {
 // remotePlaneConfigured reports whether either plane is S3, in which case a
 // local store directory is optional.
 func remotePlaneConfigured() bool {
-	return blobBackend == store.PlaneS3 || commitBackend == store.PlaneS3
+	blob, commit := effectivePlanes()
+	return blob == store.PlaneS3 || commit == store.PlaneS3
 }
 
 // applyS3Policy resolves the S3 configuration when either plane is S3. A
@@ -281,6 +303,7 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			blobBackend = kind
+			blobBackendExplicit = true
 			i++
 		case strings.HasPrefix(args[i], "--blob-backend="):
 			kind, parseErr := store.ParsePlaneKind(strings.TrimPrefix(args[i], "--blob-backend="))
@@ -288,6 +311,25 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			blobBackend = kind
+			blobBackendExplicit = true
+		case args[i] == "--backend" || args[i] == "-backend":
+			if i+1 >= len(args) {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--backend requires a value")
+			}
+			kind, parseErr := store.ParsePlaneKind(args[i+1])
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			backendBase = kind
+			backendExplicit = true
+			i++
+		case strings.HasPrefix(args[i], "--backend="):
+			kind, parseErr := store.ParsePlaneKind(strings.TrimPrefix(args[i], "--backend="))
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			backendBase = kind
+			backendExplicit = true
 		case args[i] == "--commit-backend" || args[i] == "-commit-backend":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--commit-backend requires a value")
@@ -297,6 +339,7 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			commitBackend = kind
+			commitBackendExplicit = true
 			i++
 		case strings.HasPrefix(args[i], "--commit-backend="):
 			kind, parseErr := store.ParsePlaneKind(strings.TrimPrefix(args[i], "--commit-backend="))
@@ -304,6 +347,7 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, parseErr
 			}
 			commitBackend = kind
+			commitBackendExplicit = true
 		case args[i] == "--blob-root" || args[i] == "-blob-root":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--blob-root requires a directory")

@@ -64,6 +64,9 @@ func (p *s3BlobPlane) ReclaimUnreferencedPacks() (PackReclaim, error) {
 	return PackReclaim{}, nil
 }
 
+// EnsureBlobLayout creates the bucket if it is absent. S3 has no directories.
+func (p *s3BlobPlane) EnsureBlobLayout() error { return p.client.ensureBucket() }
+
 func (p *s3BlobPlane) VerifyPacks() ([]string, error) { return nil, nil }
 
 func (p *s3BlobPlane) key(kind BlobKind, id model.Hash32) string {

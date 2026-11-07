@@ -1,0 +1,45 @@
++ exec docker run --rm --init --name weft-go-court-3363942 --memory=3g --memory-swap=3g --pids-limit=1024 --cpus=4 --ulimit nofile=65536:65536 --security-opt no-new-privileges --tmpfs /tmp:rw,size=1g,nosuid,nodev --cap-drop=ALL -e WEFT_IN_COURT=1 -e WEFT_COURT_IMAGE=weft/go-court:1 -e WEFT_COURT_KERNEL=7.3.1-1-cachyos -e WEFT_COURT_IMAGE_ID=sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166 -e WEFT_COURT_MEMORY=3g -e WEFT_COURT_CPUS=4 -e WEFT_COURT_PIDS=1024 -e WEFT_COURT_NPROC=2048 -e WEFT_DOCKER_SERVER=29.9.2 -e WEFT_DOCKER_CLIENT=29.1.5 -e WEFT_REPO_WEFTFS=28137ecd63282d07f8e10afc1de0385fa65c72b8 -e WEFT_REPO_WEFTFS_GO=cc1911f1de863b38cd323e7614d55c681b2c7afb -e WEFT_REPO_WEFTCODEC=57288e1f70c30edb58308a4f06aa7523d23f0d56 -e WEFT_REPO_WEFTCODEC_GO=86ded1edf5ca8c62ffd61687a572e924044f0c70 -e RUST_BACKTRACE=1 -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/work/.docker-cache/target-rust -e CARGO_NET_RETRY=3 -e GOCACHE=/work/.docker-cache/go-build -e GOMODCACHE=/work/.docker-cache/go-mod -e 'GOFLAGS=-p=2 -buildvcs=false' -e GOTMPDIR=/work/.docker-cache/go-tmp -e GOMAXPROCS=4 -v /mnt/1tb_kingston/WeftFS:/work -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-registry:/cargo/registry -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-git:/cargo/git -w /work -e WEFT_S3_ENDPOINT=http://weft-go-s3-minio-3363597:9000 -e WEFT_S3_REGION=us-east-1 -e WEFT_S3_ACCESS_KEY=weftcourt -e WEFT_S3_SECRET_KEY=weftcourt-secret -e WEFT_S3_LOCK_LEASE_SECS=60 -e WEFT_S3_TEST_ENDPOINT=http://weft-go-s3-minio-3363597:9000 -e WEFT_S3_TEST_PREFIX=weft-go-s3-20261107t003622z -e 'WEFT_S3_SERVER_LABEL=minio version RELEASE.2025-04-22T22-12-26Z (commit-id=0d7408fc9969caf07de6a8c3a84f9fbb10a6739e)' -e WEFT_S3_SERVER_VERSION=RELEASE.2025-04-22T22-12-26Z -e WEFT_S3_SERVER_SHA256=53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c -e WEFT_S3_CONTAINER_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc --network weft-go-s3-net-3363597 weft/go-court:1 bash -c 'set -Eeuo pipefail; ulimit -n 65536; ulimit -u 2048; export TMPDIR=/tmp; cd /work; cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run '\''TestS3|TestSigV4|TestCanonicalQuery|TestPathAndComponent|TestIfMatchForms|TestLockRecord|TestSchemasDoNot|TestS3Config'\'' ./store/'
+=== RUN   TestS3BlobPlaneCreateOnceRangesAndListing
+--- PASS: TestS3BlobPlaneCreateOnceRangesAndListing (0.02s)
+=== RUN   TestS3CommitVolumeConditionalRecords
+    s3_integration_test.go:250: measured If-Match form: quoted-as-returned
+    s3_integration_test.go:329: read malformed commit: expected Corrupt, got NonCanonical: unknown WCB tag 0x6e (*werr.Error)
+--- FAIL: TestS3CommitVolumeConditionalRecords (0.02s)
+=== RUN   TestS3FencedWriterTakeover
+    s3_integration_test.go:387: successor write after stale close: Exists: commit s3://weft-go-s3-20261107t003622z-1045-3/commits/3.commit already exists with different bytes
+--- FAIL: TestS3FencedWriterTakeover (1.24s)
+=== RUN   TestS3StoreRoundTrip
+    s3_integration_test.go:436: writable open did not record probe evidence: {Blobs:{Backend:s3 AtomicPublish:true DurableFSync:true TrueRangeReads:true MaxObjectBytes:1073741824 Consistency:single-node S3-compatible endpoint; read-after-write and list-after-write for published keys; conditional writes are required and measured at writable open Publication:S3 PUT with If-None-Match: * (create-once); identical bytes under an existing key are idempotent and different bytes are refused; durability is the provider acknowledgement, not a local fsync} Commits:{Backend:s3 ConditionalUpdate:true AtomicPublish:true DurableFSync:true MaxControlBytes:1073741824 Consistency:single-node S3-compatible endpoint; read-after-write and list-after-write for published keys; conditional writes are required and measured at writable open; a monotonic fencing token is carried in the LOCK object Publication:S3 PUT with If-None-Match: * (create-once); superblock slot via GET + If-Match PUT; every head publication is preceded by one conditional write on LOCK that carries the fencing token and names the head; release is a conditional tombstone} BlobProbe:<nil> CommitProbe:<nil> BlobRoot:s3://weft-go-s3-20261107t003622z-1045-4 CommitRoot:s3://weft-go-s3-20261107t003622z-1045-4 Packing:false}
+--- FAIL: TestS3StoreRoundTrip (0.01s)
+=== RUN   TestS3SplitLayouts
+    s3_integration_test.go:550: split write: Io: S3 PUT s3://weft-go-s3-20261107t003622z-1045-5/objects/e0/e0d2a7a880bb4dafcb0ac96bb74e2832aa3e071806e42146220ca59d8d44558a returned HTTP 404: <?xml version="1.0" encoding="UTF-8"?>
+        <Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><Key>objects/e0/e0d2a7a880bb4dafcb0ac96bb74e2832aa3e071806e42146220ca59d8d44558a</Key><BucketName>weft-go-s3-202611
+--- FAIL: TestS3SplitLayouts (0.00s)
+=== RUN   TestS3CrashChildProcess
+    s3_integration_test.go:609: S3 crash helper process; not run directly
+--- SKIP: TestS3CrashChildProcess (0.00s)
+=== RUN   TestS3CrashProxy
+=== RUN   TestS3CrashProxy/after_objects
+=== RUN   TestS3CrashProxy/after_commit_file
+=== RUN   TestS3CrashProxy/after_superblock_write
+--- PASS: TestS3CrashProxy (0.14s)
+    --- PASS: TestS3CrashProxy/after_objects (0.04s)
+    --- PASS: TestS3CrashProxy/after_commit_file (0.04s)
+    --- PASS: TestS3CrashProxy/after_superblock_write (0.05s)
+=== RUN   TestSigV4MatchesThePublishedAWSVector
+--- PASS: TestSigV4MatchesThePublishedAWSVector (0.00s)
+=== RUN   TestCanonicalQueryEncodesAndSortsLikeAWS
+--- PASS: TestCanonicalQueryEncodesAndSortsLikeAWS (0.00s)
+=== RUN   TestPathAndComponentEncodingPreserveOnlyUnreservedBytes
+--- PASS: TestPathAndComponentEncodingPreserveOnlyUnreservedBytes (0.00s)
+=== RUN   TestIfMatchFormsEncodeETags
+--- PASS: TestIfMatchFormsEncodeETags (0.00s)
+=== RUN   TestLockRecordRoundTripsLegacyAndTombstone
+--- PASS: TestLockRecordRoundTripsLegacyAndTombstone (0.00s)
+=== RUN   TestSchemasDoNotParseAcrossBackends
+--- PASS: TestSchemasDoNotParseAcrossBackends (0.00s)
+=== RUN   TestS3ConfigResolutionAndValidation
+--- PASS: TestS3ConfigResolutionAndValidation (0.00s)
+FAIL
+FAIL	github.com/infinityabundance/WeftFS-Go/store	1.445s
+FAIL

@@ -312,10 +312,18 @@ func resetPlanePolicy(t *testing.T) {
 	previousBlob := blobBackend
 	previousCommit := commitBackend
 	previousRoot := blobRoot
+	previousBase := backendBase
+	previousBaseExplicit := backendExplicit
+	previousBlobExplicit := blobBackendExplicit
+	previousCommitExplicit := commitBackendExplicit
 	t.Cleanup(func() {
 		blobBackend = previousBlob
 		commitBackend = previousCommit
 		blobRoot = previousRoot
+		backendBase = previousBase
+		backendExplicit = previousBaseExplicit
+		blobBackendExplicit = previousBlobExplicit
+		commitBackendExplicit = previousCommitExplicit
 	})
 }
 
@@ -324,6 +332,10 @@ func TestGlobalsPlanePolicy(t *testing.T) {
 	blobBackend = store.PlaneLocal
 	commitBackend = store.PlaneLocal
 	blobRoot = ""
+	backendBase = ""
+	backendExplicit = false
+	blobBackendExplicit = false
+	commitBackendExplicit = false
 	rest, dir, _, err := globals([]string{
 		"--store", "/tmp/store",
 		"--blob-backend", "object",
@@ -347,6 +359,47 @@ func TestGlobalsPlanePolicy(t *testing.T) {
 	}
 	if _, _, _, err := globals([]string{"--blob-backend", "bogus", "info"}); err == nil {
 		t.Fatal("invalid --blob-backend was accepted")
+	}
+}
+
+func TestGlobalsBackendShorthand(t *testing.T) {
+	resetPlanePolicy(t)
+	blobBackend = store.PlaneLocal
+	commitBackend = store.PlaneLocal
+	backendBase = ""
+	backendExplicit = false
+	blobBackendExplicit = false
+	commitBackendExplicit = false
+	if _, _, _, err := globals([]string{"--backend", "s3", "info"}); err != nil {
+		t.Fatalf("globals: %v", err)
+	}
+	blob, commit := effectivePlanes()
+	if blob != store.PlaneS3 || commit != store.PlaneS3 {
+		t.Fatalf("--backend s3 selected %s/%s", blob, commit)
+	}
+	if !remotePlaneConfigured() {
+		t.Fatal("--backend s3 must permit an empty --store")
+	}
+
+	// An explicit split plane wins over the shorthand, in either order.
+	for _, args := range [][]string{
+		{"--backend", "s3", "--commit-backend", "local", "info"},
+		{"--commit-backend", "local", "--backend", "s3", "info"},
+	} {
+		resetPlanePolicy(t)
+		blobBackend = store.PlaneLocal
+		commitBackend = store.PlaneLocal
+		backendBase = ""
+		backendExplicit = false
+		blobBackendExplicit = false
+		commitBackendExplicit = false
+		if _, _, _, err := globals(args); err != nil {
+			t.Fatalf("globals(%v): %v", args, err)
+		}
+		blob, commit := effectivePlanes()
+		if blob != store.PlaneS3 || commit != store.PlaneLocal {
+			t.Fatalf("globals(%v) selected %s/%s", args, blob, commit)
+		}
 	}
 }
 
