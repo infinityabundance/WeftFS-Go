@@ -1169,10 +1169,10 @@ was edited.
   checks**.
 - **FUSE over S3, fuse court**: read-only mount of a MinIO-backed store;
   **3/3 files byte-identical and 3/3 SHA-256 matches**, listing digest
-  `eeaf8a4d...e19ed0`, a write refused, daemon exited, and `verify --full`
-  after unmount (generation 6). Receipt
-  `bench/receipts/go-s3-20261107T114957Z.json` at WeftFS-Go `08fda6f` (the
-  next commit changes only a GCS test log).
+  `eeaf8a4d...e19ed0`, ranged read SHA-256 `16a0d69c...e685`, a write refused,
+  daemon exited, and `verify --full` after unmount (generation 6). Receipt
+  `bench/receipts/go-s3-20261107T120121Z.json` at WeftFS-Go `a2f4afe` (the
+  final code revision; the GCS receipt is one test-log commit earlier).
 
 ### Explicit limitations (not claims)
 
@@ -1235,8 +1235,8 @@ table of an unrelated command.
   empty `--store` are both refused.
 
 `CALIBRATION.md` now documents the install path and the explicit
-`--calibration` consumption. Test counts at `9f87b16`: GCS focused 28/0/1,
-full suite 5/5 packages, CLI package ok.
+`--calibration` consumption. Test counts at `a2f4afe`: GCS focused 28/0/1,
+S3 focused 20/0/1, both full suites 5/5 packages, CLI package ok.
 
 ---
 
