@@ -4,6 +4,13 @@
 // measures at the shipped-codec frame layer (see store/calibrate.go for the
 // exact method and its stated limits). The document schema, digest, bounds and
 // divergence report are identical, so the Rust loader accepts a Go document.
+//
+// `--install` validates the document through the strict loader (either the
+// measured record or `--from FILE`) and atomically writes it to
+// `<store>/calibrations/<id>.json`. The directory is advisory, exactly as in
+// Rust: replay, verify, and GC ignore it. The planner consumes an installed
+// document explicitly with `--calibration <path>`; installation does not
+// silently change a later command's cost table.
 package main
 
 import (
@@ -22,6 +29,7 @@ func cmdCalibrate(args []string, storeDir string, jsonOut bool) error {
 	fs := flag.NewFlagSet("calibrate", flag.ContinueOnError)
 	out := fs.String("out", "", "write the calibration document here")
 	from := fs.String("from", "", "load an existing document and report divergence")
+	install := fs.Bool("install", false, "install the validated document into <store>/calibrations/<id>.json")
 	reps := fs.Int("reps", 7, "timed repetitions per representation and size (at least 5)")
 	largeMiB := fs.Uint64("large-mib", 16, "large payload size in MiB (at least 8)")
 	smallKiB := fs.Uint64("small-kib", 128, "small payload size in KiB (at least 64)")
@@ -32,9 +40,14 @@ func cmdCalibrate(args []string, storeDir string, jsonOut bool) error {
 		return werr.Newf(werr.InvalidArgument, "calibrate takes no positional arguments")
 	}
 	// `--store` is accepted (and ignored) so the global flag is usable in one
-	// command line, exactly like Rust. Nothing is installed: `--install` is a
-	// Rust-only verb.
-	_ = storeDir
+	// command line, exactly like Rust. `--install` needs a local store: the
+	// advisory `calibrations/` directory lives inside one.
+	if *install {
+		if storeDir == "" || remotePlaneConfigured() {
+			return werr.Newf(werr.InvalidArgument,
+				"calibrate --install requires a local --store <DIR>")
+		}
+	}
 
 	options := store.MeasurementOptions{
 		Reps:     *reps,
@@ -83,6 +96,15 @@ func cmdCalibrate(args []string, storeDir string, jsonOut bool) error {
 		outputPath = &path
 	}
 
+	var installedPath *string
+	if *install {
+		path, err := record.Install(storeDir)
+		if err != nil {
+			return err
+		}
+		installedPath = &path
+	}
+
 	baked := store.BakedCostTable(store.CostModelMeasured)
 	if jsonOut {
 		rowValues := make([]any, 0, len(store.CostClassAll))
@@ -111,6 +133,9 @@ func cmdCalibrate(args []string, storeDir string, jsonOut bool) error {
 		if outputPath != nil {
 			document["out"] = *outputPath
 		}
+		if installedPath != nil {
+			document["installed"] = *installedPath
+		}
 		data, err := json.MarshalIndent(document, "", "  ")
 		if err != nil {
 			return werr.Wrap(werr.Io, err, "calibrate: cannot serialise output")
@@ -121,6 +146,9 @@ func cmdCalibrate(args []string, storeDir string, jsonOut bool) error {
 	fmt.Printf("calibration_id=%s\n", record.ID)
 	if outputPath != nil {
 		fmt.Printf("out=%s\n", *outputPath)
+	}
+	if installedPath != nil {
+		fmt.Printf("installed=%s\n", *installedPath)
 	}
 	fmt.Printf("divergence_vs_baked_measured:\n")
 	for _, class := range store.CostClassAll {

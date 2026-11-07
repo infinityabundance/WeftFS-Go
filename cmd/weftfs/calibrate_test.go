@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/infinityabundance/WeftFS-Go/store"
@@ -140,4 +141,83 @@ func runCalibrateCLIError(t *testing.T, args []string) error {
 		return err
 	}
 	return run(rest[0], rest[1:], storeDir, jsonOut)
+}
+
+func TestCalibrateCLIInstallsValidatedDocument(t *testing.T) {
+	resetCalibrateGlobals(t)
+	dir := t.TempDir()
+	storeDir := filepath.Join(dir, "store")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatalf("store dir: %v", err)
+	}
+	measured := filepath.Join(dir, "calibration.json")
+	runCalibrateCLI(t, []string{
+		"--fixed-timestamp-ns", "1700000000000000000",
+		"calibrate", "--out", measured,
+		"--reps", "5", "--small-kib", "64", "--large-mib", "8",
+	})
+
+	output := runCalibrateCLI(t, []string{
+		"--store", storeDir, "--json",
+		"calibrate", "--from", measured, "--install",
+	})
+	var report struct {
+		CalibrationID string `json:"calibration_id"`
+		Installed     string `json:"installed"`
+	}
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("calibrate --install --json output is not JSON: %v\n%s", err, output)
+	}
+	want := filepath.Join(storeDir, "calibrations", report.CalibrationID+".json")
+	if report.Installed != want {
+		t.Fatalf("installed = %q, want %q", report.Installed, want)
+	}
+	loaded, err := store.LoadCalibration(report.Installed)
+	if err != nil {
+		t.Fatalf("the installed document does not load: %v", err)
+	}
+	if loaded.ID != report.CalibrationID {
+		t.Fatalf("installed id %s != %s", loaded.ID, report.CalibrationID)
+	}
+
+	// Text output carries the same path.
+	text := runCalibrateCLI(t, []string{
+		"--store", storeDir, "calibrate", "--from", measured, "--install",
+	})
+	if !strings.Contains(text, "installed="+want) {
+		t.Fatalf("text output does not name the installed path: %s", text)
+	}
+}
+
+func TestCalibrateCLIInstallRejectsMalformedAndWritesNothing(t *testing.T) {
+	resetCalibrateGlobals(t)
+	dir := t.TempDir()
+	storeDir := filepath.Join(dir, "store")
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		t.Fatalf("store dir: %v", err)
+	}
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"schema":"weft.calibration.v1"}`), 0o644); err != nil {
+		t.Fatalf("write bad document: %v", err)
+	}
+	if err := runCalibrateCLIError(t, []string{
+		"--store", storeDir, "calibrate", "--from", bad, "--install",
+	}); err == nil {
+		t.Fatal("a malformed calibration was installed")
+	}
+	if _, err := os.Stat(filepath.Join(storeDir, "calibrations")); !os.IsNotExist(err) {
+		t.Fatalf("a malformed document created the calibration directory (err=%v)", err)
+	}
+}
+
+func TestCalibrateCLIInstallRefusesARemoteStore(t *testing.T) {
+	resetCalibrateGlobals(t)
+	if err := runCalibrateCLIError(t, []string{
+		"--backend", "gcs", "calibrate", "--install",
+	}); err == nil {
+		t.Fatal("calibrate --install accepted a remote backend")
+	}
+	if err := runCalibrateCLIError(t, []string{"calibrate", "--install"}); err == nil {
+		t.Fatal("calibrate --install accepted an empty store")
+	}
 }

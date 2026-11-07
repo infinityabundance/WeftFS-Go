@@ -23,7 +23,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/infinityabundance/WeftCodec-Go/hash"
 	"github.com/infinityabundance/WeftFS-Go/werr"
@@ -128,6 +130,51 @@ func (c *Calibration) WriteFile(path string) error {
 		return werr.Wrap(werr.Io, err, "calibration `%s`", path)
 	}
 	return nil
+}
+
+// Install atomically writes the validated document into
+// `<store>/calibrations/<id>.json`, matching Rust
+// `Calibration::install`. The directory is advisory: it is not part of the
+// frozen format and is ignored by replay, verify, and GC. Re-installing the
+// same document is idempotent because the file name is the content digest.
+func (c *Calibration) Install(storeDir string) (string, error) {
+	directory := filepath.Join(storeDir, "calibrations")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		return "", werr.Wrap(werr.Io, err, "cannot create calibration directory `%s`", directory)
+	}
+	path := filepath.Join(directory, c.ID+".json")
+	tmp := filepath.Join(directory, "."+c.ID+"."+strconv.Itoa(os.Getpid())+".tmp")
+	data, err := json.MarshalIndent(c.document, "", "  ")
+	if err != nil {
+		return "", calibrationError("cannot serialise calibration: %s", err)
+	}
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return "", werr.Wrap(werr.Io, err, "calibration `%s`", tmp)
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		_ = os.Remove(tmp)
+		return "", werr.Wrap(werr.Io, err, "calibration `%s`", tmp)
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		_ = os.Remove(tmp)
+		return "", werr.Wrap(werr.Io, err, "calibration `%s`", tmp)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return "", werr.Wrap(werr.Io, err, "calibration `%s`", tmp)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", werr.Wrap(werr.Io, err, "calibration `%s`", path)
+	}
+	if dir, err := os.Open(directory); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return path, nil
 }
 
 // Row returns one class's row.
