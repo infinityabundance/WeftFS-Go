@@ -58,16 +58,19 @@ const (
 	// PlaneS3 is an S3-compatible object endpoint. Every blob and control
 	// record maps to one logical key and is published with a conditional write.
 	PlaneS3 PlaneKind = "s3"
+	// PlaneGCS is a GCS-compatible JSON API endpoint. Compare-and-swap uses
+	// object generations (`ifGenerationMatch`), not ETags.
+	PlaneGCS PlaneKind = "gcs"
 )
 
-// ParsePlaneKind parses `local|object|posix|s3`.
+// ParsePlaneKind parses `local|object|posix|s3|gcs`.
 func ParsePlaneKind(text string) (PlaneKind, error) {
 	switch PlaneKind(text) {
-	case PlaneLocal, PlaneObject, PlanePosix, PlaneS3:
+	case PlaneLocal, PlaneObject, PlanePosix, PlaneS3, PlaneGCS:
 		return PlaneKind(text), nil
 	default:
 		return "", werr.Newf(werr.InvalidArgument,
-			"backend must be `local`, `object`, `posix`, or `s3` (got `%s`)", text)
+			"backend must be `local`, `object`, `posix`, `s3`, or `gcs` (got `%s`)", text)
 	}
 }
 

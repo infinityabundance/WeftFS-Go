@@ -127,6 +127,9 @@ type Options struct {
 	// S3 configures an S3-compatible endpoint. It is required when either
 	// BlobBackend or CommitBackend is `s3` and ignored otherwise.
 	S3 *S3Config
+	// GCS configures a GCS-compatible endpoint. It is required when either
+	// BlobBackend or CommitBackend is `gcs` and ignored otherwise.
+	GCS *GCSConfig
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -309,6 +312,15 @@ func validateOptions(opts Options) error {
 			return err
 		}
 	}
+	if opts.BlobBackend == PlaneGCS || opts.CommitBackend == PlaneGCS {
+		if opts.GCS == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `gcs` plane needs endpoint, bucket, and exactly one credential form")
+		}
+		if err := opts.GCS.Validate(); err != nil {
+			return err
+		}
+	}
 	if opts.BlobRoot != "" && opts.BlobBackend == PlanePosix {
 		return werr.Newf(werr.InvalidArgument, "a `posix` blob plane cannot be given an explicit root")
 	}
@@ -446,13 +458,13 @@ func Init(path string, opts Options) (*Store, error) {
 			blobKind = PlaneLocal
 		}
 	}
-	if commitKind != PlaneS3 && path == "" {
+	if commitKind != PlaneS3 && commitKind != PlaneGCS && path == "" {
 		return nil, werr.Newf(werr.InvalidArgument, "a local commit plane needs a store directory")
 	}
-	if blobKind != PlaneS3 && opts.BlobRoot == "" && path == "" {
+	if blobKind != PlaneS3 && blobKind != PlaneGCS && opts.BlobRoot == "" && path == "" {
 		return nil, werr.Newf(werr.InvalidArgument, "a local blob plane needs a store directory or --blob-root")
 	}
-	if commitKind != PlaneS3 {
+	if commitKind != PlaneS3 && commitKind != PlaneGCS {
 		info, err := os.Stat(path)
 		if err == nil {
 			if !info.IsDir() {
@@ -691,6 +703,15 @@ func (s *Store) S3Stats() (S3StatsSnapshot, bool) {
 	return S3StatsSnapshot{}, false
 }
 
+// GCSStats reports the shared GCS client's HTTP counters when either plane is
+// GCS. It is host-local diagnostic evidence, not a performance claim.
+func (s *Store) GCSStats() (GCSStatsSnapshot, bool) {
+	if provider, ok := s.commits.(interface{ GCSStats() GCSStatsSnapshot }); ok {
+		return provider.GCSStats(), true
+	}
+	return GCSStatsSnapshot{}, false
+}
+
 // PackStats reports this handle's pack-plane counters when packing is enabled.
 func (s *Store) PackStats() (PackStats, bool) {
 	if s.packed == nil {
@@ -740,16 +761,35 @@ func (s *Store) buildPlanes() error {
 		}
 		client = created
 	}
+	var gcs *gcsClient
+	if blobKind == PlaneGCS || commitKind == PlaneGCS {
+		if s.options.GCS == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `gcs` plane needs an endpoint, bucket, and exactly one credential form (--gcs-endpoint/--gcs-bucket/--gcs-token/--gcs-credentials/--gcs-anonymous or WEFT_GCS_*/GOOGLE_*)")
+		}
+		created, err := newGCSClient(*s.options.GCS)
+		if err != nil {
+			return err
+		}
+		gcs = created
+	}
 
 	var access BlobAccess
 	var prober blobProber
-	if blobKind == PlaneS3 {
+	switch blobKind {
+	case PlaneS3:
 		plane := newS3BlobPlane(client)
 		access = plane
 		prober = plane
 		blobRoot = plane.Root()
 		s.remoteBlob = true
-	} else {
+	case PlaneGCS:
+		plane := newGCSBlobPlane(gcs)
+		access = plane
+		prober = plane
+		blobRoot = plane.Root()
+		s.remoteBlob = true
+	default:
 		blobs, err := newFlatBlobPlane(blobRoot, blobKind)
 		if err != nil {
 			return err
@@ -760,11 +800,16 @@ func (s *Store) buildPlanes() error {
 
 	var commits ControlVolume
 	var control ControlPlane
-	if commitKind == PlaneS3 {
+	switch commitKind {
+	case PlaneS3:
 		plane := newS3Control(client)
 		commits = plane
 		control = plane
-	} else {
+	case PlaneGCS:
+		plane := newGCSControl(gcs)
+		commits = plane
+		control = plane
+	default:
 		local, err := newLocalControl(s.root, commitKind)
 		if err != nil {
 			return err

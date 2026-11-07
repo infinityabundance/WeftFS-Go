@@ -53,10 +53,13 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto|overlay]
               [--content-identity whole-file|merkle] [--codec-min-bytes N]
               [--quota SPEC] [--quota-file FILE]
-              [--backend local|object|posix|s3]
+              [--backend local|object|posix|s3|gcs]
               [--blob-backend KIND] [--commit-backend KIND] [--blob-root DIR]
               [--s3-endpoint URL] [--s3-bucket NAME] [--s3-region REGION]
               [--s3-access-key KEY] [--s3-secret-key SECRET] [--s3-session-token TOKEN]
+              [--gcs-endpoint URL] [--gcs-bucket NAME] [--gcs-token TOKEN]
+              [--gcs-credentials FILE] [--gcs-project PROJECT] [--gcs-scope SCOPE]
+              [--gcs-anonymous]
               <command> [args]
 
 commands:
@@ -64,10 +67,13 @@ commands:
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
   context causal uri tensor quota merge rebase compact calibrate
 
---store is optional when either plane is s3; the store is then addressed by
-bucket. An s3 plane requires an endpoint, bucket, and credentials (flags or
-WEFT_S3_*/AWS_*). A writable open probes the endpoint's conditional writes and
-refuses one that cannot prove create-once and compare-and-swap.
+--store is optional when either plane is s3 or gcs; the store is then
+addressed by bucket. A gcs plane accepts exactly one credential form: a
+bearer token (--gcs-token or WEFT_GCS_ACCESS_TOKEN/GOOGLE_OAUTH_ACCESS_TOKEN),
+a service-account key (--gcs-credentials or WEFT_GCS_CREDENTIALS/
+GOOGLE_APPLICATION_CREDENTIALS), or --gcs-anonymous for an emulator. A
+writable open probes the endpoint's generation preconditions and refuses one
+that cannot prove create-once and compare-and-swap.
 `)
 }
 
@@ -115,6 +121,15 @@ var (
 	s3AccessKey    string
 	s3SecretKey    string
 	s3SessionToken string
+	// GCS endpoint, bucket, and credential form. Exactly one of token,
+	// credentials, or anonymous may resolve.
+	gcsEndpoint    string
+	gcsBucket      string
+	gcsToken       string
+	gcsProject     string
+	gcsAnonymous   bool
+	gcsCredentials string
+	gcsScope       string
 	// Pack-plane policy. `--pack` enables it; the bounds default to the Rust
 	// values and are always validated.
 	packing      bool
@@ -165,11 +180,12 @@ func applyPlanePolicy(opts *store.Options) {
 	}
 }
 
-// remotePlaneConfigured reports whether either plane is S3, in which case a
-// local store directory is optional.
+// remotePlaneConfigured reports whether either plane is remote, in which case
+// a local store directory is optional.
 func remotePlaneConfigured() bool {
 	blob, commit := effectivePlanes()
-	return blob == store.PlaneS3 || commit == store.PlaneS3
+	return blob == store.PlaneS3 || commit == store.PlaneS3 ||
+		blob == store.PlaneGCS || commit == store.PlaneGCS
 }
 
 // applyS3Policy resolves the S3 configuration when either plane is S3. A
@@ -177,13 +193,33 @@ func remotePlaneConfigured() bool {
 func applyS3Policy(opts *store.Options) error {
 	if !remotePlaneConfigured() {
 		opts.S3 = nil
+		opts.GCS = nil
 		return nil
 	}
-	config, err := store.ResolveS3(s3Endpoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey, s3SessionToken)
-	if err != nil {
-		return err
+	blob, commit := effectivePlanes()
+	if blob == store.PlaneS3 || commit == store.PlaneS3 {
+		config, err := store.ResolveS3(s3Endpoint, s3Bucket, s3Region, s3AccessKey, s3SecretKey, s3SessionToken)
+		if err != nil {
+			return err
+		}
+		opts.S3 = &config
+	} else {
+		opts.S3 = nil
 	}
-	opts.S3 = &config
+	if blob == store.PlaneGCS || commit == store.PlaneGCS {
+		var anonymous *bool
+		if gcsAnonymous {
+			value := true
+			anonymous = &value
+		}
+		config, err := store.ResolveGCS(gcsEndpoint, gcsBucket, gcsToken, gcsProject, anonymous, gcsCredentials, gcsScope)
+		if err != nil {
+			return err
+		}
+		opts.GCS = &config
+	} else {
+		opts.GCS = nil
+	}
 	return nil
 }
 
@@ -408,6 +444,56 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 			}
 			s3SessionToken = value
 			i += consumed
+		case args[i] == "--gcs-endpoint" || strings.HasPrefix(args[i], "--gcs-endpoint="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-endpoint")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsEndpoint = value
+			i += consumed
+		case args[i] == "--gcs-bucket" || strings.HasPrefix(args[i], "--gcs-bucket="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-bucket")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsBucket = value
+			i += consumed
+		case args[i] == "--gcs-token" || strings.HasPrefix(args[i], "--gcs-token="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-token")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsToken = value
+			i += consumed
+		case args[i] == "--gcs-project" || strings.HasPrefix(args[i], "--gcs-project="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-project")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsProject = value
+			i += consumed
+		case args[i] == "--gcs-credentials" || strings.HasPrefix(args[i], "--gcs-credentials="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-credentials")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsCredentials = value
+			i += consumed
+		case args[i] == "--gcs-scope" || strings.HasPrefix(args[i], "--gcs-scope="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--gcs-scope")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			gcsScope = value
+			i += consumed
+		case args[i] == "--gcs-anonymous":
+			gcsAnonymous = true
+		case strings.HasPrefix(args[i], "--gcs-anonymous="):
+			value, parseErr := strconv.ParseBool(strings.TrimPrefix(args[i], "--gcs-anonymous="))
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--gcs-anonymous must be true or false")
+			}
+			gcsAnonymous = value
 		case args[i] == "--planner-cost-model" || args[i] == "-planner-cost-model":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--planner-cost-model requires a value")

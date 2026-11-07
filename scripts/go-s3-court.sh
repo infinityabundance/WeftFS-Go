@@ -28,9 +28,11 @@ weft_root="$(cd "$repo_root/.." && pwd)"
 cd "$repo_root"
 
 focused_only=0
+run_full=1
 for arg in "$@"; do
   case "$arg" in
-    --focused-only) focused_only=1 ;;
+    --focused-only) focused_only=1; run_full=0 ;;
+    --no-full) run_full=0 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "unknown argument '$arg'" >&2; exit 64 ;;
   esac
@@ -153,6 +155,7 @@ docker_server="$(docker version --format '{{.Server.Version}}')"
 focused_log="bench/receipts/go-s3-focused-${stamp}.log"
 full_log="bench/receipts/go-s3-full-${stamp}.log"
 xlang_log="bench/receipts/go-s3-xlang-${stamp}.log"
+mount_log="bench/receipts/go-s3-fuse-${stamp}.log"
 
 echo "go-s3-court: MinIO $minio_release sha256=$actual_sha256 endpoint=$endpoint prefix=$prefix" >&2
 
@@ -169,7 +172,7 @@ if [[ $focused_status -ne 0 ]]; then
   exit 1
 fi
 
-if [[ "$focused_only" == 0 ]]; then
+if [[ "$run_full" == 1 ]]; then
   echo "go-s3-court: full -race suite in the fuse court" >&2
   set +e
   "$weft_root/scripts/docker-court.sh" fuse \
@@ -183,27 +186,42 @@ if [[ "$focused_only" == 0 ]]; then
     exit 1
   fi
 
-	echo "go-s3-court: building the Rust CLI at $weft_root (fuse court)" >&2
-	"$weft_root/scripts/docker-court.sh" fuse \
-	  "cd /work && cargo build --release --features fuse --bin weftfs" >&2
-	rust_bin="$weft_root/.docker-cache/target-rust/release/weftfs"
-	if [[ ! -x "$rust_bin" ]]; then
-	  echo "go-s3-court: Rust CLI was not produced at $rust_bin" >&2
-	  exit 1
-	fi
+  echo "go-s3-court: building the Rust CLI at $weft_root (fuse court)" >&2
+  "$weft_root/scripts/docker-court.sh" fuse \
+    "cd /work && cargo build --release --features fuse --bin weftfs" >&2
+  rust_bin="$weft_root/.docker-cache/target-rust/release/weftfs"
+  if [[ ! -x "$rust_bin" ]]; then
+    echo "go-s3-court: Rust CLI was not produced at $rust_bin" >&2
+    exit 1
+  fi
 
-	echo "go-s3-court: bidirectional cross-language leg (fuse court: Rust links libfuse3)" >&2
-	export WEFT_XLANG_PREFIX="$prefix"
-	export WEFT_XLANG_GIT_REV="$go_rev"
-	set +e
-	"$weft_root/scripts/docker-court.sh" fuse \
-	  "cd /work/WeftFS-Go && CGO_ENABLED=0 go build -o /work/.docker-cache/weftfs-go-xlang ./cmd/weftfs && WEFT_XLANG_GO_BIN=/work/.docker-cache/weftfs-go-xlang WEFT_XLANG_RUST_BIN=/work/.docker-cache/target-rust/release/weftfs bash scripts/go-s3-xlang.sh" \
-	  >"$xlang_log" 2>&1
+  echo "go-s3-court: bidirectional cross-language leg (fuse court: Rust links libfuse3)" >&2
+  export WEFT_XLANG_PREFIX="$prefix"
+  export WEFT_XLANG_GIT_REV="$go_rev"
+  set +e
+  "$weft_root/scripts/docker-court.sh" fuse \
+    "cd /work/WeftFS-Go && CGO_ENABLED=0 go build -o /work/.docker-cache/weftfs-go-xlang ./cmd/weftfs && WEFT_XLANG_GO_BIN=/work/.docker-cache/weftfs-go-xlang WEFT_XLANG_RUST_BIN=/work/.docker-cache/target-rust/release/weftfs bash scripts/go-s3-xlang.sh" \
+    >"$xlang_log" 2>&1
   xlang_status=$?
   set -e
   cat "$xlang_log" >&2
   if [[ $xlang_status -ne 0 ]]; then
     echo "go-s3-court: cross-language leg failed (log $xlang_log)" >&2
+    exit 1
+  fi
+fi
+
+if [[ "$focused_only" == 0 ]]; then
+  echo "go-s3-court: read-only FUSE mount over S3 (fuse court)" >&2
+  set +e
+  "$weft_root/scripts/docker-court.sh" fuse \
+    "cd /work/WeftFS-Go && bash scripts/go-object-fuse-court.sh s3" \
+    >"$mount_log" 2>&1
+  mount_status=$?
+  set -e
+  cat "$mount_log" >&2
+  if [[ $mount_status -ne 0 ]]; then
+    echo "go-s3-court: FUSE-over-S3 leg failed (log $mount_log)" >&2
     exit 1
   fi
 fi
@@ -217,13 +235,22 @@ measured_form="$(grep -o 'measured If-Match form: [a-z-]*' "$focused_log" | sed 
 full_passed=0
 full_failed=0
 xlang_checks=0
+fuse_files=0
+fuse_shas=0
+fuse_listing_digest="not recorded"
 logs_json="\"$focused_log\""
 if [[ "$focused_only" == 0 ]]; then
+  fuse_files="$(grep -o 'files=[0-9]*' "$mount_log" | head -1 | cut -d= -f2 || true)"
+  fuse_shas="$(grep -o 'sha_matches=[0-9]*' "$mount_log" | head -1 | cut -d= -f2 || true)"
+  fuse_listing_digest="$(grep -o 'listing_digest=[a-f0-9]*' "$mount_log" | head -1 | cut -d= -f2 || true)"
+  logs_json="$logs_json, \"$mount_log\""
+fi
+if [[ "$run_full" == 1 ]]; then
   # `go test ./...` without -v prints one `ok`/`FAIL` line per package.
   full_passed="$(grep -c '^ok[[:space:]]' "$full_log" || true)"
   full_failed="$(grep -c '^FAIL' "$full_log" || true)"
   xlang_checks="$(grep -c -- '^XLANG:' "$xlang_log" || true)"
-  logs_json="$logs_json, \"$full_log\", \"$xlang_log\""
+  logs_json="\"$focused_log\", \"$full_log\", \"$xlang_log\", \"$mount_log\""
 fi
 
 receipt="bench/receipts/go-s3-${stamp}.json"
@@ -264,15 +291,18 @@ cat > "$receipt" <<JSON
     "focused_passed": $focused_passed,
     "focused_failed": $focused_failed,
     "focused_skipped": $focused_skipped,
-    "full_command": "$(if [[ "$focused_only" == 0 ]]; then echo "go test -race -count=1 ./... in the fuse court"; else echo "not run (--focused-only)"; fi)",
+    "full_command": "$(if [[ "$run_full" == 1 ]]; then echo "go test -race -count=1 ./... in the fuse court"; else echo "not run (--no-full)"; fi)",
     "full_passed": $full_passed,
     "full_failed": $full_failed,
     "full_count_kind": "packages reporting ok",
     "cross_language_checks": $xlang_checks,
     "measured_if_match_form": "${measured_form:-not recorded}",
+    "fuse_read_only_files": $fuse_files,
+    "fuse_read_only_sha256_matches": $fuse_shas,
+    "fuse_read_only_listing_digest": "$fuse_listing_digest",
     "logs": [$logs_json]
   },
-  "label": "Single-node MinIO on loopback in the OOM-protected Docker court with a tmpfs data directory. Not a cloud, multi-node, fleet, device-cache, media, power-loss, or production claim."
+  "label": "Single-node MinIO on loopback in the OOM-protected Docker court with a tmpfs data directory. Not a cloud, multi-node, fleet, device-cache, media, power-loss, or production claim. The FUSE leg is a read-only mount; no writable FUSE-over-object claim is made."
 }
 JSON
 

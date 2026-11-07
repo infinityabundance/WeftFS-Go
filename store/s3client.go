@@ -50,7 +50,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/infinityabundance/WeftCodec-Go/hash"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
@@ -903,228 +902,30 @@ func (l publishedLock) isLive(nowNS int64) bool {
 
 // attestedHead returns the head the record names, when it names a complete one.
 func (l publishedLock) attestedHead() (uint64, model.Hash32, bool) {
-	if l.pendingGeneration == 0 || l.pendingCommit == "" || l.pendingCommit == "-" {
+	if l.pendingGeneration == 0 {
 		return 0, model.Hash32{}, false
 	}
-	commit, err := hash.FromHex(l.pendingCommit)
-	if err != nil {
+	commit, ok := attestedCommit(l.pendingCommit)
+	if !ok {
 		return 0, model.Hash32{}, false
 	}
 	return l.pendingGeneration, commit, true
 }
 
 func encodeS3Lock(owner string, fence, sequence uint64, deadlineNS, renewedNS int64, pendingGeneration uint64, pendingCommit string, pendingCommitLen uint64) string {
-	if pendingCommit == "" {
-		pendingCommit = "-"
-	}
-	if pendingGeneration == 0 {
-		pendingCommitLen = 0
-	}
-	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nlease_deadline_ns=%d\nrenewed_ns=%d\npending_generation=%d\npending_commit=%s\npending_commit_len=%d\n",
-		s3LockSchema, owner, fence, sequence, deadlineNS, renewedNS, pendingGeneration, pendingCommit, pendingCommitLen)
+	return encodeFenceLock(s3FenceSchemas, owner, fence, sequence, deadlineNS, renewedNS, pendingGeneration, pendingCommit, pendingCommitLen)
 }
 
 func encodeS3Released(owner string, fence, sequence uint64, releasedNS int64, releasedFrom string, pendingGeneration uint64, pendingCommit string, pendingCommitLen uint64) string {
-	if pendingCommit == "" {
-		pendingCommit = "-"
-	}
-	if pendingGeneration == 0 {
-		pendingCommitLen = 0
-	}
-	return fmt.Sprintf("%s\nowner=%s\nfence=%d\nsequence=%d\nreleased_ns=%d\nreleased_from=%s\npending_generation=%d\npending_commit=%s\npending_commit_len=%d\n",
-		s3ReleasedSchema, owner, fence, sequence, releasedNS, releasedFrom, pendingGeneration, pendingCommit, pendingCommitLen)
+	return encodeFenceReleased(s3FenceSchemas, owner, fence, sequence, releasedNS, releasedFrom, pendingGeneration, pendingCommit, pendingCommitLen)
 }
 
 // parseS3Lock accepts the v3 publication record, the fenced v2 record, the
 // legacy v1 record (fence 0), and both released tombstones. It is a direct port
-// of Rust `writer_fence::parse_lock`.
+// of Rust `writer_fence::parse_lock`; the shared body lives in
+// `fence_record.go`.
 func parseS3Lock(bytes []byte) (publishedLock, bool) {
-	var out publishedLock
-	text := string(bytes)
-	lines := strings.Split(text, "\n")
-	if len(lines) == 0 {
-		return out, false
-	}
-	header := lines[0]
-	fields := map[string]string{}
-	for _, line := range lines[1:] {
-		if line == "" {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			return out, false
-		}
-		fields[key] = value
-	}
-	number := func(key string) (int64, bool) {
-		value, ok := fields[key]
-		if !ok {
-			return 0, false
-		}
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return parsed, true
-	}
-	unsigned := func(key string) (uint64, bool) {
-		value, ok := fields[key]
-		if !ok {
-			return 0, false
-		}
-		parsed, err := strconv.ParseUint(value, 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return parsed, true
-	}
-	switch header {
-	case s3LockSchema:
-		owner, ok := fields["owner"]
-		if !ok {
-			return out, false
-		}
-		fence, ok := unsigned("fence")
-		if !ok {
-			return out, false
-		}
-		sequence, ok := unsigned("sequence")
-		if !ok {
-			return out, false
-		}
-		deadline, ok := number("lease_deadline_ns")
-		if !ok {
-			return out, false
-		}
-		renewed, ok := number("renewed_ns")
-		if !ok {
-			return out, false
-		}
-		pending, ok := unsigned("pending_generation")
-		if !ok {
-			return out, false
-		}
-		pendingLen, ok := unsigned("pending_commit_len")
-		if !ok {
-			return out, false
-		}
-		commit, ok := fields["pending_commit"]
-		if !ok {
-			commit = "-"
-		}
-		return publishedLock{
-			schemaVersion: 3,
-			owner:         owner, fence: fence, sequence: sequence, deadlineNS: deadline,
-			renewedNS: renewed, pendingGeneration: pending, pendingCommit: commit,
-			pendingCommitLen: pendingLen,
-		}, true
-	case s3LockSchemaV2:
-		owner, ok := fields["owner"]
-		if !ok {
-			return out, false
-		}
-		fence, ok := unsigned("fence")
-		if !ok {
-			return out, false
-		}
-		sequence, ok := unsigned("sequence")
-		if !ok {
-			return out, false
-		}
-		deadline, ok := number("lease_deadline_ns")
-		if !ok {
-			return out, false
-		}
-		renewed, ok := number("renewed_ns")
-		if !ok {
-			return out, false
-		}
-		pending, ok := unsigned("pending_generation")
-		if !ok {
-			return out, false
-		}
-		commit, ok := fields["pending_commit"]
-		if !ok {
-			commit = "-"
-		}
-		return publishedLock{
-			schemaVersion: 2,
-			owner:         owner, fence: fence, sequence: sequence, deadlineNS: deadline,
-			renewedNS: renewed, pendingGeneration: pending, pendingCommit: commit,
-		}, true
-	case s3LockSchemaV1:
-		owner, ok := fields["owner"]
-		if !ok {
-			return out, false
-		}
-		deadline, ok := number("expires_ns")
-		if !ok {
-			return out, false
-		}
-		return publishedLock{schemaVersion: 1, owner: owner, deadlineNS: deadline, pendingCommit: "-"}, true
-	case s3ReleasedSchema:
-		owner, ok := fields["owner"]
-		if !ok {
-			return out, false
-		}
-		fence, ok := unsigned("fence")
-		if !ok {
-			return out, false
-		}
-		sequence, ok := unsigned("sequence")
-		if !ok {
-			return out, false
-		}
-		released, ok := number("released_ns")
-		if !ok {
-			return out, false
-		}
-		pending, ok := unsigned("pending_generation")
-		if !ok {
-			return out, false
-		}
-		pendingLen, ok := unsigned("pending_commit_len")
-		if !ok {
-			return out, false
-		}
-		commit, ok := fields["pending_commit"]
-		if !ok {
-			commit = "-"
-		}
-		return publishedLock{
-			schemaVersion: 3,
-			owner:         owner, fence: fence, sequence: sequence, deadlineNS: released,
-			renewedNS: released, pendingGeneration: pending, pendingCommit: commit,
-			pendingCommitLen: pendingLen, released: true,
-			releasedFrom: fields["released_from"],
-		}, true
-	case s3ReleasedSchemaV1:
-		owner, ok := fields["owner"]
-		if !ok {
-			return out, false
-		}
-		fence, ok := unsigned("fence")
-		if !ok {
-			return out, false
-		}
-		sequence, ok := unsigned("sequence")
-		if !ok {
-			return out, false
-		}
-		released, ok := number("released_ns")
-		if !ok {
-			return out, false
-		}
-		return publishedLock{
-			schemaVersion: 2,
-			owner:         owner, fence: fence, sequence: sequence, deadlineNS: released,
-			renewedNS: released, pendingCommit: "-", released: true,
-			releasedFrom: fields["released_from"],
-		}, true
-	default:
-		return out, false
-	}
+	return parseFenceLock(bytes, s3FenceSchemas)
 }
 
 // describeObserved is the non-deciding diagnostic sentence on a refused
