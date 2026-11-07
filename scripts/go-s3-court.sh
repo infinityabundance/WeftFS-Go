@@ -183,22 +183,22 @@ if [[ "$focused_only" == 0 ]]; then
     exit 1
   fi
 
-  echo "go-s3-court: building the Rust CLI at $weft_root" >&2
-  "$weft_root/scripts/docker-court.sh" rust \
-    "cd /work && cargo build --release --features fuse --bin weftfs" >&2
-  rust_bin="$weft_root/.docker-cache/target-rust/release/weftfs"
-  if [[ ! -x "$rust_bin" ]]; then
-    echo "go-s3-court: Rust CLI was not produced at $rust_bin" >&2
-    exit 1
-  fi
+	echo "go-s3-court: building the Rust CLI at $weft_root (fuse court)" >&2
+	"$weft_root/scripts/docker-court.sh" fuse \
+	  "cd /work && cargo build --release --features fuse --bin weftfs" >&2
+	rust_bin="$weft_root/.docker-cache/target-rust/release/weftfs"
+	if [[ ! -x "$rust_bin" ]]; then
+	  echo "go-s3-court: Rust CLI was not produced at $rust_bin" >&2
+	  exit 1
+	fi
 
-  echo "go-s3-court: bidirectional cross-language leg" >&2
-  export WEFT_XLANG_PREFIX="$prefix"
-  export WEFT_XLANG_GIT_REV="$go_rev"
-  set +e
-  "$weft_root/scripts/docker-court.sh" go \
-    "cd /work/WeftFS-Go && go build -o /work/.docker-cache/weftfs-go-xlang ./cmd/weftfs && WEFT_XLANG_GO_BIN=/work/.docker-cache/weftfs-go-xlang WEFT_XLANG_RUST_BIN=/work/.docker-cache/target-rust/release/weftfs bash scripts/go-s3-xlang.sh" \
-    >"$xlang_log" 2>&1
+	echo "go-s3-court: bidirectional cross-language leg (fuse court: Rust links libfuse3)" >&2
+	export WEFT_XLANG_PREFIX="$prefix"
+	export WEFT_XLANG_GIT_REV="$go_rev"
+	set +e
+	"$weft_root/scripts/docker-court.sh" fuse \
+	  "cd /work/WeftFS-Go && CGO_ENABLED=0 go build -o /work/.docker-cache/weftfs-go-xlang ./cmd/weftfs && WEFT_XLANG_GO_BIN=/work/.docker-cache/weftfs-go-xlang WEFT_XLANG_RUST_BIN=/work/.docker-cache/target-rust/release/weftfs bash scripts/go-s3-xlang.sh" \
+	  >"$xlang_log" 2>&1
   xlang_status=$?
   set -e
   cat "$xlang_log" >&2
@@ -219,8 +219,9 @@ full_failed=0
 xlang_checks=0
 logs_json="\"$focused_log\""
 if [[ "$focused_only" == 0 ]]; then
-  full_passed="$(grep -c -- '--- PASS' "$full_log" || true)"
-  full_failed="$(grep -c -- '--- FAIL' "$full_log" || true)"
+  # `go test ./...` without -v prints one `ok`/`FAIL` line per package.
+  full_passed="$(grep -c '^ok[[:space:]]' "$full_log" || true)"
+  full_failed="$(grep -c '^FAIL' "$full_log" || true)"
   xlang_checks="$(grep -c -- '^XLANG:' "$xlang_log" || true)"
   logs_json="$logs_json, \"$full_log\", \"$xlang_log\""
 fi
@@ -266,6 +267,7 @@ cat > "$receipt" <<JSON
     "full_command": "$(if [[ "$focused_only" == 0 ]]; then echo "go test -race -count=1 ./... in the fuse court"; else echo "not run (--focused-only)"; fi)",
     "full_passed": $full_passed,
     "full_failed": $full_failed,
+    "full_count_kind": "packages reporting ok",
     "cross_language_checks": $xlang_checks,
     "measured_if_match_form": "${measured_form:-not recorded}",
     "logs": [$logs_json]

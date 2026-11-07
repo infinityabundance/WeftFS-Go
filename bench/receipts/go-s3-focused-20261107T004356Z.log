@@ -1,0 +1,39 @@
++ exec docker run --rm --init --name weft-go-court-3374996 --memory=3g --memory-swap=3g --pids-limit=1024 --cpus=4 --ulimit nofile=65536:65536 --security-opt no-new-privileges --tmpfs /tmp:rw,size=1g,nosuid,nodev --cap-drop=ALL -e WEFT_IN_COURT=1 -e WEFT_COURT_IMAGE=weft/go-court:1 -e WEFT_COURT_KERNEL=7.3.1-1-cachyos -e WEFT_COURT_IMAGE_ID=sha256:ace88700bc27c45294a8d9d808ee163bbe888f35354ef9dea237b362c026f166 -e WEFT_COURT_MEMORY=3g -e WEFT_COURT_CPUS=4 -e WEFT_COURT_PIDS=1024 -e WEFT_COURT_NPROC=2048 -e WEFT_DOCKER_SERVER=29.9.2 -e WEFT_DOCKER_CLIENT=29.1.5 -e WEFT_REPO_WEFTFS=28137ecd63282d07f8e10afc1de0385fa65c72b8 -e WEFT_REPO_WEFTFS_GO=6fc87ccec0fb7ef8b8bc5e2b59b96fd3420713e7 -e WEFT_REPO_WEFTCODEC=57288e1f70c30edb58308a4f06aa7523d23f0d56 -e WEFT_REPO_WEFTCODEC_GO=86ded1edf5ca8c62ffd61687a572e924044f0c70 -e RUST_BACKTRACE=1 -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/work/.docker-cache/target-rust -e CARGO_NET_RETRY=3 -e GOCACHE=/work/.docker-cache/go-build -e GOMODCACHE=/work/.docker-cache/go-mod -e 'GOFLAGS=-p=2 -buildvcs=false' -e GOTMPDIR=/work/.docker-cache/go-tmp -e GOMAXPROCS=4 -v /mnt/1tb_kingston/WeftFS:/work -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-registry:/cargo/registry -v /mnt/1tb_kingston/WeftFS/.docker-cache/cargo-git:/cargo/git -w /work -e WEFT_S3_ENDPOINT=http://weft-go-s3-minio-3374632:9000 -e WEFT_S3_REGION=us-east-1 -e WEFT_S3_ACCESS_KEY=weftcourt -e WEFT_S3_SECRET_KEY=weftcourt-secret -e WEFT_S3_LOCK_LEASE_SECS=60 -e WEFT_S3_TEST_ENDPOINT=http://weft-go-s3-minio-3374632:9000 -e WEFT_S3_TEST_PREFIX=weft-go-s3-20261107t004356z -e 'WEFT_S3_SERVER_LABEL=minio version RELEASE.2025-04-22T22-12-26Z (commit-id=0d7408fc9969caf07de6a8c3a84f9fbb10a6739e)' -e WEFT_S3_SERVER_VERSION=RELEASE.2025-04-22T22-12-26Z -e WEFT_S3_SERVER_SHA256=53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c -e WEFT_S3_CONTAINER_IMAGE=debian@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc --network weft-go-s3-net-3374632 weft/go-court:1 bash -c 'set -Eeuo pipefail; ulimit -n 65536; ulimit -u 2048; export TMPDIR=/tmp; cd /work; cd /work/WeftFS-Go && gofmt -l . && go vet ./... && CGO_ENABLED=0 go build ./... && go test -race -count=1 -v -run '\''TestS3|TestSigV4|TestCanonicalQuery|TestPathAndComponent|TestIfMatchForms|TestLockRecord|TestSchemasDoNot|TestS3Config'\'' ./store/'
+=== RUN   TestS3BlobPlaneCreateOnceRangesAndListing
+--- PASS: TestS3BlobPlaneCreateOnceRangesAndListing (0.01s)
+=== RUN   TestS3CommitVolumeConditionalRecords
+    s3_integration_test.go:250: measured If-Match form: quoted-as-returned
+--- PASS: TestS3CommitVolumeConditionalRecords (0.02s)
+=== RUN   TestS3FencedWriterTakeover
+--- PASS: TestS3FencedWriterTakeover (1.27s)
+=== RUN   TestS3StoreRoundTrip
+--- PASS: TestS3StoreRoundTrip (0.14s)
+=== RUN   TestS3SplitLayouts
+--- PASS: TestS3SplitLayouts (0.03s)
+=== RUN   TestS3CrashChildProcess
+    s3_integration_test.go:619: S3 crash helper process; not run directly
+--- SKIP: TestS3CrashChildProcess (0.00s)
+=== RUN   TestS3CrashProxy
+=== RUN   TestS3CrashProxy/after_objects
+=== RUN   TestS3CrashProxy/after_commit_file
+=== RUN   TestS3CrashProxy/after_superblock_write
+--- PASS: TestS3CrashProxy (0.16s)
+    --- PASS: TestS3CrashProxy/after_objects (0.05s)
+    --- PASS: TestS3CrashProxy/after_commit_file (0.05s)
+    --- PASS: TestS3CrashProxy/after_superblock_write (0.06s)
+=== RUN   TestSigV4MatchesThePublishedAWSVector
+--- PASS: TestSigV4MatchesThePublishedAWSVector (0.00s)
+=== RUN   TestCanonicalQueryEncodesAndSortsLikeAWS
+--- PASS: TestCanonicalQueryEncodesAndSortsLikeAWS (0.00s)
+=== RUN   TestPathAndComponentEncodingPreserveOnlyUnreservedBytes
+--- PASS: TestPathAndComponentEncodingPreserveOnlyUnreservedBytes (0.00s)
+=== RUN   TestIfMatchFormsEncodeETags
+--- PASS: TestIfMatchFormsEncodeETags (0.00s)
+=== RUN   TestLockRecordRoundTripsLegacyAndTombstone
+--- PASS: TestLockRecordRoundTripsLegacyAndTombstone (0.00s)
+=== RUN   TestSchemasDoNotParseAcrossBackends
+--- PASS: TestSchemasDoNotParseAcrossBackends (0.00s)
+=== RUN   TestS3ConfigResolutionAndValidation
+--- PASS: TestS3ConfigResolutionAndValidation (0.00s)
+PASS
+ok  	github.com/infinityabundance/WeftFS-Go/store	2.650s

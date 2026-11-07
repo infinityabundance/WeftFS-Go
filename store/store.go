@@ -671,6 +671,15 @@ func (s *Store) BlobRoot() string { return s.blobRoot }
 // Planes reports the routed planes and their probe evidence.
 func (s *Store) Planes() PlaneReport { return s.planeReport }
 
+// S3Stats reports the shared S3 client's HTTP counters when either plane is
+// S3. It is host-local diagnostic evidence, not a performance claim.
+func (s *Store) S3Stats() (S3StatsSnapshot, bool) {
+	if provider, ok := s.commits.(interface{ S3Stats() S3StatsSnapshot }); ok {
+		return provider.S3Stats(), true
+	}
+	return S3StatsSnapshot{}, false
+}
+
 // PackStats reports this handle's pack-plane counters when packing is enabled.
 func (s *Store) PackStats() (PackStats, bool) {
 	if s.packed == nil {

@@ -896,3 +896,147 @@ Parity with the Rust store; normative layout in `spec/WEFT-QUOTA.md`.
   exercise a store-side mode-15 read path because Go has no writer); the FUSE
   test does not cover a packed *writable* mount (all mounts are `--read-only`);
   no power-loss, multi-host, or fleet claim.
+
+## R25 — S3-compatible backend in Go (2026-11-07)
+
+The largest remaining dual-implementation gap is closed: Go now has a real
+S3-compatible backend, not a local directory posing as one. Rust remains the
+normative reference (`src/s3.rs`, `src/writer_fence.rs`) and its behaviour was
+ported rather than reinvented. No parent Rust file and no submodule pin was
+changed.
+
+### What is implemented (requirement by requirement)
+
+1. **SigV4 over the standard library.** `store/s3client.go` signs with
+   `crypto/hmac` + `crypto/sha256`; no new dependency. Canonical path and query
+   follow the Rust spelling (`%`-encoding with `%20`, `/` preserved in paths,
+   component-encoded and sorted query). `host`, `x-amz-content-sha256`,
+   `x-amz-date`, `x-amz-security-token`, and every extra header
+   (`range`, `if-match`, `if-none-match`) are signed. Empty bodies hash to the
+   standard empty SHA-256. `TestSigV4MatchesThePublishedAWSVector` pins the
+   canonical request, string to sign, and signature against the AWS "GET
+   Object" example. Config resolution is `WEFT_S3_*` first, then `AWS_*`, with
+   explicit `--s3-endpoint/--s3-bucket/--s3-region/--s3-access-key/
+   --s3-secret-key/--s3-session-token` winning. Path-style addressing is used
+   for a custom endpoint (virtual-hosted is implemented by the signer too).
+2. **Blob plane** (`store/s3blob.go`) maps the unchanged logical layout
+   (`objects/<ab>/<hash>`, `manifests/...`, `indexes/...`, `packs/...`,
+   `pack-catalog/...`) to keys. `Put` is `If-None-Match: *`; a 412/409 is
+   resolved by reading the existing object (identical bytes are idempotent,
+   different bytes are `Exists`). `Get`, `GetRange` (206, with the Rust
+   "server ignored Range" slice fallback and 416 end-of-object handling),
+   `HEAD` length, `DELETE` with an honest `NotFound`, and `ListObjectsV2` by
+   prefix with continuation tokens. A 1 GiB object bound is enforced on every
+   read and write. `probe()` republishes, refuses a second create, HEADs the
+   length, reads 17 mid-range bytes, deletes, and observes the deletion.
+3. **Commit plane** (`store/s3commit.go`) is a measured conditional-write
+   layer: control records via create-once or `If-Match` CAS; the superblock is
+   one 8192-byte object holding the same two 4096-byte slots and a slot update
+   is a whole-object read-modify-write with `If-Match`, retried from a fresh
+   read on 412. **Measured form:** the writable open tries the ETag exactly as
+   returned, then the dequoted form, and keeps a form only when a matching
+   write succeeds, a stale write in that same form is refused, and the winner's
+   bytes survive. Diagnostics print `S3 If-Match form measured at open: ...`.
+   An endpoint that ignores `If-None-Match: *` or accepts a stale `If-Match` is
+   refused `UnsupportedVersion`. **MinIO measured
+   `quoted-as-returned`.** (The Ceph RGW literal-comparison path is ported but
+   not exercised here; the parent R16 court covers it for Rust.)
+4. **Fenced writer**, ported verbatim. `LOCK` is `weftfs-s3-lock v2` with
+   `owner`, monotonic `fence`, `sequence`, absolute `lease_deadline_ns`,
+   `renewed_ns`, `pending_generation`, `pending_commit`; legacy v1 reads as
+   fence 0. Takeover increments the fence. The last gate before the superblock
+   CAS is a conditional rewrite of `LOCK` naming the pending head, so a stale
+   writer gets 412 -> `Busy` without touching the head; the lease is renewed
+   when one publication budget remains; a writer stops publishing once its own
+   deadline passes (checked before the commit record and again before the
+   head). Release is a content-addressed tombstone written with `If-Match`,
+   never an unconditional delete; a lock naming another writer is never
+   touched. `TestS3FencedWriterTakeover` exercises a live refusal, a 1 s lease
+   expiry, a fence-2 takeover, a stale publication refused `Busy`, a stale
+   close that leaves the successor's lock intact, and a tombstone reclaim.
+5. **Store integration.** `store/control.go` introduces a `ControlVolume`
+   (FORMAT, writer lock, superblock, commits, refs, quota, access counters);
+   the local implementation delegates to the historical helpers, so local
+   bytes are unchanged (the full local suite, including fixture and overlay
+   tests, still passes). `--backend s3` sets both planes; `--blob-backend s3`
+   and `--commit-backend s3` select one; mixing S3 and local works in both
+   directions. Init on an S3 commit plane needs no local directory. A writable
+   open (including `init`) probes both planes and fails closed; read-only opens
+   never probe and never write. Packing, snapshots, GC, verify, quotas, access
+   counters, and checkpoints ride on the existing code paths.
+6. **No silent degradation.** No local fallback, no unconditional overwrite,
+   no ignored precondition: every failed conditional write is `Busy`, every
+   unprovable capability is `Unsupported`, and a missing identity is `Exists`/
+   `NotFound`/`Corrupt` as the contract requires.
+
+### Exact command and environment
+
+```
+cd /mnt/1tb_kingston/WeftFS/WeftFS-Go
+scripts/go-s3-court.sh              # focused + full -race + cross-language
+scripts/go-s3-court.sh --focused-only
+```
+
+The court starts the same pinned official MinIO release as the parent court
+(`RELEASE.2025-04-22T22-12-26Z`, binary sha256
+`53e2a2cb16c5366ea6fbbc479c19ddb4c6a0948273e752f740fb1fbf27bb817c`) in a
+`debian:bookworm-slim` container under memory 3g / swap 3g / pids 1024 / cpus 4
+/ `--tmpfs /tmp` / `no-new-privileges` / `cap-drop=ALL`, with a 1 GiB tmpfs data
+directory. It creates a private Docker network and runs every leg through
+`../scripts/docker-court.sh` with `WEFT_DOCKER_NETWORK`; the endpoint is
+**container-name DNS, path-style**: `http://<minio-container>:9000`. That is
+the same wiring the parent `scripts/s3_court.sh` uses for the Rust court; no
+parent file was edited.
+
+### Evidence
+
+- Focused, go court: `gofmt -l`, `go vet ./...`, `CGO_ENABLED=0 go build ./...`
+  clean; `go test -race -count=1 -v -run 'TestS3|...' ./store/` ->
+  **16 pass / 0 fail / 1 skip** (the skip is the crash child helper when run
+  directly).
+- Full suite, fuse court: `go test -race -count=1 ./...` -> **all packages ok**
+  (`cmd/weftfs`, `fusefs`, `model`, `store`), 0 failures.
+- Cross-language, fuse court (Rust links libfuse3; the Go binary is
+  `CGO_ENABLED=0`): **17/17 `XLANG:` checks**. Go wrote init/files/snapshot,
+  Rust `verify --full`, reported the same head, and read both files
+  byte-exactly; Rust wrote init/files, Go `verify --full`, reported the same
+  head, read both files byte-exactly; then Go unlinked and `gc --apply` on the
+  Rust-written store, Go and Rust both verified, and Rust agreed the file is
+  gone.
+- Measured on this host (loopback, tmpfs data), from the handles' own HTTP
+  counters in the focused log
+  `bench/receipts/go-s3-focused-20261107T005259Z.log`: the writer handle used
+  110 requests (30 writes / 101,104 bytes written; 12 reads / 56,756 bytes
+  read; 0 conditional conflicts) across init, three file writes, a snapshot,
+  `verify --full`, and the reopen; a fresh read-only handle used 68 requests
+  (21 reads / 113,027 bytes). These are diagnostics of one run, not throughput
+  or latency measurements, and no performance claim is made from them.
+- Receipts: `bench/receipts/go-s3-20261107T005259Z.json` plus the focused,
+  full, and cross-language logs beside it. The receipt records `focused 16/0/1`,
+  `full 4/0 packages`, `17 cross-language checks`, the exact WeftFS-Go
+  revision, MinIO release/sha256, court image ids, limits, and the measured
+  If-Match form.
+
+### Explicit limitations (not claims)
+
+- Single-node MinIO on loopback with tmpfs data. No AWS, GCS, Azure, S3
+  gateway, multi-node, replication, media, power-loss, device-cache, fleet, or
+  production claim.
+- The fenced writer is **two conditional writes on two objects** (LOCK, then the
+  superblock), not one atomic fence-and-publish operation; plain S3 has no such
+  primitive. The fence still makes a stale publication impossible because a
+  successor cannot take the lease without rewriting LOCK.
+- No clock-skew defence, no multi-writer protocol, and a lost network reply
+  remains at-least-once.
+- No Go GCS or Azure backend; no S3 backend for the Rust-Go *handoff* tests
+  beyond the CLI cross-language leg.
+- No FUSE-over-S3 court was run (the FUSE frontend routes through the store, so
+  the path exists, but it is untested evidence-wise).
+- `ListObjectsV2` is used for listing; a server that never truncates more than
+  1000 keys per page and returns no continuation token is refused as `Io`.
+- Ranged reads that the server ignores are sliced client-side; the full object
+  is still bounded to 1 GiB.
+- The S3 blob plane implements `ReclaimUnreferencedPacks`/`VerifyPacks` as
+  no-ops: physical packs are not rewritten by the Go plane.
+- Durability means "the provider acknowledged the write"; there is no fsync on
+  S3 and the court's data is a tmpfs, so no durability claim is made.

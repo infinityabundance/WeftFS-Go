@@ -86,6 +86,20 @@ func (c *s3Control) Capabilities() CommitCapabilities {
 
 func (c *s3Control) Diagnostics() []string { return c.client.diagnostics() }
 
+// S3Stats returns the HTTP counters of the shared S3 client. It is diagnostic
+// evidence (requests and bytes on the wire), never a correctness input.
+func (c *s3Control) S3Stats() S3StatsSnapshot {
+	return S3StatsSnapshot{
+		Requests:            c.client.stats.requests.Load(),
+		Reads:               c.client.stats.reads.Load(),
+		RangeReads:          c.client.stats.rangeReads.Load(),
+		BytesRead:           c.client.stats.bytesRead.Load(),
+		Writes:              c.client.stats.writes.Load(),
+		BytesWritten:        c.client.stats.bytesWritten.Load(),
+		ConditionalConflict: c.client.stats.conflicts.Load(),
+	}
+}
+
 func (c *s3Control) EnsureLayout() error { return c.client.ensureBucket() }
 
 // CleanTmp removes leftover probe keys. The writer lock is held here, so no

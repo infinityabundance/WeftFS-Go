@@ -52,12 +52,22 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto|overlay]
               [--content-identity whole-file|merkle] [--codec-min-bytes N]
-              [--quota SPEC] [--quota-file FILE] <command> [args]
+              [--quota SPEC] [--quota-file FILE]
+              [--backend local|object|posix|s3]
+              [--blob-backend KIND] [--commit-backend KIND] [--blob-root DIR]
+              [--s3-endpoint URL] [--s3-bucket NAME] [--s3-region REGION]
+              [--s3-access-key KEY] [--s3-secret-key SECRET] [--s3-session-token TOKEN]
+              <command> [args]
 
 commands:
   init info create write cat ls stat mkdir unlink rmdir rename link symlink
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
   context causal uri tensor quota merge rebase compact calibrate
+
+--store is optional when either plane is s3; the store is then addressed by
+bucket. An s3 plane requires an endpoint, bucket, and credentials (flags or
+WEFT_S3_*/AWS_*). A writable open probes the endpoint's conditional writes and
+refuses one that cannot prove create-once and compare-and-swap.
 `)
 }
 

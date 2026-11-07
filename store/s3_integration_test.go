@@ -466,6 +466,10 @@ func TestS3StoreRoundTrip(t *testing.T) {
 	if !report.OK {
 		t.Fatalf("verify on the writer reports problems: %+v", report.Problems)
 	}
+	if stats, ok := writer.S3Stats(); ok {
+		t.Logf("host-local S3 counters (writer, loopback): requests=%d writes=%d bytes_written=%d reads=%d bytes_read=%d conflicts=%d",
+			stats.Requests, stats.Writes, stats.BytesWritten, stats.Reads, stats.BytesRead, stats.ConditionalConflict)
+	}
 	generation := writer.Generation()
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
@@ -494,6 +498,10 @@ func TestS3StoreRoundTrip(t *testing.T) {
 	report, err = reader.Verify(true)
 	if err != nil || !report.OK {
 		t.Fatalf("verify on the reader: %v %+v", err, report)
+	}
+	if stats, ok := reader.S3Stats(); ok {
+		t.Logf("host-local S3 counters (reader handle, loopback): requests=%d reads=%d bytes_read=%d",
+			stats.Requests, stats.Reads, stats.BytesRead)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("close reader: %v", err)
