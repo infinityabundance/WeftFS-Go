@@ -25,7 +25,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/infinityabundance/WeftCodec-Go/hash"
@@ -860,18 +859,4 @@ func ensureCommitLayout(root string) error {
 		}
 	}
 	return nil
-}
-
-// flockExclusive takes the single-writer lock. It lives here so both the store
-// and a test can use exactly the same primitive.
-func flockExclusive(path string) (*os.File, error) {
-	lock, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return nil, werr.Wrap(werr.Io, err, "cannot open LOCK")
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		lock.Close()
-		return nil, werr.Wrap(werr.Busy, err, "store is locked by another writer")
-	}
-	return lock, nil
 }

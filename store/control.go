@@ -13,7 +13,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
@@ -78,7 +77,8 @@ type ControlVolume interface {
 // are byte-identical.
 type localControl struct {
 	*commitPlane
-	lock *os.File
+	lock          *os.File
+	lockMechanism string
 }
 
 func newLocalControl(root string, kind PlaneKind) (*localControl, error) {
@@ -283,17 +283,18 @@ func (c *localControl) ListRecords(prefix string) ([]string, error) {
 }
 
 func (c *localControl) AcquireWriterLock() error {
-	lock, err := flockExclusive(filepath.Join(c.root, "LOCK"))
+	lock, mechanism, err := lockExclusive(filepath.Join(c.root, "LOCK"))
 	if err != nil {
 		return err
 	}
 	c.lock = lock
+	c.lockMechanism = mechanism
 	return nil
 }
 
 func (c *localControl) VerifyWriteLease() error { return nil }
 
-// A POSIX plane has no lease record: the exclusive flock is the ownership proof,
+// A POSIX plane has no lease record: the exclusive lock is the ownership proof,
 // a suspended process keeps it, and nothing can reclaim it. The store writes the
 // superblock slot as the publication point.
 func (c *localControl) CheckLeaseDeadline() error { return nil }
@@ -312,11 +313,8 @@ func (c *localControl) ReleaseWriterLock() error {
 	if c.lock == nil {
 		return nil
 	}
-	unlockErr := syscall.Flock(int(c.lock.Fd()), syscall.LOCK_UN)
-	closeErr := c.lock.Close()
+	err := releaseLock(c.lock)
 	c.lock = nil
-	if unlockErr != nil {
-		return werr.Wrap(werr.Io, unlockErr, "cannot unlock LOCK")
-	}
-	return closeErr
+	c.lockMechanism = ""
+	return err
 }
