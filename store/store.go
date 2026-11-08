@@ -108,6 +108,11 @@ type Options struct {
 	// MaxOverlayBytes bounds the total logical bytes carried by an overlay
 	// chain. Zero selects DefaultMaxOverlayBytes.
 	MaxOverlayBytes uint64
+	// AttestIndexes records the selector index's expected shape in the commit
+	// (`weftfs.commit.v2`). Default on. Turning it off writes `weftfs.commit.v1`
+	// and no index segment: a segment without an attestation is never trusted,
+	// so this exists only to reproduce the frozen v1 fixture bytes.
+	AttestIndexes bool
 	// BlobBackend selects the immutable blob plane (`local`, `object`, or
 	// `posix`). The empty value is `local` (and `object` when the commit plane
 	// is `object`, so a single `--backend object` store stays unchanged).
@@ -151,6 +156,7 @@ func DefaultOptions() Options {
 		BlobBackend:             PlaneLocal,
 		CommitBackend:           PlaneLocal,
 		PackOptions:             DefaultPackOptions(),
+		AttestIndexes:           true,
 	}
 }
 
@@ -1419,6 +1425,11 @@ func (s *Store) writeGenesis() error {
 	commit := model.Commit{
 		Generation: 1, Parent: nil, TimestampNS: mtime, Ops: ops, Checkpoint: nil,
 	}
+	attestation, builtIndex, err := s.indexAttestationFor(state, 1, &commit)
+	if err != nil {
+		return err
+	}
+	commit.IndexAttestation = attestation
 	if _, err := s.publishCommit(commit); err != nil {
 		return err
 	}
@@ -1430,7 +1441,9 @@ func (s *Store) writeGenesis() error {
 	s.head = hash
 	s.generation = 1
 	s.nextGeneration = 2
-	s.persistIndexAfterCommit(s.head, s.state)
+	if builtIndex != nil {
+		s.persistBuiltIndex(s.head, builtIndex)
+	}
 	return nil
 }
 
@@ -1494,6 +1507,11 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 		Generation: newGeneration, Parent: hashPtr(s.head), TimestampNS: timestamp,
 		Ops: ops, Checkpoint: checkpoint,
 	}
+	attestation, builtIndex, err := s.indexAttestationFor(nextState, newGeneration, &commit)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	commit.IndexAttestation = attestation
 	hash, err := s.publishCommit(commit)
 	if err != nil {
 		return model.Hash32{}, err
@@ -1507,7 +1525,9 @@ func (s *Store) commitOps(ops []model.Op, forceCheckpoint bool) (model.Hash32, e
 	s.nextGeneration = newGeneration + 1
 	// Advisory only: the commit is already durable and visible. A failed index
 	// write is recorded and ignored.
-	s.persistIndexAfterCommit(hash, s.state)
+	if builtIndex != nil {
+		s.persistBuiltIndex(hash, builtIndex)
+	}
 	if quotaPlan != nil {
 		s.recordQuotaAfterCommit(quotaPlan)
 	}

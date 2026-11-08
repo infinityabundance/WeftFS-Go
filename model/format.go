@@ -5,31 +5,119 @@ import (
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
 
-// Commit is a commit record (WEFT-MODEL.md §2.2).
-type Commit struct {
-	Generation  uint64
-	Parent      *Hash32
-	TimestampNS int64
-	Ops         []Op
-	Checkpoint  *Hash32
+// IndexAttestation is the commit's record of the selector index it published.
+//
+// The segment's own digest only proves the bytes did not change by accident.
+// This record proves completeness: `CandidatesRoot` is the digest of the full
+// candidate sets an honest index must contain, so a forger who removes an
+// entry, re-sorts, fixes the counts, and recomputes the self-digest still
+// cannot match it. `StateRoot` binds the attestation to this commit's own
+// authoritative fields.
+type IndexAttestation struct {
+	ObjectCount    uint64
+	RelationCount  uint64
+	EntryCount     uint64
+	StateRoot      Hash32
+	CandidatesRoot Hash32
 }
 
-var commitKeys = []string{"schema", "generation", "parent", "timestamp_ns", "ops", "checkpoint"}
+var attestationKeys = []string{
+	"candidates_root", "entry_count", "object_count", "relation_count", "state_root",
+}
 
-// ToWCB returns the canonical commit map.
-func (c Commit) ToWCB() wcb.Value {
+// ToWCB returns the canonical attestation map.
+func (a IndexAttestation) ToWCB() wcb.Value {
+	return Map(map[string]wcb.Value{
+		"object_count":    wcb.U64Value(a.ObjectCount),
+		"relation_count":  wcb.U64Value(a.RelationCount),
+		"entry_count":     wcb.U64Value(a.EntryCount),
+		"state_root":      HashValue(a.StateRoot),
+		"candidates_root": HashValue(a.CandidatesRoot),
+	})
+}
+
+// AttestationFromWCB parses an attestation map.
+func AttestationFromWCB(v wcb.Value) (IndexAttestation, error) {
+	m, err := AsMap(v)
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	if err := CheckKeys(m, attestationKeys...); err != nil {
+		return IndexAttestation{}, err
+	}
+	objectCount, err := GetU64(m, "object_count")
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	relationCount, err := GetU64(m, "relation_count")
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	entryCount, err := GetU64(m, "entry_count")
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	stateRoot, err := GetHash(m, "state_root")
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	candidatesRoot, err := GetHash(m, "candidates_root")
+	if err != nil {
+		return IndexAttestation{}, err
+	}
+	return IndexAttestation{
+		ObjectCount: objectCount, RelationCount: relationCount, EntryCount: entryCount,
+		StateRoot: stateRoot, CandidatesRoot: candidatesRoot,
+	}, nil
+}
+
+// Commit is a commit record (WEFT-MODEL.md §2.2).
+type Commit struct {
+	Generation       uint64
+	Parent           *Hash32
+	TimestampNS      int64
+	Ops              []Op
+	Checkpoint       *Hash32
+	IndexAttestation *IndexAttestation
+}
+
+var commitKeysV1 = []string{"schema", "generation", "parent", "timestamp_ns", "ops", "checkpoint"}
+var commitKeysV2 = []string{"schema", "generation", "parent", "timestamp_ns", "ops", "checkpoint", "index_attestation"}
+
+func (c Commit) fields() map[string]wcb.Value {
 	ops := make([]wcb.Value, 0, len(c.Ops))
 	for _, op := range c.Ops {
 		ops = append(ops, op.ToWCB())
 	}
-	return Map(map[string]wcb.Value{
-		"schema":       wcb.TextValue(CommitSchema),
+	return map[string]wcb.Value{
 		"generation":   wcb.U64Value(c.Generation),
 		"parent":       OptHashValue(c.Parent),
 		"timestamp_ns": wcb.TimestampValue(c.TimestampNS),
 		"ops":          wcb.ArrayValue(ops),
 		"checkpoint":   OptHashValue(c.Checkpoint),
-	})
+	}
+}
+
+// FieldsWCB returns the canonical v1-shaped bytes of the six authoritative
+// fields. It is the `state_root` preimage and is independent of whether this
+// record carries an attestation.
+func (c Commit) FieldsWCB() ([]byte, error) {
+	m := c.fields()
+	m["schema"] = wcb.TextValue(CommitSchema)
+	return EncodeWCB(Map(m))
+}
+
+// ToWCB returns the canonical commit map. A commit with an attestation is
+// `weftfs.commit.v2`; one without is the frozen `weftfs.commit.v1`.
+func (c Commit) ToWCB() wcb.Value {
+	m := c.fields()
+	if c.IndexAttestation != nil {
+		m["schema"] = wcb.TextValue(CommitSchemaV2)
+		m["index_attestation"] = c.IndexAttestation.ToWCB()
+	} else {
+		m["schema"] = wcb.TextValue(CommitSchema)
+	}
+	return Map(m)
 }
 
 // Encode returns canonical WCB bytes of the commit record.
@@ -50,15 +138,31 @@ func CommitFromWCB(v wcb.Value) (Commit, error) {
 	if err != nil {
 		return Commit{}, err
 	}
-	if err := CheckKeys(m, commitKeys...); err != nil {
-		return Commit{}, err
-	}
 	schema, err := GetText(m, "schema")
 	if err != nil {
 		return Commit{}, err
 	}
-	if schema != CommitSchema {
-		return Commit{}, werr.Newf(werr.UnknownSchema, "commit schema `%s` is not `%s`", schema, CommitSchema)
+	var attestation *IndexAttestation
+	switch schema {
+	case CommitSchema:
+		if err := CheckKeys(m, commitKeysV1...); err != nil {
+			return Commit{}, err
+		}
+	case CommitSchemaV2:
+		if err := CheckKeys(m, commitKeysV2...); err != nil {
+			return Commit{}, err
+		}
+		if raw, ok := m["index_attestation"]; ok {
+			if raw.Kind != wcb.Null {
+				parsed, err := AttestationFromWCB(raw)
+				if err != nil {
+					return Commit{}, err
+				}
+				attestation = &parsed
+			}
+		}
+	default:
+		return Commit{}, werr.Newf(werr.UnknownSchema, "commit schema `%s` is neither `%s` nor `%s`", schema, CommitSchema, CommitSchemaV2)
 	}
 	generation, err := GetU64(m, "generation")
 	if err != nil {
@@ -90,7 +194,7 @@ func CommitFromWCB(v wcb.Value) (Commit, error) {
 	}
 	return Commit{
 		Generation: generation, Parent: parent, TimestampNS: timestamp,
-		Ops: ops, Checkpoint: checkpoint,
+		Ops: ops, Checkpoint: checkpoint, IndexAttestation: attestation,
 	}, nil
 }
 

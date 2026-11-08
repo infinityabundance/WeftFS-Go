@@ -308,6 +308,11 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 		Generation: newGeneration, Parent: hashPtr(s.head), TimestampNS: timestamp,
 		Ops: ops, Checkpoint: checkpoint,
 	}
+	attestation, builtIndex, err := s.indexAttestationFor(s.state, newGeneration, &commit)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	commit.IndexAttestation = attestation
 	hash, err := s.publishCommit(commit)
 	if err != nil {
 		return model.Hash32{}, err
@@ -320,7 +325,9 @@ func (s *Store) publishGroupOps(ops []model.Op, forceCheckpoint bool) (model.Has
 	}
 	s.nextGeneration = newGeneration + 1
 	// Advisory only: the commit is already durable and visible.
-	s.persistIndexAfterCommit(hash, s.state)
+	if builtIndex != nil {
+		s.persistBuiltIndex(hash, builtIndex)
+	}
 	if quotaPlan != nil {
 		s.recordQuotaAfterCommit(quotaPlan)
 	}

@@ -20,6 +20,9 @@ func fixedOptions() store.Options {
 	ts := int64(1_700_000_000_000_000_000)
 	opts := store.DefaultOptions()
 	opts.FixedTimestampNS = &ts
+	// The committed fixture is a frozen `weftfs.commit.v1` byte sequence; an
+	// attested (v2) commit would change every commit hash.
+	opts.AttestIndexes = false
 	return opts
 }
 

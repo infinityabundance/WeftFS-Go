@@ -1033,6 +1033,11 @@ func (s *Store) publishQuotaUsageOp(op model.SetQuotaUsageOp) (model.Hash32, err
 		Generation: newGeneration, Parent: hashPtr(s.head), TimestampNS: timestamp,
 		Ops: ops, Checkpoint: checkpoint,
 	}
+	attestation, builtIndex, err := s.indexAttestationFor(nextState, newGeneration, &commit)
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	commit.IndexAttestation = attestation
 	hash, err := s.publishCommit(commit)
 	if err != nil {
 		return model.Hash32{}, err
@@ -1044,7 +1049,9 @@ func (s *Store) publishQuotaUsageOp(op model.SetQuotaUsageOp) (model.Hash32, err
 		return model.Hash32{}, werr.Newf(werr.LimitExceeded, "generation counter overflow")
 	}
 	s.nextGeneration = newGeneration + 1
-	s.persistIndexAfterCommit(hash, s.state)
+	if builtIndex != nil {
+		s.persistBuiltIndex(hash, builtIndex)
+	}
 	return hash, nil
 }
 

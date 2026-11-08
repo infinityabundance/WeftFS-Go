@@ -4,9 +4,12 @@
 // whether the two implementations can consume each other's bytes. These tests
 // answer it with real processes:
 //
-//   * Go writes the segments, Rust must load the Go bytes rather than reject
-//     and rebuild. A load is proved by a *control* segment with one section
-//     emptied: Rust can only return zero matches if it trusted the file.
+//   * Go writes the segments, Rust must load the Go bytes (its `query --json`
+//     reports `index.loads>0, builds==0, rejects==0`).
+//   * A **forged** segment that is self-consistent (one section emptied,
+//     counts and the WFX2 digest fixed up) must be rejected: the commit's
+//     attestation is the only thing that can prove completeness, so Rust and
+//     Go both rebuild and still return the true answers.
 //   * Rust writes the segments, Go must load them with DiskLoads=1/Builds=0
 //     and reproduce the scan oracle exactly.
 
@@ -33,6 +36,11 @@ type rustQueryResult struct {
 	Results      []struct {
 		ObjectID string `json:"object_id"`
 	} `json:"results"`
+	Index struct {
+		Loads   uint64 `json:"loads"`
+		Builds  uint64 `json:"builds"`
+		Rejects uint64 `json:"rejects"`
+	} `json:"index"`
 }
 
 func runRustQuery(t *testing.T, bin, dir, text string) rustQueryResult {
@@ -98,10 +106,16 @@ func TestRustLoadsGoWrittenIndexSegment(t *testing.T) {
 		t.Fatalf("tag results differ:\ngo=%v\nrust=%v", goIDs, rustObjectIDs(rustTag))
 	}
 
-	// 2. Control: clear the tag section of the *Go-written head segment*, keep
-	// the digest valid, and ask Rust again. A rebuild would still see the
-	// relation and return matches; zero matches proves Rust loaded and trusted
-	// only the Go bytes.
+	// The genuine Go segment must be *loaded*, not rebuilt: the CLI reports the
+	// advisory index diagnostics, so a load is provable from outside.
+	if rustTag.Index.Loads == 0 || rustTag.Index.Builds != 0 || rustTag.Index.Rejects != 0 {
+		t.Fatalf("rust did not load the genuine Go segment: %+v", rustTag.Index)
+	}
+
+	// 2. Control: clear the tag section of the *Go-written head segment* and
+	// recompute the WFX2 digest, so every self-consistency check still passes.
+	// The commit attests the full candidate set, so Rust must reject this
+	// forged subset, rebuild, and still return the true answers.
 	headPath := store.BlobPath(dir, store.BlobIndex, reader.Head())
 	original, err := os.ReadFile(headPath)
 	if err != nil {
@@ -123,17 +137,21 @@ func TestRustLoadsGoWrittenIndexSegment(t *testing.T) {
 		t.Fatalf("write control segment: %v", err)
 	}
 	controlTag := runRustQuery(t, bin, dir, tagQuery)
-	if controlTag.MatchedCount != 0 || len(controlTag.Results) != 0 {
-		t.Fatalf("rust rebuilt instead of loading the Go segment: matched=%d results=%v",
-			controlTag.MatchedCount, rustObjectIDs(controlTag))
+	if controlTag.Index.Loads != 0 || controlTag.Index.Rejects == 0 || controlTag.Index.Builds == 0 {
+		t.Fatalf("rust trusted a forged subset (attestation not enforced): %+v", controlTag.Index)
+	}
+	if controlTag.MatchedCount != rustTag.MatchedCount ||
+		strings.Join(rustObjectIDs(controlTag), ",") != strings.Join(rustObjectIDs(rustTag), ",") {
+		t.Fatalf("forged-subset query answers changed: matched=%d", controlTag.MatchedCount)
 	}
 
 	// 3. Restore, then repeat the control for the attr_eq section.
 	if err := os.WriteFile(headPath, original, 0o644); err != nil {
 		t.Fatalf("restore go segment: %v", err)
 	}
-	if before := runRustQuery(t, bin, dir, attrQuery); before.MatchedCount == 0 {
-		t.Fatal("rust found no attr-equality matches before the control")
+	beforeAttr := runRustQuery(t, bin, dir, attrQuery)
+	if beforeAttr.MatchedCount == 0 || beforeAttr.Index.Loads == 0 {
+		t.Fatalf("rust did not load the restored Go segment: %+v", beforeAttr.Index)
 	}
 	decoded, err = weftindex.DecodeFile(original)
 	if err != nil {
@@ -148,9 +166,12 @@ func TestRustLoadsGoWrittenIndexSegment(t *testing.T) {
 		t.Fatalf("write attr control: %v", err)
 	}
 	controlAttr := runRustQuery(t, bin, dir, attrQuery)
-	if controlAttr.MatchedCount != 0 || len(controlAttr.Results) != 0 {
-		t.Fatalf("rust rebuilt instead of loading the Go attr_eq section: matched=%d",
-			controlAttr.MatchedCount)
+	if controlAttr.Index.Loads != 0 || controlAttr.Index.Rejects == 0 {
+		t.Fatalf("rust trusted a forged attr_eq subset: %+v", controlAttr.Index)
+	}
+	if controlAttr.MatchedCount != beforeAttr.MatchedCount {
+		t.Fatalf("forged attr_eq subset changed the answer: %d vs %d",
+			controlAttr.MatchedCount, beforeAttr.MatchedCount)
 	}
 	if err := os.WriteFile(headPath, original, 0o644); err != nil {
 		t.Fatalf("final restore: %v", err)

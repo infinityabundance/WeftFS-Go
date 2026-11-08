@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/infinityabundance/WeftCodec-Go/hash"
 	weftindex "github.com/infinityabundance/WeftFS-Go/index"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
@@ -185,23 +186,93 @@ func (s *Store) loadPersistedIndex(commit model.Hash32, state *model.State) *wef
 			": generation/counts disagree with the replayed state")
 		return nil
 	}
+	// Trust requires the commit to attest this index. A self-consistent
+	// segment (valid digest, matching generation and counts) can still be a
+	// forged *subset*; only the commit's CandidatesRoot can refute that.
+	record, err := s.commits.ReadCommit(loaded.Generation())
+	if err != nil {
+		s.indexes.noteReject("ignoring index " + displayed + ": cannot re-read its commit record")
+		return nil
+	}
+	if id, err := record.Commit.ID(); err != nil || id != commit {
+		s.indexes.noteReject("ignoring index " + displayed + ": commit record hash mismatch")
+		return nil
+	}
+	attestation := record.Commit.IndexAttestation
+	if attestation == nil {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": the commit carries no index attestation (v1 commit); rebuild-only")
+		return nil
+	}
+	if attestation.ObjectCount != uint64(loaded.ObjectCount()) ||
+		attestation.RelationCount != uint64(loaded.RelationCount()) ||
+		attestation.EntryCount != uint64(loaded.EntryCount()) {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": counts disagree with the commit attestation")
+		return nil
+	}
+	candidates, err := loaded.CandidatesRoot()
+	if err != nil {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": cannot re-derive its candidate root: " + err.Error())
+		return nil
+	}
+	if candidates != attestation.CandidatesRoot {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": candidate root disagrees with the commit attestation (forged or incomplete index); rebuild-only")
+		return nil
+	}
+	preimage, err := record.Commit.FieldsWCB()
+	if err != nil {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": cannot recompute the attested state root: " + err.Error())
+		return nil
+	}
+	if hash.Domain(weftindex.DomainState, preimage) != attestation.StateRoot {
+		s.indexes.noteReject("ignoring index " + displayed +
+			": attested state root disagrees with the commit record")
+		return nil
+	}
 	s.indexes.bump(func(stats *IndexStats) { stats.DiskLoads++ })
 	return loaded
 }
 
-// writeStateIndex writes the advisory segment for a published commit. The
-// index is derived data: a failure here is recorded but must never fail the
-// commit that already published.
-func (s *Store) writeStateIndex(commit model.Hash32, state *model.State) (uint64, error) {
-	if s.mode != ReadWrite {
-		return 0, nil
+// indexAttestationFor builds the attestation for a commit that is about to
+// publish (`commit` must not carry one yet) and returns the index it describes
+// so the segment write does not rebuild it.
+func (s *Store) indexAttestationFor(
+	state *model.State,
+	generation uint64,
+	commit *model.Commit,
+) (*model.IndexAttestation, *weftindex.StateIndex, error) {
+	if !s.options.AttestIndexes || s.mode != ReadWrite {
+		return nil, nil, nil
 	}
-	derived := weftindex.Build(state)
+	derived := weftindex.Build(state).WithGeneration(generation)
 	if !derived.Complete() {
-		// Persisting an incomplete index would later be loaded as exact and
-		// could under-select. Keep it in memory only; the commit stands.
-		return 0, nil
+		// An incomplete index is never persisted; without an attestation the
+		// commit is v1 and no segment can be trusted.
+		return nil, nil, nil
 	}
+	preimage, err := commit.FieldsWCB()
+	if err != nil {
+		return nil, nil, err
+	}
+	candidates, err := derived.CandidatesRoot()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &model.IndexAttestation{
+		ObjectCount:    uint64(derived.ObjectCount()),
+		RelationCount:  uint64(derived.RelationCount()),
+		EntryCount:     uint64(derived.EntryCount()),
+		StateRoot:      hash.Domain(weftindex.DomainState, preimage),
+		CandidatesRoot: candidates,
+	}, derived, nil
+}
+
+// writeBuiltIndex publishes an index that was built for the attestation.
+func (s *Store) writeBuiltIndex(commit model.Hash32, derived *weftindex.StateIndex) (uint64, error) {
 	derived.WithCommit(commit)
 	data, err := derived.EncodeFile()
 	if err != nil {
@@ -219,9 +290,12 @@ func (s *Store) writeStateIndex(commit model.Hash32, state *model.State) (uint64
 	return uint64(len(data)), nil
 }
 
-// persistIndexAfterCommit is the best-effort write after a commit published.
-func (s *Store) persistIndexAfterCommit(commit model.Hash32, state *model.State) {
-	if _, err := s.writeStateIndex(commit, state); err != nil {
+// persistBuiltIndex is the best-effort write after a commit published.
+func (s *Store) persistBuiltIndex(commit model.Hash32, derived *weftindex.StateIndex) {
+	if s.mode != ReadWrite {
+		return
+	}
+	if _, err := s.writeBuiltIndex(commit, derived); err != nil {
 		s.indexes.noteWriteError("index for " + commit.Hex() + " was not written: " + err.Error())
 	}
 }
@@ -233,12 +307,25 @@ func (s *Store) IndexStats() IndexStats { return s.indexes.snapshotStats() }
 func (s *Store) ResetIndexStats() { s.indexes.resetStats() }
 
 // WriteIndexForBench writes the advisory segment for the current head and
-// returns its size. Test/receipt hook only.
+// returns its size. It writes a *loadable* segment, so the head commit must
+// already carry its attestation. Test/receipt hook only.
 func (s *Store) WriteIndexForBench() (uint64, error) {
 	if err := s.requireWritable(); err != nil {
 		return 0, err
 	}
-	return s.writeStateIndex(s.head, s.state)
+	record, err := s.commits.ReadCommit(s.generation)
+	if err != nil {
+		return 0, err
+	}
+	attestation := record.Commit.IndexAttestation
+	if attestation == nil {
+		return 0, werr.Newf(werr.InvalidArgument, "a loadable index needs an attested head commit")
+	}
+	derived := weftindex.Build(s.state)
+	if candidates, err := derived.CandidatesRoot(); err != nil || candidates != attestation.CandidatesRoot {
+		return 0, werr.Newf(werr.Corrupt, "rebuilt index differs from the head commit's attestation")
+	}
+	return s.writeBuiltIndex(s.head, derived)
 }
 
 // BuildIndexForBench builds an index from `state` without writing it and

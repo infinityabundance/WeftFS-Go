@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/infinityabundance/WeftCodec-Go/hash"
@@ -705,5 +706,101 @@ func TestIndexWriteFailureNeverFailsTheCommit(t *testing.T) {
 	}
 	if report, verifyErr := s.Verify(false); verifyErr != nil || !report.OK {
 		t.Fatalf("verify after a failed index write: ok=%v err=%v problems=%v", report, verifyErr, report.Problems)
+	}
+}
+
+// TestForgedSubsetIndexIsRejectedByCommitAttestation is the adversarial proof:
+// take a valid Go-written segment, remove one candidate, re-encode it (which
+// recomputes the WFX2 digest and keeps every header count unchanged), and
+// require the loader to reject it and rebuild. Only the commit's
+// `candidates_root` can catch this, because every self-consistency check still
+// passes.
+func TestForgedSubsetIndexIsRejectedByCommitAttestation(t *testing.T) {
+	dir := t.TempDir()
+	fixture := buildIndexFixture(t, dir, 256)
+	head := fixture.head
+	if err := fixture.store.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	path := store.BlobPath(dir, store.BlobIndex, head)
+	query, err := selector.Parse("select tag(\"alpha\")")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	principal := auth.New(0, 0, nil)
+	lim := limits.Default()
+
+	// The honest segment loads.
+	reader, err := store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	reader.ResetIndexStats()
+	if _, err := reader.Resolve(query, nil, principal, lim); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	stats := reader.IndexStats()
+	if stats.DiskLoads != 1 || stats.Builds != 0 || stats.Rejects != 0 {
+		t.Fatalf("the attested segment must load: %+v", stats)
+	}
+	reader.Close()
+
+	// Forge: remove one id from one tag set and re-encode.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read segment: %v", err)
+	}
+	decoded, err := weftindex.DecodeFile(data)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	forged := false
+	for _, ids := range decoded.Tags {
+		if len(ids) > 1 {
+			var victim model.Hash32
+			for id := range ids {
+				victim = id
+				break
+			}
+			delete(ids, victim)
+			forged = true
+			break
+		}
+	}
+	if !forged {
+		t.Fatal("fixture has no tag set with at least two members")
+	}
+	mutated, err := decoded.EncodeFile()
+	if err != nil {
+		t.Fatalf("re-encode forged segment: %v", err)
+	}
+	if err := os.WriteFile(path, mutated, 0o644); err != nil {
+		t.Fatalf("write forged segment: %v", err)
+	}
+
+	reader, err = store.Open(dir, store.ReadOnly)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reader.Close()
+	reader.ResetIndexStats()
+	got, err := reader.Resolve(query, nil, principal, lim)
+	if err != nil {
+		t.Fatalf("resolve forged: %v", err)
+	}
+	scan, err := resolver.ResolveState(query, reader.Head(), reader.CurrentState(), principal, lim)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	compareResolution(t, "forged subset", got, scan)
+	stats = reader.IndexStats()
+	if stats.DiskLoads != 0 {
+		t.Fatalf("a forged subset must never load: %+v", stats)
+	}
+	if stats.Rejects < 1 || stats.Builds < 1 {
+		t.Fatalf("the forged subset must be rejected and rebuilt: %+v", stats)
+	}
+	if !strings.Contains(strings.Join(stats.Notes, "\n"), "attestation") {
+		t.Fatalf("the reject note must name the attestation: %+v", stats)
 	}
 }

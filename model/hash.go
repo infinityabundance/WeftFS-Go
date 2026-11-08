@@ -32,6 +32,15 @@ const (
 // Namespace used by v1.
 const DefaultNamespace = "default"
 
+// Commit record schemas.
+const (
+	// CommitSchema is the frozen v1 commit record (no index attestation).
+	CommitSchema = "weftfs.commit.v1"
+	// CommitSchemaV2 may carry an `index_attestation` map; the key set is v1's
+	// plus that one field.
+	CommitSchemaV2 = "weftfs.commit.v2"
+)
+
 // Format and schema constants (WEFT-MODEL.md §2).
 const (
 	FormatContents   = "weftfs-store 1\n"
@@ -39,7 +48,6 @@ const (
 	SlotBytes        = 4096
 	FormatMajor      = 1
 	FormatMinor      = 0
-	CommitSchema     = "weftfs.commit.v1"
 	ManifestSchema   = "weft.manifest.v1"
 	ManifestSchemaV2 = "weft.manifest.v2"
 	ManifestSchemaV3 = "weft.manifest.v3"

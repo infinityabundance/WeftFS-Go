@@ -40,6 +40,11 @@ const (
 	VersionV2 uint32 = 1
 	// DomainV2 is the integrity-digest domain over every preceding WFX2 byte.
 	DomainV2 = "weft/index/v2"
+	// DomainCandidates is the domain of the section digest the commit attests.
+	DomainCandidates = "weft/index/candidates/v1"
+	// DomainState is the domain of the six-field commit digest the commit
+	// attests.
+	DomainState = "weft/index/state/v1"
 	// HeaderBytes is magic(4) + version(4) + commit(32) + generation/object/
 	// relation/entry(32).
 	HeaderBytes = 72
@@ -191,6 +196,50 @@ func (x *StateIndex) MatchesState(state *model.State) bool {
 // insertion. An incomplete index is never persisted: it could under-select and
 // must stay in memory only.
 func (x *StateIndex) EncodeFile() ([]byte, error) {
+	body, err := x.encodeBody()
+	if err != nil {
+		return nil, err
+	}
+	total := uint64(len(body)) + DigestBytes
+	if total > MaxFileBytes {
+		return nil, werr.Newf(werr.LimitExceeded,
+			"index file is %d bytes, above the %d-byte cap", total, MaxFileBytes)
+	}
+	digest := hash.Domain(DomainV2, body)
+	return append(body, digest[:]...), nil
+}
+
+// CandidatesRoot is the digest of the candidate sections an honest index must
+// contain. The commit attests it, so a self-consistent subset is rejected.
+func (x *StateIndex) CandidatesRoot() (model.Hash32, error) {
+	body, err := x.encodeBody()
+	if err != nil {
+		return model.Hash32{}, err
+	}
+	if len(body) < HeaderBytes {
+		return model.Hash32{}, werr.Newf(werr.Corrupt, "index body is shorter than its header")
+	}
+	return hash.Domain(DomainCandidates, body[HeaderBytes:]), nil
+}
+
+// Generation is the replayed generation this index describes.
+func (x *StateIndex) Generation() uint64 { return x.generation }
+
+// RelationCount is the indexed relation count (diagnostic only).
+func (x *StateIndex) RelationCount() int { return x.relationCount }
+
+// EntryCount is the indexed entry count (diagnostic only).
+func (x *StateIndex) EntryCount() int { return x.entryCount }
+
+// WithGeneration sets the generation used for structural matching. A caller
+// building an index for a commit that is about to publish needs this because
+// the live state still carries the previous generation.
+func (x *StateIndex) WithGeneration(generation uint64) *StateIndex {
+	x.generation = generation
+	return x
+}
+
+func (x *StateIndex) encodeBody() ([]byte, error) {
 	if !x.complete {
 		return nil, werr.Newf(werr.InvalidArgument,
 			"an incomplete selector index cannot be persisted")
@@ -305,13 +354,6 @@ func (x *StateIndex) EncodeFile() ([]byte, error) {
 		}
 	}
 
-	total := uint64(len(out)) + DigestBytes
-	if total > MaxFileBytes {
-		return nil, werr.Newf(werr.LimitExceeded,
-			"index file is %d bytes, above the %d-byte cap", total, MaxFileBytes)
-	}
-	digest := hash.Domain(DomainV2, out)
-	out = append(out, digest[:]...)
 	return out, nil
 }
 
