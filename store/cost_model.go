@@ -36,8 +36,19 @@ const Mode18MeasuredCalibration = "weftfs-mode18/decode-calibration/v1"
 // mode18FixedNS and mode18NSPerMiB are the measured mode-18 coefficients
 // (median of three 7-repetition runs, 128 KiB and 16 MiB, four interleaved
 // streams). They are not a copy of the tensor-tiled row.
+//
+// The two-point fit produced a negative intercept, which used to be clamped to
+// zero; a zero fixed term made a one-tile region read look free. The fixed term
+// is now the measured small-region lower bound, derived from the mode-18
+// court's 1-row and 100-row medians at tile [64,896]:
+//
+//	(415,555 - 256,078) ns per extra 114,688-byte tile => 1,457,700 ns/MiB
+//	256,078 - 159,477                                  => 96,601 ns
+//
+// The per-MiB term remains the whole-frame measured rate (the persisted
+// calibration schema has one rate per class).
 const (
-	mode18FixedNS  uint64 = 0
+	mode18FixedNS  uint64 = 96601
 	mode18NSPerMiB uint64 = 3674824
 )
 
@@ -222,4 +233,111 @@ func EstimateDecodeNSWith(class CostClass, decodedBytes uint64, model CostModelK
 		return table.EstimateNS(class, decodedBytes)
 	}
 	return EstimateDecodeNS(class, decodedBytes, model)
+}
+
+// ---------------------------------------------------------------------------
+// Encoder (write) cost
+// ---------------------------------------------------------------------------
+
+// EncodeCalibration names the encode-cost table. Constants here MUST equal the
+// Rust table in src/cost_model.rs; TestEncodeCostModelMatchesRust asserts it.
+const EncodeCalibration = "weftfs-write-cost/v1"
+
+// EncodeClass is an encode-cost row. It tracks planner strategies rather than
+// the frozen decode CostClass set because modes 17 and 18 have their own
+// measured encode cost but no decode class of their own.
+type EncodeClass string
+
+const (
+	EncodeClassRaw               EncodeClass = "raw"
+	EncodeClassZstd              EncodeClass = "zstd"
+	EncodeClassZstd19            EncodeClass = "zstd-19"
+	EncodeClassFloatTensor       EncodeClass = "float-tensor"
+	EncodeClassTensorSharded     EncodeClass = "tensor-sharded"
+	EncodeClassTensorTiled       EncodeClass = "tensor-tiled"
+	EncodeClassFloatTiled        EncodeClass = "float-tiled"
+	EncodeClassFloatTiledStreams EncodeClass = "float-tiled-streams"
+	EncodeClassWeightDelta       EncodeClass = "weight-delta"
+	EncodeClassSparseDelta       EncodeClass = "sparse-delta"
+	EncodeClassSemanticDelta     EncodeClass = "semantic-delta"
+)
+
+// EncodeClassAll is every encode row in canonical order.
+var EncodeClassAll = []EncodeClass{
+	EncodeClassRaw,
+	EncodeClassZstd,
+	EncodeClassZstd19,
+	EncodeClassFloatTensor,
+	EncodeClassTensorSharded,
+	EncodeClassTensorTiled,
+	EncodeClassFloatTiled,
+	EncodeClassFloatTiledStreams,
+	EncodeClassWeightDelta,
+	EncodeClassSparseDelta,
+	EncodeClassSemanticDelta,
+}
+
+// EncodeCoefficients is one encode row: fixed cost plus nanoseconds per MiB of
+// encoded logical bytes.
+type EncodeCoefficients struct {
+	FixedNS    uint64
+	NSperMiB   uint64
+	Provenance string
+}
+
+// EncodeCoefficientsTable mirrors the Rust ENCODE table. Measured rows come
+// from the T1 write-policy court (raw, zstd) and the float-tiled court
+// (float-tensor, float-tiled); float-tiled-streams is derived from the measured
+// mode-18 codec ratio; the rest are declared.
+var EncodeCoefficientsTable = map[EncodeClass]EncodeCoefficients{
+	EncodeClassRaw:               {FixedNS: 0, NSperMiB: 2620000, Provenance: "measured"},
+	EncodeClassZstd:              {FixedNS: 0, NSperMiB: 3090000, Provenance: "measured"},
+	EncodeClassZstd19:            {FixedNS: 0, NSperMiB: 35087719, Provenance: "measured"},
+	EncodeClassFloatTensor:       {FixedNS: 0, NSperMiB: 8806000, Provenance: "measured"},
+	EncodeClassTensorSharded:     {FixedNS: 0, NSperMiB: 8806000, Provenance: "declared"},
+	EncodeClassTensorTiled:       {FixedNS: 0, NSperMiB: 28633000, Provenance: "declared"},
+	EncodeClassFloatTiled:        {FixedNS: 0, NSperMiB: 28633000, Provenance: "measured"},
+	EncodeClassFloatTiledStreams: {FixedNS: 0, NSperMiB: 37360000, Provenance: "derived"},
+	EncodeClassWeightDelta:       {FixedNS: 0, NSperMiB: 17612000, Provenance: "declared"},
+	EncodeClassSparseDelta:       {FixedNS: 0, NSperMiB: 17612000, Provenance: "declared"},
+	EncodeClassSemanticDelta:     {FixedNS: 0, NSperMiB: 17612000, Provenance: "declared"},
+}
+
+// EncodeClassOf maps a planner strategy to its encode row.
+func EncodeClassOf(strategy TensorStrategy) EncodeClass {
+	switch strategy {
+	case TensorStrategyRaw:
+		return EncodeClassRaw
+	case TensorStrategyZstd:
+		return EncodeClassZstd
+	case TensorStrategyFloatTensor:
+		return EncodeClassFloatTensor
+	case TensorStrategySharded:
+		return EncodeClassTensorSharded
+	case TensorStrategyFloatTiled:
+		return EncodeClassFloatTiled
+	case TensorStrategyFloatTiledStreams:
+		return EncodeClassFloatTiledStreams
+	case TensorStrategyWeightDelta:
+		return EncodeClassWeightDelta
+	case TensorStrategySparseDelta:
+		return EncodeClassSparseDelta
+	case TensorStrategySemanticDelta:
+		return EncodeClassSemanticDelta
+	default:
+		return EncodeClassTensorSharded
+	}
+}
+
+// EstimateEncodeNS prices one whole-tensor encode of `bytes`.
+func EstimateEncodeNS(strategy TensorStrategy, bytes uint64) uint64 {
+	return EstimateEncodeNSClass(EncodeClassOf(strategy), bytes)
+}
+
+// EstimateEncodeNSClass prices one whole-tensor encode with an explicit row.
+func EstimateEncodeNSClass(class EncodeClass, bytes uint64) uint64 {
+	row := EncodeCoefficientsTable[class]
+	hi, lo := bits.Mul64(bytes, row.NSperMiB)
+	scaled := (hi << 44) | (lo >> 20)
+	return saturatingAdd(scaled, row.FixedNS)
 }

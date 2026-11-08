@@ -203,6 +203,8 @@ func codecStrategyMode(strategy string) (frame.Mode, bool) {
 		return frame.ModeDelta, true
 	case model.StrategyReference:
 		return frame.ModeReference, true
+	case model.StrategyZstdPatch:
+		return frame.ModeDictionary, true
 	default:
 		return 0, false
 	}

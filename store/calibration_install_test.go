@@ -107,8 +107,11 @@ func TestInstalledCalibrationChangesPlannerSelection(t *testing.T) {
 	}
 
 	const lambdaNS = uint64(1)
-	bakedOptions := TensorPlanOptions{LambdaNS: lambdaNS, CostModel: CostModelMeasured}
-	installedOptions := TensorPlanOptions{LambdaNS: lambdaNS, CostModel: CostModelMeasured, Cost: installed.Table()}
+	// This test validates the decode calibration table, so the write term is
+	// explicitly disabled (otherwise the cheapest-to-encode raw candidate wins
+	// for every table and the comparison would not exercise the decode rows).
+	bakedOptions := TensorPlanOptions{LambdaNS: lambdaNS, CostModel: CostModelMeasured, LambdaWriteNSSet: true}
+	installedOptions := TensorPlanOptions{LambdaNS: lambdaNS, CostModel: CostModelMeasured, Cost: installed.Table(), LambdaWriteNSSet: true}
 
 	bakedPlan, err := s.PlanTensor("bf16", shape, payload, RowMajorTensorLayout(), nil, bakedOptions)
 	if err != nil {

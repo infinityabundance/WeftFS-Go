@@ -230,6 +230,10 @@ const (
 	StrategyZstd      = "zstd"
 	StrategyDelta     = "delta"
 	StrategyReference = "reference"
+	// StrategyZstdPatch is a mode-4 DICTIONARY frame whose raw-content
+	// dictionary is the whole declared base (the `zstd --patch-from` analogue).
+	// It carries exactly one dependency.
+	StrategyZstdPatch = "zstd-patch"
 	// Tensor strategies; the spelling is fixed by the tensor mode (WEFT-MODEL
 	// §2.3.1).
 	StrategyTensorSharded = "tensor-sharded"
@@ -645,9 +649,9 @@ func RepresentationFromWCB(v wcb.Value) (Representation, error) {
 			if len(dependencies) != 0 {
 				return representation, werr.Newf(werr.Malformed, "zstd representation must not have dependencies")
 			}
-		case StrategyDelta, StrategyReference:
+		case StrategyDelta, StrategyReference, StrategyZstdPatch:
 			if len(dependencies) != 1 {
-				return representation, werr.Newf(werr.Malformed, "delta/reference representation requires exactly one dependency")
+				return representation, werr.Newf(werr.Malformed, "delta/reference/zstd-patch representation requires exactly one dependency")
 			}
 		default:
 			return representation, werr.Newf(werr.Malformed, "unknown codec strategy `%s`", strategy)

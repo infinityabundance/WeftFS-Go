@@ -30,10 +30,21 @@ type GCReport struct {
 	Candidates   []string
 	Deleted      []string
 	DeletedFiles uint64
+	// DeletedBytes counts physical bytes of data blobs (objects + manifests)
+	// unlinked by this pass. It excludes advisory index segments and packed
+	// plane reclamation, so it matches the shrink of the data tree rather
+	// than every byte this pass removed.
 	DeletedBytes uint64
+	// DeletedIndexBytes counts advisory index segments unlinked by this pass.
+	// Their bytes are real on disk but are not part of the data tree and must
+	// never be reported as data reclaimed.
+	DeletedIndexBytes uint64
+	// DeletedTotalBytes is DeletedBytes + DeletedIndexBytes + ReclaimedPacks.DeletedPackBytes:
+	// every byte this pass unlinked or reclaimed, from any directory.
+	DeletedTotalBytes uint64
 	// DeletedIndexes names advisory index segments removed by this pass. Their
-	// bytes are included in DeletedBytes; removing a segment never removes
-	// data, a later query simply rebuilds.
+	// bytes are counted separately in DeletedIndexBytes; removing a segment
+	// never removes data, a later query simply rebuilds.
 	DeletedIndexes []string
 	// Retained counts marked files plus unmarked files kept by the grace gate.
 	Retained      uint64
@@ -312,8 +323,9 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	report.Candidates = append(report.Candidates, indexCandidates...)
 	if apply {
 		report.DeletedIndexes = append(report.DeletedIndexes, indexDeleted...)
-		report.DeletedBytes += indexBytes
+		report.DeletedIndexBytes += indexBytes
 	}
+	report.DeletedTotalBytes = report.DeletedBytes + report.DeletedIndexBytes + report.ReclaimedPacks.DeletedPackBytes
 	return report, nil
 }
 

@@ -78,7 +78,7 @@ func TestFloatTiledStreamsPlannerCandidateAndDefault(t *testing.T) {
 	defer s.Close()
 
 	plan, err := s.PlanTensor("bf16", shape, payload, store.RowMajorTensorLayout(), nil,
-		store.TensorPlanOptions{TileShape: []uint64{16, 32}})
+		store.TensorPlanOptions{TileShape: []uint64{16, 32}, AllowExperimentalModes: true})
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
@@ -113,10 +113,11 @@ func TestFloatTiledStreamsCostRowIsMeasuredAndLoses(t *testing.T) {
 	}
 	plan, err := s.PlanTensor("bf16", shape, payload, store.RowMajorTensorLayout(), nil,
 		store.TensorPlanOptions{
-			TileShape:     []uint64{256, 1024},
-			NStreams:      4,
-			LambdaNS:      1000,
-			AccessPattern: pattern,
+			TileShape:              []uint64{256, 1024},
+			NStreams:               4,
+			LambdaNS:               1000,
+			AllowExperimentalModes: true,
+			AccessPattern:          pattern,
 		})
 	if err != nil {
 		t.Fatalf("plan: %v", err)

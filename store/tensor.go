@@ -240,6 +240,30 @@ func priceTensor(physicalBytes, estimatedNS, lambdaNS uint64) tensorCost {
 	return tensorCost{Hi: hi + carry, Lo: lo}
 }
 
+// effectiveWriteLambda is the explicit write lambda, or the decode lambda when
+// the caller did not set one (so --lambda-ns prices both).
+func (o TensorPlanOptions) effectiveWriteLambda() uint64 {
+	if o.LambdaWriteNSSet {
+		return o.LambdaWriteNS
+	}
+	return o.LambdaNS
+}
+
+// priceTensorWithWrite is the access-pattern objective:
+//
+//	physical + lambda_read*decode + lambda_write*encode
+//
+// Decode already accounts for reads_per_write; the encode is charged once for
+// the plan's single write.
+func priceTensorWithWrite(strategy TensorStrategy, physicalBytes, estimatedDecodeNS, size uint64, options TensorPlanOptions) tensorCost {
+	cost := priceTensor(physicalBytes, estimatedDecodeNS, options.LambdaNS)
+	encode := EstimateEncodeNS(strategy, size)
+	hi, lo := bits.Mul64(options.effectiveWriteLambda(), encode)
+	var carry uint64
+	lo, carry = bits.Add64(cost.Lo, lo, 0)
+	return tensorCost{Hi: cost.Hi + hi + carry, Lo: lo}
+}
+
 func (c tensorCost) less(other tensorCost) bool {
 	if c.Hi != other.Hi {
 		return c.Hi < other.Hi
@@ -319,6 +343,186 @@ func estimatedDecodeNS(strategy TensorStrategy, size uint64, options TensorPlanO
 			return estimate(regionBytes)
 		}
 		return full
+	}
+	switch options.AccessPattern.Kind {
+	case AccessPatternRegion:
+		reads := options.AccessPattern.ReadsPerWrite
+		if reads == 0 {
+			reads = 1
+		}
+		return saturatingMul(regionCost(options.AccessPattern.RegionBytes), reads)
+	case AccessPatternMixed:
+		whole := saturatingMul(full, options.AccessPattern.WholeReads)
+		region := saturatingMul(regionCost(options.AccessPattern.RegionBytes), options.AccessPattern.RegionReads)
+		if math.MaxUint64-whole < region {
+			return math.MaxUint64
+		}
+		return whole + region
+	default:
+		return full
+	}
+}
+
+// IsExperimental reports whether a strategy is experimental and therefore
+// never auto-selected without an explicit opt-in.
+func (s TensorStrategy) IsExperimental() bool {
+	return s == TensorStrategyFloatTiledStreams
+}
+
+// tensorElementBytes is the logical element width used by tile accounting.
+func tensorElementBytes(dtype string) uint64 {
+	switch dtype {
+	case "f16", "bf16", "i16":
+		return 2
+	case "f32", "i32":
+		return 4
+	case "f64", "i64":
+		return 8
+	default:
+		return 1
+	}
+}
+
+func ceilDiv(value, divisor uint64) uint64 {
+	if divisor == 0 {
+		return 0
+	}
+	return value/divisor + btoi(value%divisor != 0)
+}
+
+func btoi(value bool) uint64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+// tilesIntersected counts the whole tiles a leading row-major prefix read
+// touches. It mirrors Rust's TileGeometry::tiles_intersected.
+func tilesIntersected(shape, tileShape []uint64, elementBytes, regionBytes uint64) uint64 {
+	if len(shape) == 0 || len(shape) != len(tileShape) {
+		return 1
+	}
+	for _, extent := range shape {
+		if extent == 0 {
+			return 1
+		}
+	}
+	for _, tile := range tileShape {
+		if tile == 0 {
+			return 1
+		}
+	}
+	total := uint64(1)
+	for axis := range shape {
+		total = saturatingMul(total, ceilDiv(shape[axis], tileShape[axis]))
+	}
+	rowElements := uint64(1)
+	for axis := 1; axis < len(shape); axis++ {
+		rowElements = saturatingMul(rowElements, shape[axis])
+	}
+	if rowElements == 0 {
+		return total
+	}
+	if elementBytes == 0 {
+		elementBytes = 1
+	}
+	if regionBytes == 0 {
+		regionBytes = 1
+	}
+	elements := ceilDiv(regionBytes, elementBytes)
+	fullRows := elements / rowElements
+	remainder := elements % rowElements
+	if len(shape) == 1 {
+		rows := elements
+		if rows > shape[0] {
+			rows = shape[0]
+		}
+		tiles := ceilDiv(rows, tileShape[0])
+		if tiles > total {
+			tiles = total
+		}
+		if tiles == 0 {
+			tiles = 1
+		}
+		return tiles
+	}
+	var tiles uint64
+	if remainder == 0 {
+		rows := fullRows
+		if rows < 1 {
+			rows = 1
+		}
+		if rows > shape[0] {
+			rows = shape[0]
+		}
+		tiles = ceilDiv(rows, tileShape[0])
+		for axis := 1; axis < len(shape); axis++ {
+			tiles = saturatingMul(tiles, ceilDiv(shape[axis], tileShape[axis]))
+		}
+	} else {
+		rows := fullRows + 1
+		if rows > shape[0] {
+			rows = shape[0]
+		}
+		columns := remainder
+		if columns > shape[1] {
+			columns = shape[1]
+		}
+		tiles = saturatingMul(ceilDiv(rows, tileShape[0]), ceilDiv(columns, tileShape[1]))
+		for axis := 2; axis < len(shape); axis++ {
+			tiles = saturatingMul(tiles, ceilDiv(shape[axis], tileShape[axis]))
+		}
+	}
+	if tiles > total {
+		tiles = total
+	}
+	if tiles == 0 {
+		tiles = 1
+	}
+	return tiles
+}
+
+// estimatedDecodeNSFor prices a candidate at the configured pattern, counting
+// the whole tiles a region read intersects for tile-independent strategies.
+func estimatedDecodeNSFor(strategy TensorStrategy, size uint64, options TensorPlanOptions, shape, tileShape []uint64, dtype string) uint64 {
+	if strategy != TensorStrategyFloatTiled && strategy != TensorStrategyFloatTiledStreams {
+		return estimatedDecodeNS(strategy, size, options)
+	}
+	if len(tileShape) == 0 {
+		return estimatedDecodeNS(strategy, size, options)
+	}
+	model := options.CostModel
+	if model == "" {
+		model = DefaultCostModel
+	}
+	elementBytes := tensorElementBytes(dtype)
+	tileElements := uint64(1)
+	totalTiles := uint64(1)
+	for _, tile := range tileShape {
+		tileElements = saturatingMul(tileElements, tile)
+	}
+	tileBytes := saturatingMul(tileElements, elementBytes)
+	for axis := range shape {
+		if axis >= len(tileShape) {
+			break
+		}
+		totalTiles = saturatingMul(totalTiles, ceilDiv(shape[axis], tileShape[axis]))
+	}
+	full := estimatedDecodeNS(strategy, size, options)
+	perTile := func(bytes uint64) uint64 {
+		if strategy == TensorStrategyFloatTiledStreams && options.Cost == nil {
+			return EstimateMode18NS(bytes)
+		}
+		return EstimateDecodeNSWith(strategy.costClass(), bytes, model, options.Cost)
+	}
+	regionCost := func(regionBytes uint64) uint64 {
+		tiles := tilesIntersected(shape, tileShape, elementBytes, regionBytes)
+		if tiles == 0 {
+			tiles = 1
+		}
+		_ = totalTiles
+		return saturatingMul(perTile(tileBytes), tiles)
 	}
 	switch options.AccessPattern.Kind {
 	case AccessPatternRegion:
@@ -642,6 +846,22 @@ type TensorPlanOptions struct {
 	// LambdaNS is the number of bytes charged per estimated nanosecond of
 	// decode time. 0 is bytes-only.
 	LambdaNS uint64
+	// LambdaWriteNS is the number of bytes charged per estimated nanosecond of
+	// encode time. When LambdaWriteNSSet is false it tracks LambdaNS, so a
+	// bytes-only plan is unchanged and a latency-priced plan pays for its
+	// one-time encode.
+	LambdaWriteNS uint64
+	// LambdaWriteNSSet records whether LambdaWriteNS was set explicitly.
+	LambdaWriteNSSet bool
+	// AllowExperimentalModes permits experimental representations (mode 18) to
+	// be auto-selected. Default false: mode 18 stays selectable only by an
+	// explicit strategy hint.
+	AllowExperimentalModes bool
+	// NoZstd19 disables the level-19 ZSTD candidate (the zero value offers it).
+	NoZstd19 bool
+	// Zstd19CPUBudgetNS bounds the estimated level-19 encode time (0 = the
+	// 20 s default).
+	Zstd19CPUBudgetNS uint64
 	// CostModel selects the decode-cost table. The empty value means
 	// DefaultCostModel (measured).
 	CostModel CostModelKind
@@ -664,6 +884,12 @@ type TensorPlanOptions struct {
 	NStreams uint64
 }
 
+// zstd19MinBytes and zstd19CPUBudgetNS mirror the Rust defaults.
+const (
+	zstd19MinBytes    uint64 = 1024 * 1024
+	zstd19CPUBudgetNS uint64 = 20_000_000_000
+)
+
 // TensorWriteSpec is the option set for one tensor write.
 type TensorWriteSpec struct {
 	// StrategyHint is nil to run the planner, or a required strategy.
@@ -681,6 +907,9 @@ type TensorPlanCandidate struct {
 	Detail            string
 	PhysicalBytes     *uint64
 	EstimatedDecodeNS *uint64
+	// EstimatedEncodeNS is the one-time whole-tensor encode cost from the
+	// shared write-cost table (see EncodeCalibration).
+	EstimatedEncodeNS *uint64
 	Cost              *tensorCost
 	// Dependency is the base content root for weight-delta candidates.
 	Dependency *model.Hash32
@@ -691,10 +920,12 @@ type TensorPlan struct {
 	Chosen                    TensorStrategy
 	ChosenPhysicalBytes       uint64
 	ChosenEstimatedDecodeNS   uint64
+	ChosenEstimatedEncodeNS   uint64
 	ChosenCost                tensorCost
 	RunnerUp                  *TensorStrategy
 	RunnerUpPhysicalBytes     *uint64
 	RunnerUpEstimatedDecodeNS *uint64
+	RunnerUpEstimatedEncodeNS *uint64
 	RunnerUpCost              *tensorCost
 	Candidates                []TensorPlanCandidate
 }
@@ -779,7 +1010,9 @@ func (s *Store) WriteTensorFileWithSpec(
 	if err != nil {
 		return model.Hash32{}, err
 	}
-	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, spec.Causal, spec.Plan, false)
+	allowExperimental := spec.Plan.AllowExperimentalModes ||
+		(spec.StrategyHint != nil && spec.StrategyHint.IsExperimental())
+	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, spec.Causal, spec.Plan, false, allowExperimental)
 	if err != nil {
 		return model.Hash32{}, err
 	}
@@ -854,7 +1087,8 @@ func (s *Store) PlanTensorIndependent(
 		return TensorIndependentPlan{}, err
 	}
 	prepared, err := s.prepareTensorCandidates(
-		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true)
+		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true,
+		options.AllowExperimentalModes || (hint != nil && hint.IsExperimental()))
 	if err != nil {
 		return TensorIndependentPlan{}, err
 	}
@@ -904,7 +1138,8 @@ func (s *Store) RebaseTensorObject(
 		return TensorRebase{}, err
 	}
 	prepared, err := s.prepareTensorCandidates(
-		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true)
+		meta.Dtype, meta.Shape, logical, meta.Layout, nil, options, true,
+		options.AllowExperimentalModes || (hint != nil && hint.IsExperimental()))
 	if err != nil {
 		return TensorRebase{}, err
 	}
@@ -1036,7 +1271,7 @@ func (s *Store) PlanTensor(
 	if err != nil {
 		return TensorPlan{}, err
 	}
-	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, causal, options, false)
+	prepared, err := s.prepareTensorCandidates(dtype, shape, logical, layout, causal, options, false, options.AllowExperimentalModes)
 	if err != nil {
 		return TensorPlan{}, err
 	}
@@ -1068,6 +1303,9 @@ func (s *Store) PlanTensor(
 	if chosen.candidate.EstimatedDecodeNS != nil {
 		plan.ChosenEstimatedDecodeNS = *chosen.candidate.EstimatedDecodeNS
 	}
+	if chosen.candidate.EstimatedEncodeNS != nil {
+		plan.ChosenEstimatedEncodeNS = *chosen.candidate.EstimatedEncodeNS
+	}
 	if chosen.candidate.Cost != nil {
 		plan.ChosenCost = *chosen.candidate.Cost
 	}
@@ -1076,6 +1314,7 @@ func (s *Store) PlanTensor(
 		plan.RunnerUp = &strategy
 		plan.RunnerUpPhysicalBytes = runnerUp.candidate.PhysicalBytes
 		plan.RunnerUpEstimatedDecodeNS = runnerUp.candidate.EstimatedDecodeNS
+		plan.RunnerUpEstimatedEncodeNS = runnerUp.candidate.EstimatedEncodeNS
 		plan.RunnerUpCost = runnerUp.candidate.Cost
 	}
 	for _, item := range prepared {
@@ -1109,6 +1348,7 @@ func (s *Store) prepareTensorCandidates(
 	causal []model.Hash32,
 	options TensorPlanOptions,
 	independentOnly bool,
+	allowExperimental bool,
 ) ([]preparedTensorCandidate, error) {
 	lim := limits.Default()
 	size := uint64(len(logical))
@@ -1133,7 +1373,8 @@ func (s *Store) prepareTensorCandidates(
 				Detail:            "canonical row-major chunks",
 				PhysicalBytes:     uint64Ptr(size),
 				EstimatedDecodeNS: uint64Ptr(estimatedDecodeNS(TensorStrategyRaw, size, options)),
-				Cost:              costPtr(priceTensor(size, estimatedDecodeNS(TensorStrategyRaw, size, options), options.LambdaNS)),
+				EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyRaw, size)),
+				Cost:              costPtr(priceTensorWithWrite(TensorStrategyRaw, size, estimatedDecodeNS(TensorStrategyRaw, size, options), size, options)),
 			},
 			artifact: &tensorArtifact{
 				Kind: model.RepresentationRaw, StrategyName: model.StrategyRaw,
@@ -1159,13 +1400,48 @@ func (s *Store) prepareTensorCandidates(
 				Detail:            "one ZSTD frame",
 				PhysicalBytes:     uint64Ptr(physical),
 				EstimatedDecodeNS: uint64Ptr(estimate),
-				Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+				EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyZstd, size)),
+				Cost:              costPtr(priceTensorWithWrite(TensorStrategyZstd, physical, estimate, size, options)),
 			},
 			artifact: &tensorArtifact{
 				Kind: model.RepresentationCodec, StrategyName: model.StrategyZstd,
 				Frame: zstdFrame,
 			},
 		})
+	}
+
+	// ZSTD level 19: the same frozen ZSTD mode encoded again at a much slower
+	// setting. Only offered by the planned policy, above the size threshold,
+	// and inside the CPU budget. Mirrors the Rust candidate.
+	// Go has no separate fast write policy; the candidate is offered whenever
+	// the caller did not disable it and the bounds hold.
+	if !quantized && !options.NoZstd19 && size >= zstd19MinBytes {
+		budget := options.Zstd19CPUBudgetNS
+		if budget == 0 {
+			budget = zstd19CPUBudgetNS
+		}
+		encodeNS := EstimateEncodeNSClass(EncodeClassZstd19, size)
+		if encodeNS <= budget {
+			if frameBytes, err := modes.EncodeZstd(logical, 19, int(codecChunk), lim); err == nil {
+				physical := uint64(len(frameBytes))
+				estimate := estimatedDecodeNS(TensorStrategyZstd, size, options)
+				encoded := encodeNS
+				out = append(out, preparedTensorCandidate{
+					candidate: TensorPlanCandidate{
+						Strategy: TensorStrategyZstd, Applicable: true,
+						Detail:            "one ZSTD level-19 frame",
+						PhysicalBytes:     uint64Ptr(physical),
+						EstimatedDecodeNS: uint64Ptr(estimate),
+						EstimatedEncodeNS: &encoded,
+						Cost:              costPtr(priceTensorWithWrite(TensorStrategyZstd, physical, estimate, size, options)),
+					},
+					artifact: &tensorArtifact{
+						Kind: model.RepresentationCodec, StrategyName: model.StrategyZstd,
+						Frame: frameBytes,
+					},
+				})
+			}
+		}
 	}
 
 	// Mode 9 FLOAT_TENSOR. Offered for byte-aligned float dtypes; priced only
@@ -1204,7 +1480,8 @@ func (s *Store) prepareTensorCandidates(
 					Detail:            "one mode-9 FLOAT_TENSOR frame (" + floatDtype.Name + ")",
 					PhysicalBytes:     uint64Ptr(physical),
 					EstimatedDecodeNS: uint64Ptr(estimate),
-					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyFloatTensor, size)),
+					Cost:              costPtr(priceTensorWithWrite(TensorStrategyFloatTensor, physical, estimate, size, options)),
 				},
 				artifact: &tensorArtifact{
 					Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTensor.String(),
@@ -1237,14 +1514,15 @@ func (s *Store) prepareTensorCandidates(
 		out = append(out, skippedTensor(TensorStrategyFloatTiled, err.Error()))
 	} else {
 		physical := uint64(len(frameBytes))
-		estimate := estimatedDecodeNS(TensorStrategyFloatTiled, size, options)
+		estimate := estimatedDecodeNSFor(TensorStrategyFloatTiled, size, options, shape, options.TileShape, dtype)
 		out = append(out, preparedTensorCandidate{
 			candidate: TensorPlanCandidate{
 				Strategy: TensorStrategyFloatTiled, Applicable: true,
 				Detail:            "one mode-17 float-tiled frame",
 				PhysicalBytes:     uint64Ptr(physical),
 				EstimatedDecodeNS: uint64Ptr(estimate),
-				Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+				EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyFloatTiled, size)),
+				Cost:              costPtr(priceTensorWithWrite(TensorStrategyFloatTiled, physical, estimate, size, options)),
 			},
 			artifact: &tensorArtifact{
 				Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTiled.String(),
@@ -1261,7 +1539,14 @@ func (s *Store) prepareTensorCandidates(
 	// Same tile opt-in as mode 17; the bytes-only default keeps choosing the
 	// strictly smaller representation because mode 18 pays one 256-byte table
 	// per exponent stream.
-	if len(options.TileShape) == 0 {
+	//
+	// EXPERIMENTAL GATE: mode 18 lost every measured axis, so it is never
+	// auto-selected. It is prepared (and therefore selectable) only when the
+	// caller opted in with --allow-experimental-modes or named the strategy.
+	if !allowExperimental {
+		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams,
+			"experimental: mode 18 is not auto-selected; pass --allow-experimental-modes or name the strategy"))
+	} else if len(options.TileShape) == 0 {
 		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, "no tile shape supplied"))
 	} else if floatDtype, ok := floatTensorDtype(dtype); !ok {
 		out = append(out, skippedTensor(TensorStrategyFloatTiledStreams,
@@ -1284,14 +1569,15 @@ func (s *Store) prepareTensorCandidates(
 			out = append(out, skippedTensor(TensorStrategyFloatTiledStreams, err.Error()))
 		} else {
 			physical := uint64(len(frameBytes))
-			estimate := estimatedDecodeNS(TensorStrategyFloatTiledStreams, size, options)
+			estimate := estimatedDecodeNSFor(TensorStrategyFloatTiledStreams, size, options, shape, options.TileShape, dtype)
 			out = append(out, preparedTensorCandidate{
 				candidate: TensorPlanCandidate{
 					Strategy: TensorStrategyFloatTiledStreams, Applicable: true,
 					Detail:            fmt.Sprintf("one mode-18 float-tiled frame with %d streams", nStreams),
 					PhysicalBytes:     uint64Ptr(physical),
 					EstimatedDecodeNS: uint64Ptr(estimate),
-					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyFloatTiledStreams, size)),
+					Cost:              costPtr(priceTensorWithWrite(TensorStrategyFloatTiledStreams, physical, estimate, size, options)),
 				},
 				artifact: &tensorArtifact{
 					Kind: model.RepresentationTensor, StrategyName: TensorStrategyFloatTiledStreams.String(),
@@ -1319,7 +1605,8 @@ func (s *Store) prepareTensorCandidates(
 					Detail:            "one mode-10 shard (shard_count = 1)",
 					PhysicalBytes:     uint64Ptr(physical),
 					EstimatedDecodeNS: uint64Ptr(estimate),
-					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategySharded, size)),
+					Cost:              costPtr(priceTensorWithWrite(TensorStrategySharded, physical, estimate, size, options)),
 				},
 				artifact: &tensorArtifact{
 					Kind: model.RepresentationTensor, StrategyName: TensorStrategySharded.String(),
@@ -1361,7 +1648,8 @@ func (s *Store) prepareTensorCandidates(
 					Detail:            "mode 11 against the causal parent",
 					PhysicalBytes:     uint64Ptr(physical),
 					EstimatedDecodeNS: uint64Ptr(estimate),
-					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategyWeightDelta, size)),
+					Cost:              costPtr(priceTensorWithWrite(TensorStrategyWeightDelta, physical, estimate, size, options)),
 					Dependency:        dependency,
 				},
 				artifact: &tensorArtifact{
@@ -1405,7 +1693,8 @@ func (s *Store) prepareTensorCandidates(
 					Detail:            "mode 16 against the causal parent",
 					PhysicalBytes:     uint64Ptr(physical),
 					EstimatedDecodeNS: uint64Ptr(estimate),
-					Cost:              costPtr(priceTensor(physical, estimate, options.LambdaNS)),
+					EstimatedEncodeNS: uint64Ptr(EstimateEncodeNS(TensorStrategySparseDelta, size)),
+					Cost:              costPtr(priceTensorWithWrite(TensorStrategySparseDelta, physical, estimate, size, options)),
 					Dependency:        dependency,
 				},
 				artifact: &tensorArtifact{

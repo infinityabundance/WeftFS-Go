@@ -987,6 +987,8 @@ func cmdWrite(args []string, storeDir string) error {
 	tileShapeText := fs.String("tile-shape", "", "mode-17 FLOAT_TILED tile extents as comma-separated u64 values")
 	accessPatternText := fs.String("access-pattern", "whole", "whole, region:BYTES:READS, or mixed:WHOLE:BYTES:READS")
 	lambdaNS := fs.Uint64("lambda-ns", 0, "bytes charged per estimated decode nanosecond")
+	lambdaWriteNS := fs.Uint64("lambda-write-ns", 0, "bytes charged per estimated encode nanosecond (defaults to --lambda-ns)")
+	allowExperimental := fs.Bool("allow-experimental-modes", false, "allow experimental representations (mode 18) to be auto-selected")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -1051,7 +1053,9 @@ func cmdWrite(args []string, storeDir string) error {
 			Causal:       causalIDs,
 			Plan: store.TensorPlanOptions{
 				LambdaNS: *lambdaNS, CostModel: plannerCostModel, Cost: activeCostTable(),
-				TileShape: tileShape, AccessPattern: accessPattern,
+				LambdaWriteNS: *lambdaWriteNS, LambdaWriteNSSet: flagSet(fs, "lambda-write-ns"),
+				AllowExperimentalModes: *allowExperimental,
+				TileShape:              tileShape, AccessPattern: accessPattern,
 			},
 		})
 		if err != nil {
@@ -2317,14 +2321,16 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 		return s.GCWatch(ctx, *interval, *maxDeletes, func(report store.GCReport) {
 			if jsonOut {
 				_ = encoder.Encode(map[string]any{
-					"applied":           report.Applied,
-					"deleted_files":     report.DeletedFiles,
-					"deleted_bytes":     report.DeletedBytes,
-					"unreachable_files": report.UnreachableFiles,
-					"remaining_files":   report.RemainingFiles,
-					"grace_retained":    report.GraceRetained,
-					"removed_orphans":   len(report.RemovedOrphans),
-					"problems":          len(report.Problems),
+					"applied":             report.Applied,
+					"deleted_files":       report.DeletedFiles,
+					"deleted_bytes":       report.DeletedBytes,
+					"deleted_index_bytes": report.DeletedIndexBytes,
+					"deleted_total_bytes": report.DeletedTotalBytes,
+					"unreachable_files":   report.UnreachableFiles,
+					"remaining_files":     report.RemainingFiles,
+					"grace_retained":      report.GraceRetained,
+					"removed_orphans":     len(report.RemovedOrphans),
+					"problems":            len(report.Problems),
 				})
 				return
 			}
@@ -2354,23 +2360,26 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 			problems = []string{}
 		}
 		return printJSON(map[string]any{
-			"applied":           report.Applied,
-			"marked_manifests":  report.MarkedManifests,
-			"marked_chunks":     report.MarkedChunks,
-			"reachable_files":   report.ReachableFiles,
-			"reachable_bytes":   report.ReachableBytes,
-			"unreachable_files": report.UnreachableFiles,
-			"unreachable_bytes": report.UnreachableBytes,
-			"remaining_files":   report.RemainingFiles,
-			"remaining_bytes":   report.RemainingBytes,
-			"deleted_files":     report.DeletedFiles,
-			"deleted_bytes":     report.DeletedBytes,
-			"retained":          report.Retained,
-			"grace_retained":    report.GraceRetained,
-			"removed_orphans":   removedOrphans,
-			"candidates":        candidates,
-			"deleted":           deleted,
-			"problems":          problems,
+			"applied":             report.Applied,
+			"marked_manifests":    report.MarkedManifests,
+			"marked_chunks":       report.MarkedChunks,
+			"reachable_files":     report.ReachableFiles,
+			"reachable_bytes":     report.ReachableBytes,
+			"unreachable_files":   report.UnreachableFiles,
+			"unreachable_bytes":   report.UnreachableBytes,
+			"remaining_files":     report.RemainingFiles,
+			"remaining_bytes":     report.RemainingBytes,
+			"deleted_files":       report.DeletedFiles,
+			"deleted_bytes":       report.DeletedBytes,
+			"deleted_index_bytes": report.DeletedIndexBytes,
+			"deleted_total_bytes": report.DeletedTotalBytes,
+			"reclaimed_packs":     report.ReclaimedPacks,
+			"retained":            report.Retained,
+			"grace_retained":      report.GraceRetained,
+			"removed_orphans":     removedOrphans,
+			"candidates":          candidates,
+			"deleted":             deleted,
+			"problems":            problems,
 		})
 	}
 	fmt.Printf("applied=%v\n", report.Applied)
@@ -2384,6 +2393,8 @@ func cmdGC(args []string, storeDir string, jsonOut bool) error {
 	fmt.Printf("remaining_bytes=%d\n", report.RemainingBytes)
 	fmt.Printf("deleted_files=%d\n", report.DeletedFiles)
 	fmt.Printf("deleted_bytes=%d\n", report.DeletedBytes)
+	fmt.Printf("deleted_index_bytes=%d\n", report.DeletedIndexBytes)
+	fmt.Printf("deleted_total_bytes=%d\n", report.DeletedTotalBytes)
 	fmt.Printf("retained=%d\n", report.Retained)
 	fmt.Printf("grace_retained=%d\n", report.GraceRetained)
 	for _, id := range report.RemovedOrphans {
