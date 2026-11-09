@@ -87,6 +87,8 @@ func TensorStrategyForMode(mode uint32) (string, bool) {
 		return "float-tiled", true
 	case 18:
 		return "float-tiled-streams", true
+	case 20:
+		return "engram-shard", true
 	default:
 		return "", false
 	}
@@ -116,6 +118,8 @@ func TensorModeForStrategy(strategy string) (uint32, bool) {
 		return 17, true
 	case "float-tiled-streams":
 		return 18, true
+	case "engram-shard":
+		return 20, true
 	default:
 		return 0, false
 	}
@@ -340,7 +344,14 @@ func tensorRepresentationFromWCB(m map[string]wcb.Value) (Representation, error)
 	if err != nil {
 		return representation, err
 	}
-	if TensorModeHasDependency(mode) {
+	if mode == 20 {
+		// An inline engram table has no dependency; an incrementally updated
+		// table names exactly one earlier artifact.
+		if len(dependencies) > 1 {
+			return representation, werr.Newf(werr.Malformed,
+				"engram-shard representation allows at most one dependency")
+		}
+	} else if TensorModeHasDependency(mode) {
 		if len(dependencies) != 1 {
 			return representation, werr.Newf(werr.Malformed,
 				"weight-delta/semantic-delta representation requires exactly one dependency")

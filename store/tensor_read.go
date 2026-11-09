@@ -102,6 +102,19 @@ func readTensorRange(
 				err = werr.Newf(werr.Corrupt, "mode-17 logical root disagrees with the manifest")
 			}
 		}
+	case 20:
+		var source *dependency.MapFrameSource
+		source, err = engramFrameSource(src, rep)
+		if err == nil {
+			logical, err = modes.DecodeEngram(context.Background(), parsed, source, lim)
+		}
+		if err == nil {
+			var root model.Hash32
+			root, err = tensor.LogicalRoot(rep.Tensor.Dtype, rep.Tensor.Shape, logical, lim)
+			if err == nil && root != rep.Tensor.LogicalRoot {
+				err = werr.Newf(werr.Corrupt, "mode-20 logical root disagrees with the manifest")
+			}
+		}
 	default:
 		return nil, werr.Newf(werr.Corrupt,
 			"tensor_mode %d is not a defined tensor frame mode", rep.Tensor.Mode)
@@ -161,9 +174,39 @@ func tensorFrameMode(mode uint32) (frame.Mode, bool) {
 		return frame.ModeFloatTiled, true
 	case 18:
 		return frame.ModeFloatTiledStreams, true
+	case 20:
+		return frame.ModeEngramShard, true
 	default:
 		return 0, false
 	}
+}
+
+// engramFrameSource builds a frame source for a mode-20 representation's
+// dependency manifests. Each dependency is an earlier tensor object's manifest
+// id; its frame is keyed by the frame's own content hash (the hash named by
+// the engram frame's dependency table).
+func engramFrameSource(src blobSource, rep *model.Representation) (*dependency.MapFrameSource, error) {
+	source := dependency.NewMapFrameSource()
+	lim := limits.Default()
+	for _, dep := range rep.Dependencies {
+		depManifest, err := readManifest(src, dep)
+		if err != nil {
+			return nil, err
+		}
+		if depManifest.Representation == nil || depManifest.Representation.Frame == nil {
+			return nil, werr.Newf(werr.Corrupt,
+				"engram dependency has no frame")
+		}
+		frameBytes, err := readBlobVerified(src, BlobManifest,
+			*depManifest.Representation.Frame, model.DomainManifest)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := source.InsertFrame(context.Background(), frameBytes, lim); err != nil {
+			return nil, werr.FromCodec(err)
+		}
+	}
+	return source, nil
 }
 
 func decodeTensorMode9(

@@ -2202,6 +2202,20 @@ func (s *Store) ReadTensorRegion(id model.Hash32, region tensor.Region) (tensor.
 	if err != nil {
 		return tensor.RegionRead{}, err
 	}
+	// Mode 20 is independently region-addressable: decode only the groups
+	// whose row intervals intersect the region.
+	record, err := s.ObjectMeta(id)
+	if err != nil {
+		return tensor.RegionRead{}, err
+	}
+	manifest, err := readManifest(s.blobs, record.Content)
+	if err != nil {
+		return tensor.RegionRead{}, err
+	}
+	if manifest.Representation != nil && manifest.Representation.Tensor != nil &&
+		manifest.Representation.Tensor.Mode == 20 {
+		return s.readEngramRegion(manifest, region)
+	}
 	bytesValue, err := s.ReadObject(id)
 	if err != nil {
 		return tensor.RegionRead{}, err
@@ -2220,6 +2234,65 @@ func (s *Store) ReadTensorRegion(id model.Hash32, region tensor.Region) (tensor.
 		return tensor.RegionRead{}, werr.FromCodec(err)
 	}
 	return read, nil
+}
+
+// readEngramRegion decodes only the mode-20 groups intersecting the region.
+// It reads the frame blob and its dependency frames, then calls the codec's
+// group-region reader; untouched groups are never decoded. The exact region
+// (including a column subset) is returned.
+func (s *Store) readEngramRegion(manifest model.Manifest, region tensor.Region) (tensor.RegionRead, error) {
+	rep := manifest.Representation
+	if rep == nil || rep.Frame == nil {
+		return tensor.RegionRead{}, werr.Newf(werr.Corrupt, "engram representation has no frame")
+	}
+	lim := limits.Default()
+	frameBytes, err := readBlobVerified(s.blobs, BlobManifest, *rep.Frame, model.DomainManifest)
+	if err != nil {
+		return tensor.RegionRead{}, err
+	}
+	parsed, err := frame.Parse(frameBytes, lim)
+	if err != nil {
+		return tensor.RegionRead{}, werr.FromCodec(err)
+	}
+	descriptor, err := modes.ParseEngram(parsed, lim)
+	if err != nil {
+		return tensor.RegionRead{}, werr.FromCodec(err)
+	}
+	if len(region.Start) != 2 || len(region.End) != 2 {
+		return tensor.RegionRead{}, werr.Newf(werr.InvalidArgument,
+			"engram regions must have rank 2")
+	}
+	source, err := engramFrameSource(s.blobs, rep)
+	if err != nil {
+		return tensor.RegionRead{}, err
+	}
+	rows, touched, err := modes.ReadEngramRegion(
+		context.Background(), parsed, descriptor, region.Start[0], region.End[0], source, lim)
+	if err != nil {
+		return tensor.RegionRead{}, werr.FromCodec(err)
+	}
+	dim := descriptor.Meta.TableShape[1]
+	word, err := modes.TensorElementSize(descriptor.Meta.Dtype)
+	if err != nil {
+		return tensor.RegionRead{}, werr.FromCodec(err)
+	}
+	out := rows
+	if region.Start[1] != 0 || region.End[1] != dim {
+		rowBytes := dim * word
+		colStart := region.Start[1] * word
+		colEnd := region.End[1] * word
+		rowCount := region.End[0] - region.Start[0]
+		out = make([]byte, 0, int(rowCount*(colEnd-colStart)))
+		for row := uint64(0); row < rowCount; row++ {
+			base := row * rowBytes
+			out = append(out, rows[base+colStart:base+colEnd]...)
+		}
+	}
+	return tensor.RegionRead{
+		Shape:        region.Extent(),
+		Bytes:        out,
+		UnitsTouched: uint64(len(touched)),
+	}, nil
 }
 
 // TensorLogicalRoot recomputes and verifies an object's LogicalTensorRoot.
