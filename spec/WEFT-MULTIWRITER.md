@@ -326,7 +326,7 @@ use. The transaction records the state it observed when it was built (the
 
 | class | detection | outcome | rule that makes it safe |
 |---|---|---|---|
-| `NameExists` | a directory entry for `(parent, name)` now targets a different object | reject (`Conflict`) | a name is a unique key; two different targets cannot both be visible under one name |
+| `NameExists` | a create of `(parent, name)` finds the name already taken by a different object | reject (`Conflict`) | a name is a unique key; two different targets cannot both be visible under one name. A caller that intends to replace a name must observe the existing entry (`put_entry`), not use create semantics (`put_entry_create`). |
 | `NameIdempotent` | the entry now targets the same object | merge (no-op) | the transactions are observably identical for this op |
 | `ObjectChanged` | `PutObject` for an existing id whose current `version` differs from the observed version | reject (`Conflict`) | a version is an immutable identity of the object content; replacing it without having observed it would be last-writer-wins |
 | `ObjectAbsent` | `PutObject` replacing an object that has disappeared | reject (`Conflict`) | the update's base is gone; it cannot be replayed |
@@ -463,7 +463,7 @@ exact.
 | MW2 on `gcs`/`azure` | code path only, no concurrent court | no | not claimed |
 | MW2 for FUSE file mutations | **not implemented** | **not implemented** | FUSE remains MW1 |
 | MW2 for checkpoint publish | **not implemented as a generic path**; a tensor/shard set can be expressed as a transaction | no | not claimed |
-| mixed Rust/Go concurrent writers | yes | yes | `scripts/multiwriter_court.sh` |
+| mixed Rust/Go concurrent writers | yes | yes | `scripts/multiwriter_court.sh`, receipt `multiwriter-court-20261109T143346Z` (parity commit file and superblock byte-identical; 160/160 disjoint; 1/80 contended winner; finite history check) |
 | model-checked multi-committer invariants | bounded TLA+ | n/a | `verification/tla/WeftMultiWriter.tla` |
 | linearizability proof | **no** | **no** | finite history check only |
 | MW3 (distributed scalable) | **no** | **no** | not claimed |

@@ -148,7 +148,8 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	if err := s.requireWritable(); err != nil {
 		return report, err
 	}
-	if !s.writerLockHeld {
+	optimistic := s.options.WriterMode == WriterModeOptimistic
+	if !s.writerLockHeld && !optimistic {
 		return report, werr.Newf(werr.Busy, "store writer lock is not held")
 	}
 	if err := checkCancel(ctx); err != nil {
@@ -161,6 +162,15 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	// touched. This runs before marking so the updated state is authoritative.
 	if apply {
 		orphans := s.orphanObjectIDs()
+		if optimistic && len(orphans) > 0 {
+			// Removing orphan object records is a logical publish. In MW2 it
+			// must go through a validated transaction; R4 does not implement
+			// that, so the pass reports the refusal instead of publishing
+			// without conflict validation.
+			report.Problems = append(report.Problems,
+				"orphan object records were not removed: run GC from a single-writer open")
+			orphans = nil
+		}
 		if len(orphans) > 0 {
 			ops := make([]model.Op, 0, len(orphans))
 			for _, id := range orphans {
@@ -179,8 +189,27 @@ func (s *Store) gcPass(ctx context.Context, apply bool, maxDeletes int, graceSec
 	markedManifests := make(map[model.Hash32]struct{})
 	markedChunks := make(map[model.Hash32]struct{})
 
+	// A live prepared transaction pins the manifests its ops name. Expired
+	// records are abandoned and may be removed on apply.
+	txGraceNS := int64(0)
+	if s.options.GCGraceSecs < uint64((1<<62)/1_000_000_000) {
+		txGraceNS = int64(s.options.GCGraceSecs) * 1_000_000_000
+	} else {
+		txGraceNS = 1 << 62
+	}
+	nowNS := s.nowNS()
+	expiredTx, txErr := s.markPreparedTransactions(txGraceNS, nowNS, markedManifests, markedChunks, &report.Problems)
+	if txErr != nil {
+		return report, txErr
+	}
+
 	if err := markState(ctx, s.blobs, s.state, markedManifests, markedChunks, &report.Problems); err != nil {
 		return report, err
+	}
+	if apply {
+		for _, name := range expiredTx {
+			_ = s.commits.DeleteRecord(name)
+		}
 	}
 
 	snapshotNames := make([]string, 0, len(s.state.Snapshots))
@@ -391,6 +420,48 @@ func markState(ctx context.Context, src blobSource, state *model.State, manifest
 // raw chunks, the codec frame blob, and (transitively, bounded) dependency
 // content roots. It mirrors the Rust GC so a GC that keeps a dependent keeps
 // its whole dependency closure.
+// markPreparedTransactions marks the manifests a live prepared MW2 transaction
+// still needs, and returns the records that are past the grace window.
+func (s *Store) markPreparedTransactions(graceNS, nowNS int64, manifests, chunks map[model.Hash32]struct{}, problems *[]string) ([]string, error) {
+	names, err := s.commits.ListRecords("txs/")
+	if err != nil {
+		return nil, err
+	}
+	if len(names) > 4096 {
+		return nil, werr.Newf(werr.LimitExceeded,
+			"%d prepared transaction records exceed the 4096-record GC bound", len(names))
+	}
+	expired := make([]string, 0)
+	seen := make(map[model.Hash32]struct{})
+	for _, name := range names {
+		data, ok, err := s.commits.ReadRecord(name)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		record, err := DecodeTxRecord(data)
+		if err != nil {
+			return nil, err
+		}
+		age := nowNS - record.UpdatedNS
+		if age < 0 {
+			age = 0
+		}
+		if record.State == TxPrepared && age <= graceNS {
+			for _, pin := range record.Pins {
+				if err := markManifestTree(context.Background(), s.blobs, pin, manifests, chunks, problems, 0, seen); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			expired = append(expired, name)
+		}
+	}
+	return expired, nil
+}
+
 func markManifestTree(ctx context.Context, src blobSource, manifestID model.Hash32, manifests, chunks map[model.Hash32]struct{}, problems *[]string, depth int, seen map[model.Hash32]struct{}) error {
 	if err := checkCancel(ctx); err != nil {
 		return err

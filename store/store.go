@@ -129,6 +129,11 @@ type Options struct {
 	// PackOptions is the physical packing policy; zero fields take the
 	// DefaultPackOptions values before validation.
 	PackOptions PackOptions
+	// WriterMode selects the control-state publication contract. The empty
+	// value is `single` (MW1). `optimistic` is MW2 and is implemented for the
+	// local and object commit planes; it applies to the explicit transaction
+	// API only. See spec/WEFT-MULTIWRITER.md.
+	WriterMode WriterMode
 	// S3 configures an S3-compatible endpoint. It is required when either
 	// BlobBackend or CommitBackend is `s3` and ignored otherwise.
 	S3 *S3Config
@@ -302,6 +307,17 @@ func validateOptions(opts Options) error {
 	}
 	if opts.CommitBackend == "" {
 		opts.CommitBackend = PlaneLocal
+	}
+	if _, err := parseWriterMode(string(opts.WriterMode)); err != nil {
+		return err
+	}
+	if opts.WriterMode == WriterModeOptimistic {
+		// Go MW2 uses the POSIX publication lock; a remote commit plane's
+		// conditional write is a different protocol and is not claimed here.
+		if opts.CommitBackend != PlaneLocal && opts.CommitBackend != PlaneObject {
+			return werr.Newf(werr.Unsupported,
+				"optimistic writer mode is implemented for the local and object commit planes in Go, not %q", opts.CommitBackend)
+		}
 	}
 	if _, err := ParsePlaneKind(string(opts.BlobBackend)); err != nil {
 		return err
@@ -581,14 +597,17 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	if string(format) != model.FormatContents {
 		return nil, werr.Newf(werr.Unsupported, "FORMAT is %q, expected %q", string(format), model.FormatContents)
 	}
+	optimistic := mode == ReadWrite && opts.WriterMode == WriterModeOptimistic
 	if mode == ReadWrite {
 		if err := requireWritablePlanes(store.blobs.Capabilities(), store.commits.Capabilities()); err != nil {
 			return nil, err
 		}
-		if err := store.commits.AcquireWriterLock(); err != nil {
-			return nil, err
+		if !optimistic {
+			if err := store.commits.AcquireWriterLock(); err != nil {
+				return nil, err
+			}
+			store.writerLockHeld = true
 		}
-		store.writerLockHeld = true
 		if err := store.commits.EnsureLayout(); err != nil {
 			_ = store.commits.ReleaseWriterLock()
 			return nil, err
@@ -617,6 +636,10 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	switch {
 	case fullScan:
 		recovery, err = recoverFullScan(store.commits, store.blobs)
+	case optimistic:
+		// The superblock is authoritative in MW2; a stale writer-lock record
+		// from an earlier single-writer life must not override it.
+		recovery, err = recoverForWrite(headAttestHider{store.commits}, store.blobs)
 	case mode == ReadWrite:
 		recovery, err = recoverForWrite(store.commits, store.blobs)
 	default:
@@ -629,7 +652,7 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	// A writable open repairs the superblock cache from the writer lock record:
 	// the record is the publication point, the cache is a cache. A repair
 	// failure is not fatal (recovery already used the record).
-	if mode == ReadWrite {
+	if mode == ReadWrite && !optimistic {
 		if generation, commit, commitLen, ok, headErr := store.commits.AttestedHead(); headErr == nil && ok && commitLen != 0 {
 			_ = store.commits.RefreshHeadCache(generation, commit, commitLen, 0)
 		}
@@ -654,6 +677,12 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	store.blobIndex = map[model.Hash32]uint64{}
 	store.access = loadAccessCountsFrom(store.commits)
 	store.loadQuotaRecord()
+	if mode == ReadWrite {
+		if err := store.ensureWriterPolicy(opts.WriterMode); err != nil {
+			_ = store.commits.ReleaseWriterLock()
+			return nil, err
+		}
+	}
 	return store, nil
 }
 
@@ -1539,11 +1568,19 @@ func hashPtr(h model.Hash32) *model.Hash32 {
 	return &copy
 }
 
-// publishCommit writes the commit record, fences the writer, publishes the
-// superblock slot, then syncs the plane. The order is the durable publication
-// protocol: nothing names the head before the commit record and every blob it
-// names are visible.
+// publishCommit publishes through the configured writer mode.
 func (s *Store) publishCommit(commit model.Commit) (model.Hash32, error) {
+	if s.options.WriterMode == WriterModeOptimistic {
+		return s.publishCommitOptimistic(commit)
+	}
+	return s.publishCommitSingle(commit)
+}
+
+// publishCommitSingle writes the commit record, fences the writer, publishes
+// the superblock slot, then syncs the plane. The order is the durable
+// publication protocol: nothing names the head before the commit record and
+// every blob it names are visible.
+func (s *Store) publishCommitSingle(commit model.Commit) (model.Hash32, error) {
 	// Every blob the commit names must be durable and visible before the
 	// commit record is published. A packed plane buffers the open pack.
 	if err := s.blobs.Flush(); err != nil {
