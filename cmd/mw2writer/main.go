@@ -168,6 +168,13 @@ func main() {
 			prefix = writer
 		}
 		hot := arg(args, "--hot")
+		explicitTx := arg(args, "--tx-id")
+		pauseMS := uint64(0)
+		if text := arg(args, "--pause-before-execute-ms"); text != "" {
+			if value, err := strconv.ParseUint(text, 10, 64); err == nil {
+				pauseMS = value
+			}
+		}
 		s, err := store.OpenWithOptions(storePath, store.ReadWrite, options(store.WriterModeOptimistic, now))
 		if err != nil {
 			fail(err)
@@ -205,7 +212,12 @@ func main() {
 				continue
 			}
 			entry := model.EntryRecord{ID: entryID, Parent: model.RootID, Name: []byte(name), Target: objectID}
-			txID := hash.Domain("weft/tx/id/v1", []byte(fmt.Sprintf("%s:%d", writer, index))).Hex()[:32]
+			txID := ""
+			if explicitTx != "" && count == 1 {
+				txID = explicitTx
+			} else {
+				txID = hash.Domain("weft/tx/id/v1", []byte(fmt.Sprintf("%s:%d", writer, index))).Hex()[:32]
+			}
 			tx, err := s.BeginTransaction(txID)
 			if err != nil {
 				errorsList = append(errorsList, err.Error())
@@ -222,6 +234,9 @@ func main() {
 			if err := tx.SetTip(s.CurrentState(), objectID, version); err != nil {
 				errorsList = append(errorsList, err.Error())
 				continue
+			}
+			if pauseMS > 0 {
+				time.Sleep(time.Duration(pauseMS) * time.Millisecond)
 			}
 			options := store.DefaultTransactionOptions()
 			options.MaxAttempts = 64
@@ -247,6 +262,22 @@ func main() {
 			"committed": committed, "conflicts": conflicts, "attempts": attempts,
 			"errors": errorsList, "elapsed_ms": time.Since(started).Milliseconds(),
 		})
+	case "outcome":
+		txID := arg(args, "--tx-id")
+		s, err := store.OpenWithOptions(storePath, store.ReadWrite, options(store.WriterModeOptimistic, now))
+		if err != nil {
+			fail(err)
+		}
+		defer s.Close()
+		lookup, err := s.TransactionOutcome(txID)
+		if err != nil {
+			fail(err)
+		}
+		commit := ""
+		if lookup.Committed != nil {
+			commit = lookup.Committed.Commit.Hex()
+		}
+		emit(map[string]any{"ok": true, "state": lookup.State, "commit": commit})
 	case "verify":
 		writer := arg(args, "--writer")
 		if writer == "" {

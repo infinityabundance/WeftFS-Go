@@ -326,3 +326,32 @@ func TestMW2AuthRaceDeniesPublication(t *testing.T) {
 		t.Fatalf("B err = %v", err)
 	}
 }
+
+func TestMW2QuotaRaceAtLimitRejectsLoser(t *testing.T) {
+	dir := t.TempDir()
+	opts := mw2Options(store.WriterModeSingle)
+	opts.Quotas = []store.QuotaBudget{{
+		Principal: store.PosixPrincipal(0, 0), MaxNewBytes: ^uint64(0), MaxObjects: 1,
+	}}
+	s, err := store.Init(dir, opts)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	a := openMW2(t, dir)
+	defer a.Close()
+	b := openMW2(t, dir)
+	defer b.Close()
+	planA := planMW2File(t, a, model.RootID, []byte("qa"), []byte("one"), []byte("seed-qa"))
+	planB := planMW2File(t, a, model.RootID, []byte("qb"), []byte("two"), []byte("seed-qb"))
+	txA := stageMW2(t, a, "0000000000000000000000000000009a", planA)
+	txB := stageMW2(t, b, "0000000000000000000000000000009b", planB)
+	if _, err := a.ExecuteTransaction(txA, store.DefaultTransactionOptions()); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if _, err := b.ExecuteTransaction(txB, store.DefaultTransactionOptions()); err == nil || werr.ClassOf(err) != werr.BudgetExceeded {
+		t.Fatalf("B err = %v", err)
+	}
+}

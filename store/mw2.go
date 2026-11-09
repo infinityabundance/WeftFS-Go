@@ -310,10 +310,12 @@ func (t *Transaction) Digest() (model.Hash32, error) {
 	for i, op := range t.Ops {
 		ops[i] = op.ToWCB()
 	}
+	// The digest covers the logical transaction (id + op set), never the
+	// attempt's observed parent: a retry from a newer head must resolve to the
+	// same outcome.
 	bytesValue, err := model.EncodeWCB(model.Map(map[string]wcb.Value{
-		"id":                wcb.TextValue(t.ID),
-		"parent_generation": wcb.U64Value(t.BaseGeneration),
-		"ops":               wcb.ArrayValue(ops),
+		"id":  wcb.TextValue(t.ID),
+		"ops": wcb.ArrayValue(ops),
 	}))
 	if err != nil {
 		return model.Hash32{}, err
@@ -591,6 +593,7 @@ func (s *Store) ExecuteTransaction(tx *Transaction, opts TransactionOptions) (Tr
 	if err := s.writeTxRecord(tx, TxPrepared, nil); err != nil {
 		return TransactionOutcome{}, err
 	}
+	crashPoint("mw2_prepared")
 
 	var attempts uint32
 	for {
@@ -680,6 +683,7 @@ func (s *Store) ExecuteTransaction(tx *Transaction, opts TransactionOptions) (Tr
 		if err := s.writeTxRecord(tx, TxCommitted, &hashID); err != nil {
 			return TransactionOutcome{}, err
 		}
+		crashPoint("mw2_after_ack")
 		return TransactionOutcome{ID: tx.ID, Commit: hashID, Generation: generation, Attempts: attempts}, nil
 	}
 }
@@ -775,9 +779,13 @@ func (s *Store) writeTxRecord(tx *Transaction, state TxRecordState, commit *mode
 			return nil
 		}
 	}
+	parentGeneration := tx.BaseGeneration
+	if existing, ok, _ := s.readTxRecord(tx.ID); ok {
+		parentGeneration = existing.ParentGeneration
+	}
 	record := TxRecord{
 		ID: tx.ID, State: state, Digest: digest,
-		ParentGeneration: tx.BaseGeneration, Commit: commit,
+		ParentGeneration: parentGeneration, Commit: commit,
 		UpdatedNS: s.nowNS(), Pins: append([]model.Hash32(nil), tx.Pins...),
 	}
 	data, err := EncodeTxRecord(record)
@@ -974,6 +982,7 @@ func (s *Store) publishCommitOptimistic(commit model.Commit) (model.Hash32, erro
 		return model.Hash32{}, werr.Newf(werr.Busy,
 			"head publication refused: expected generation %d, observed %d", s.generation, generation)
 	}
+	crashPoint("mw2_before_head")
 	if exists, err := s.commits.HasCommit(commit.Generation); err != nil {
 		return model.Hash32{}, err
 	} else if exists {
@@ -992,6 +1001,7 @@ func (s *Store) publishCommitOptimistic(commit model.Commit) (model.Hash32, erro
 		_ = s.commits.DeleteRecord("commits/" + itoa(commit.Generation) + ".commit")
 		return model.Hash32{}, err
 	}
+	crashPoint("mw2_after_head")
 	crashPoint("after_superblock_write")
 	if err := s.commits.Sync(); err != nil {
 		return model.Hash32{}, err

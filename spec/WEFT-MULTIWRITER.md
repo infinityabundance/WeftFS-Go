@@ -269,9 +269,14 @@ outcome discovery uses a deterministic **op digest**:
 
 ```
 tx_digest = BLAKE3("weft/tx/v1", WCB({
-    id: tx_id, parent_generation: u64, ops: [canonical op WCB, ...]
+    id: tx_id, ops: [canonical op WCB, ...]
 }))
 ```
+
+The digest covers the logical transaction only: the id and the canonical op
+set. It deliberately **excludes** the observed parent, so a retry from a newer
+head resolves to the same outcome. The record still stores the first attempt's
+`parent_generation` for the bounded commit-window lookup.
 
 The `txs/<id>` record is canonical WCB `weft.tx.v1`:
 
@@ -302,10 +307,14 @@ Protocol:
    diagnostic, not a publication failure.
 3. A retry with the same transaction id **must** call `transaction_outcome`
    first. If `committed`, the store verifies the named commit is the head or an
-   ancestor within a bounded window and returns it. If `prepared`, the store
-   scans commits from the current head back to the recorded parent generation
-   (bounded by `max_outcome_window`, default 256) and compares canonical op
-   bytes. A match is the outcome; the record is repaired to `committed`.
+   ancestor within a bounded window and returns it. If `prepared`, the answer
+   is `unknown`: the commit format deliberately does not carry the transaction
+   digest, so a lookup by id alone cannot prove the outcome. A **retry with the
+   same op set** performs the proof: it scans commits from the current head back
+   to the recorded parent generation (bounded by `max_outcome_window`, default
+   256), compares canonical op bytes, and repairs the record to `committed` on a
+   match. This is why the client contract is "call `transaction_outcome`, and if
+   it is `unknown`, retry the same transaction" — never "assume failure".
 4. If no match is found, the outcome is `aborted` for that attempt. Reusing the
    id with the same digest is allowed and is a new attempt under the same
    logical transaction. Reusing the id with a different digest is
