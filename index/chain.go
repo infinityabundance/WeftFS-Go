@@ -41,6 +41,10 @@ const (
 	wfx3DigestBytes = 32
 	presentFlag     = byte(1)
 	absentFlag      = byte(0)
+	// patchFlag is an element-level patch against the base row: added ids/edges
+	// then removed ids/edges. Used when the base already has the row, so an
+	// append to a large set costs the appended element, not the whole set.
+	patchFlag = byte(2)
 )
 
 // SegmentKind is full or delta.
@@ -263,9 +267,11 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 	}
 	sort.Strings(names)
 	type namedSet struct {
-		name string
-		ids  IDSet
-		have bool
+		name     string
+		ids      IDSet
+		prev     IDSet
+		have     bool
+		havePrev bool
 	}
 	var rows []namedSet
 	for _, name := range names {
@@ -278,7 +284,7 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if base != nil && okNext == okPrev && sameIDSet(next, prev) {
 			continue
 		}
-		rows = append(rows, namedSet{name: name, ids: next, have: okNext})
+		rows = append(rows, namedSet{name: name, ids: next, prev: prev, have: okNext, havePrev: okPrev})
 	}
 	var err error
 	if out, err = appendU32Checked(out, uint64(len(rows))); err != nil {
@@ -288,13 +294,18 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if out, err = appendString(out, row.name); err != nil {
 			return nil, err
 		}
-		if row.have {
+		switch {
+		case !row.have:
+			out = append(out, absentFlag)
+		case row.havePrev:
+			if out, err = appendIDPatch(out, row.ids, row.prev); err != nil {
+				return nil, err
+			}
+		default:
 			out = append(out, presentFlag)
 			if out, err = appendIDSet(out, row.ids); err != nil {
 				return nil, err
 			}
-		} else {
-			out = append(out, absentFlag)
 		}
 	}
 
@@ -319,9 +330,11 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		return keys[i].Key < keys[j].Key
 	})
 	type attrRow struct {
-		key  AttrEqKey
-		ids  IDSet
-		have bool
+		key      AttrEqKey
+		ids      IDSet
+		prev     IDSet
+		have     bool
+		havePrev bool
 	}
 	var attrRows []attrRow
 	for _, key := range keys {
@@ -334,7 +347,7 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if base != nil && okNext == okPrev && sameIDSet(next, prev) {
 			continue
 		}
-		attrRows = append(attrRows, attrRow{key: key, ids: next, have: okNext})
+		attrRows = append(attrRows, attrRow{key: key, ids: next, prev: prev, have: okNext, havePrev: okPrev})
 	}
 	if out, err = appendU32Checked(out, uint64(len(attrRows))); err != nil {
 		return nil, err
@@ -346,13 +359,18 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if out, err = appendBytes(out, []byte(row.key.Key)); err != nil {
 			return nil, err
 		}
-		if row.have {
+		switch {
+		case !row.have:
+			out = append(out, absentFlag)
+		case row.havePrev:
+			if out, err = appendIDPatch(out, row.ids, row.prev); err != nil {
+				return nil, err
+			}
+		default:
 			out = append(out, presentFlag)
 			if out, err = appendIDSet(out, row.ids); err != nil {
 				return nil, err
 			}
-		} else {
-			out = append(out, absentFlag)
 		}
 	}
 
@@ -377,9 +395,11 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		return pairs[i].Predicate < pairs[j].Predicate
 	})
 	type relationRow struct {
-		pair  RelationPair
-		edges [][]byte
-		have  bool
+		pair     RelationPair
+		edges    [][]byte
+		prev     [][]byte
+		have     bool
+		havePrev bool
 	}
 	var relationRows []relationRow
 	for _, pair := range pairs {
@@ -400,7 +420,9 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if base != nil && okNext == okPrev && sameBytes(nextCanon, prevCanon) {
 			continue
 		}
-		relationRows = append(relationRows, relationRow{pair: pair, edges: nextCanon, have: okNext})
+		relationRows = append(relationRows, relationRow{
+			pair: pair, edges: nextCanon, prev: prevCanon, have: okNext, havePrev: okPrev,
+		})
 	}
 	if out, err = appendU32Checked(out, uint64(len(relationRows))); err != nil {
 		return nil, err
@@ -410,7 +432,14 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if out, err = appendString(out, row.pair.Predicate); err != nil {
 			return nil, err
 		}
-		if row.have {
+		switch {
+		case !row.have:
+			out = append(out, absentFlag)
+		case row.havePrev:
+			if out, err = appendEdgePatch(out, row.edges, row.prev); err != nil {
+				return nil, err
+			}
+		default:
 			out = append(out, presentFlag)
 			if out, err = appendU32Checked(out, uint64(len(row.edges))); err != nil {
 				return nil, err
@@ -418,8 +447,6 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 			for _, edge := range row.edges {
 				out = append(out, edge...)
 			}
-		} else {
-			out = append(out, absentFlag)
 		}
 	}
 
@@ -449,7 +476,7 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if base != nil && okNext == okPrev && sameIDSet(next, prev) {
 			continue
 		}
-		tagRows = append(tagRows, namedSet{name: tag, ids: next, have: okNext})
+		tagRows = append(tagRows, namedSet{name: tag, ids: next, prev: prev, have: okNext, havePrev: okPrev})
 	}
 	if out, err = appendU32Checked(out, uint64(len(tagRows))); err != nil {
 		return nil, err
@@ -458,13 +485,18 @@ func encodeWfx3(header SegmentHeader, index, base *StateIndex) ([]byte, error) {
 		if out, err = appendString(out, row.name); err != nil {
 			return nil, err
 		}
-		if row.have {
+		switch {
+		case !row.have:
+			out = append(out, absentFlag)
+		case row.havePrev:
+			if out, err = appendIDPatch(out, row.ids, row.prev); err != nil {
+				return nil, err
+			}
+		default:
 			out = append(out, presentFlag)
 			if out, err = appendIDSet(out, row.ids); err != nil {
 				return nil, err
 			}
-		} else {
-			out = append(out, absentFlag)
 		}
 	}
 
@@ -607,6 +639,178 @@ func ResolveSegment(data []byte, base *StateIndex) (*StateIndex, error) {
 	return resolveParsedSegment(segment, base)
 }
 
+// appendIDPatch writes an element-level patch for a set-valued row.
+func appendIDPatch(out []byte, next, prev IDSet) ([]byte, error) {
+	added := IDSet{}
+	for id := range next {
+		if _, ok := prev[id]; !ok {
+			added[id] = struct{}{}
+		}
+	}
+	removed := IDSet{}
+	for id := range prev {
+		if _, ok := next[id]; !ok {
+			removed[id] = struct{}{}
+		}
+	}
+	out = append(out, patchFlag)
+	var err error
+	if out, err = appendIDSet(out, added); err != nil {
+		return nil, err
+	}
+	return appendIDSet(out, removed)
+}
+
+// appendEdgePatch writes an element-level patch for a relation row. `next` and
+// `prev` are canonical (sorted) target encodings.
+func appendEdgePatch(out []byte, next, prev [][]byte) ([]byte, error) {
+	prevSet := make(map[string]struct{}, len(prev))
+	for _, edge := range prev {
+		prevSet[string(edge)] = struct{}{}
+	}
+	nextSet := make(map[string]struct{}, len(next))
+	for _, edge := range next {
+		nextSet[string(edge)] = struct{}{}
+	}
+	added := make([][]byte, 0)
+	for _, edge := range next {
+		if _, ok := prevSet[string(edge)]; !ok {
+			added = append(added, edge)
+		}
+	}
+	removed := make([][]byte, 0)
+	for _, edge := range prev {
+		if _, ok := nextSet[string(edge)]; !ok {
+			removed = append(removed, edge)
+		}
+	}
+	out = append(out, patchFlag)
+	var err error
+	if out, err = appendU32Checked(out, uint64(len(added))); err != nil {
+		return nil, err
+	}
+	for _, edge := range added {
+		out = append(out, edge...)
+	}
+	if out, err = appendU32Checked(out, uint64(len(removed))); err != nil {
+		return nil, err
+	}
+	for _, edge := range removed {
+		out = append(out, edge...)
+	}
+	return out, nil
+}
+
+// applyIDPatch applies an element-level patch to a set-valued row and refuses
+// anything malformed: a removal must name a present id and an addition an
+// absent id, and the row may not become empty.
+func applyIDPatch(ids IDSet, reader *reader) error {
+	added, err := reader.idSet()
+	if err != nil {
+		return err
+	}
+	removed, err := reader.idSet()
+	if err != nil {
+		return err
+	}
+	for id := range removed {
+		if _, ok := ids[id]; !ok {
+			return werr.Newf(werr.Corrupt,
+				"WFX3 patch removes an id that is not in the base row")
+		}
+	}
+	for id := range added {
+		if _, ok := ids[id]; ok {
+			return werr.Newf(werr.Corrupt,
+				"WFX3 patch adds an id already in the base row")
+		}
+	}
+	for id := range removed {
+		delete(ids, id)
+	}
+	for id := range added {
+		ids[id] = struct{}{}
+	}
+	if len(ids) == 0 {
+		return werr.Newf(werr.Corrupt, "WFX3 patch empties a set-valued row")
+	}
+	return nil
+}
+
+// applyEdgePatch applies an element-level patch to a relation row.
+func applyEdgePatch(edges []IndexedRelation, reader *reader) ([]IndexedRelation, error) {
+	base := make(map[string]struct{}, len(edges))
+	for _, edge := range edges {
+		encoded, err := targetBytes(edge)
+		if err != nil {
+			return nil, err
+		}
+		base[string(encoded)] = struct{}{}
+	}
+	addedCount, err := reader.boundedCount(1)
+	if err != nil {
+		return nil, err
+	}
+	added := make([]IndexedRelation, 0, addedCount)
+	addedKeys := make(map[string]struct{}, addedCount)
+	var lastAdded []byte
+	for i := 0; i < addedCount; i++ {
+		edge, encoded, err := readTarget(reader)
+		if err != nil {
+			return nil, err
+		}
+		if lastAdded != nil && bytes.Compare(encoded, lastAdded) <= 0 {
+			return nil, werr.Newf(werr.Corrupt, "WFX3 patch additions are not sorted")
+		}
+		if _, ok := base[string(encoded)]; ok {
+			return nil, werr.Newf(werr.Corrupt,
+				"WFX3 patch adds a target already in the base row")
+		}
+		lastAdded = encoded
+		addedKeys[string(encoded)] = struct{}{}
+		added = append(added, edge)
+	}
+	removedCount, err := reader.boundedCount(1)
+	if err != nil {
+		return nil, err
+	}
+	removedKeys := make(map[string]struct{}, removedCount)
+	var lastRemoved []byte
+	for i := 0; i < removedCount; i++ {
+		_, encoded, err := readTarget(reader)
+		if err != nil {
+			return nil, err
+		}
+		if lastRemoved != nil && bytes.Compare(encoded, lastRemoved) <= 0 {
+			return nil, werr.Newf(werr.Corrupt, "WFX3 patch removals are not sorted")
+		}
+		if _, ok := base[string(encoded)]; !ok {
+			return nil, werr.Newf(werr.Corrupt,
+				"WFX3 patch removes a target that is not in the base row")
+		}
+		if _, ok := addedKeys[string(encoded)]; ok {
+			return nil, werr.Newf(werr.Corrupt,
+				"WFX3 patch both adds and removes one target")
+		}
+		lastRemoved = encoded
+		removedKeys[string(encoded)] = struct{}{}
+	}
+	if len(base)-len(removedKeys)+len(addedKeys) == 0 {
+		return nil, werr.Newf(werr.Corrupt, "WFX3 patch empties a relation row")
+	}
+	kept := make([]IndexedRelation, 0, len(base)-len(removedKeys))
+	for _, edge := range edges {
+		encoded, err := targetBytes(edge)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := removedKeys[string(encoded)]; !ok {
+			kept = append(kept, edge)
+		}
+	}
+	return append(kept, added...), nil
+}
+
 func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, error) {
 	header := segment.Header
 	reader := &reader{data: segment.body}
@@ -661,6 +865,15 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 				return nil, err
 			}
 			objectsWithAttr[name] = ids
+		case patchFlag:
+			ids, ok := objectsWithAttr[name]
+			if !ok {
+				return nil, werr.Newf(werr.Corrupt,
+					"WFX3 objects_with_attr patch has no base row")
+			}
+			if err := applyIDPatch(ids, reader); err != nil {
+				return nil, err
+			}
 		case absentFlag:
 			if header.Kind == SegmentFull {
 				return nil, werr.Newf(werr.Corrupt, "WFX3 full segment contains a tombstone")
@@ -671,7 +884,7 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 			}
 			delete(objectsWithAttr, name)
 		default:
-			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1")
+			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1/2")
 		}
 	}
 
@@ -706,6 +919,14 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 				return nil, err
 			}
 			objectsByAttrEq[current] = ids
+		case patchFlag:
+			ids, ok := objectsByAttrEq[current]
+			if !ok {
+				return nil, werr.Newf(werr.Corrupt, "WFX3 attr_eq patch has no base row")
+			}
+			if err := applyIDPatch(ids, reader); err != nil {
+				return nil, err
+			}
 		case absentFlag:
 			if header.Kind == SegmentFull {
 				return nil, werr.Newf(werr.Corrupt, "WFX3 full segment contains a tombstone")
@@ -715,7 +936,7 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 			}
 			delete(objectsByAttrEq, current)
 		default:
-			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1")
+			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1/2")
 		}
 	}
 
@@ -763,6 +984,16 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 				edges = append(edges, edge)
 			}
 			relationsFrom[pair] = edges
+		case patchFlag:
+			base, ok := relationsFrom[pair]
+			if !ok {
+				return nil, werr.Newf(werr.Corrupt, "WFX3 relation patch has no base row")
+			}
+			patched, err := applyEdgePatch(base, reader)
+			if err != nil {
+				return nil, err
+			}
+			relationsFrom[pair] = patched
 		case absentFlag:
 			if header.Kind == SegmentFull {
 				return nil, werr.Newf(werr.Corrupt, "WFX3 full segment contains a tombstone")
@@ -772,7 +1003,7 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 			}
 			delete(relationsFrom, pair)
 		default:
-			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1")
+			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1/2")
 		}
 	}
 
@@ -802,6 +1033,14 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 				return nil, err
 			}
 			tags[tag] = ids
+		case patchFlag:
+			ids, ok := tags[tag]
+			if !ok {
+				return nil, werr.Newf(werr.Corrupt, "WFX3 tag patch has no base row")
+			}
+			if err := applyIDPatch(ids, reader); err != nil {
+				return nil, err
+			}
 		case absentFlag:
 			if header.Kind == SegmentFull {
 				return nil, werr.Newf(werr.Corrupt, "WFX3 full segment contains a tombstone")
@@ -811,7 +1050,7 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 			}
 			delete(tags, tag)
 		default:
-			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1")
+			return nil, werr.Newf(werr.Corrupt, "WFX3 present flag is not 0/1/2")
 		}
 	}
 	if reader.remaining() != 0 {
