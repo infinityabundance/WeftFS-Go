@@ -37,9 +37,10 @@ type rustQueryResult struct {
 		ObjectID string `json:"object_id"`
 	} `json:"results"`
 	Index struct {
-		Loads   uint64 `json:"loads"`
-		Builds  uint64 `json:"builds"`
-		Rejects uint64 `json:"rejects"`
+		Loads   uint64   `json:"loads"`
+		Builds  uint64   `json:"builds"`
+		Rejects uint64   `json:"rejects"`
+		Notes   []string `json:"notes"`
 	} `json:"index"`
 }
 
@@ -121,14 +122,14 @@ func TestRustLoadsGoWrittenIndexSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read go segment: %v", err)
 	}
-	decoded, err := weftindex.DecodeFile(original)
+	decoded, err := weftindex.ResolveSegment(original, nil)
 	if err != nil {
-		t.Fatalf("go segment did not decode: %v", err)
+		t.Fatalf("go segment did not resolve: %v", err)
 	}
 	decoded.Tags = map[string]weftindex.IDSet{}
-	mutated, err := decoded.EncodeFile()
+	mutated, err := weftindex.EncodeFull(decoded)
 	if err != nil {
-		t.Fatalf("reaencode control segment: %v", err)
+		t.Fatalf("re-encode control segment: %v", err)
 	}
 	if strings.HasPrefix(string(mutated), weftindex.MagicV1) {
 		t.Fatal("control segment lost its magic")
@@ -153,12 +154,12 @@ func TestRustLoadsGoWrittenIndexSegment(t *testing.T) {
 	if beforeAttr.MatchedCount == 0 || beforeAttr.Index.Loads == 0 {
 		t.Fatalf("rust did not load the restored Go segment: %+v", beforeAttr.Index)
 	}
-	decoded, err = weftindex.DecodeFile(original)
+	decoded, err = weftindex.ResolveSegment(original, nil)
 	if err != nil {
 		t.Fatalf("re-decode: %v", err)
 	}
 	decoded.ObjectsByAttrEq = map[weftindex.AttrEqKey]weftindex.IDSet{}
-	mutated, err = decoded.EncodeFile()
+	mutated, err = weftindex.EncodeFull(decoded)
 	if err != nil {
 		t.Fatalf("reenecode attr control: %v", err)
 	}
@@ -216,17 +217,46 @@ func TestGoLoadsRustWrittenIndexSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rust-written head segment: %v", err)
 	}
-	if string(rustBytes[0:4]) != weftindex.MagicV2 {
+	if string(rustBytes[0:4]) != weftindex.MagicV3 {
 		t.Fatalf("rust segment magic = %q", rustBytes[0:4])
 	}
-	decoded, err := weftindex.DecodeFile(rustBytes)
+	segment, err := weftindex.DecodeSegment(rustBytes)
 	if err != nil {
 		t.Fatalf("Go rejected the Rust-written segment: %v", err)
 	}
-	if decoded.Commit() != reader.Head() {
-		t.Fatalf("segment names %s, head is %s", decoded.Commit().Hex(), reader.Head().Hex())
+	if segment.Header.Generation != reader.Generation() {
+		t.Fatalf("segment generation %d, head is %d",
+			segment.Header.Generation, reader.Generation())
 	}
-	reencoded, err := decoded.EncodeFile()
+	loadBase := func(baseCommit, _ model.Hash32) ([]byte, error) {
+		return os.ReadFile(store.BlobPath(dir, store.BlobIndex, baseCommit))
+	}
+	resolved, err := weftindex.ResolveChainSegment(segment, loadBase)
+	if err != nil {
+		t.Fatalf("Go cannot resolve the Rust chain: %v", err)
+	}
+	if resolved.Index.Generation() != reader.Generation() {
+		t.Fatalf("resolved generation %d, head is %d",
+			resolved.Index.Generation(), reader.Generation())
+	}
+	// Re-encode the head segment and require byte identity. A delta needs its
+	// resolved base index, which is loaded through the same chain walk.
+	var reencoded []byte
+	switch resolved.Chain.Kind {
+	case weftindex.SegmentFull:
+		reencoded, err = weftindex.EncodeFull(resolved.Index)
+	case weftindex.SegmentDelta:
+		baseBytes, readErr := loadBase(segment.Header.BaseCommit, segment.Header.BaseID)
+		if readErr != nil {
+			t.Fatalf("read base segment: %v", readErr)
+		}
+		base, chainErr := weftindex.ResolveChain(baseBytes, loadBase)
+		if chainErr != nil {
+			t.Fatalf("resolve base chain: %v", chainErr)
+		}
+		reencoded, err = weftindex.EncodeDelta(base.Index, resolved.Index,
+			resolved.Chain.Chain[1], segment.Header.BaseCommit)
+	}
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
 	}
@@ -284,6 +314,30 @@ func TestGoLoadsRustWrittenIndexSegment(t *testing.T) {
 	stats := reader.IndexStats()
 	if stats.DiskLoads != 1 || stats.Builds != 0 || stats.Rejects != 0 {
 		t.Fatalf("Go must load the pinned view's Rust segment: %+v", stats)
+	}
+}
+
+func TestRustLoadsGoDeltaChain(t *testing.T) {
+	bin := rustBinary(t)
+	rustUsable(t, bin)
+	dir := t.TempDir()
+	s, err := store.Init(dir, chainOptions())
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	writeChainFiles(t, s, 10, "d")
+	if kind, depth, err := s.IndexHeadChain(); err != nil || kind != "delta" || depth == 0 {
+		t.Fatalf("Go chain head = %q depth=%d err=%v", kind, depth, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	result := runRustQuery(t, bin, dir, "select tag(\"alpha\")")
+	if result.MatchedCount == 0 {
+		t.Fatal("rust found no tagged objects in the Go chain")
+	}
+	if result.Index.Loads == 0 || result.Index.Builds != 0 || result.Index.Rejects != 0 {
+		t.Fatalf("rust did not load the genuine Go delta chain: %+v", result.Index)
 	}
 }
 

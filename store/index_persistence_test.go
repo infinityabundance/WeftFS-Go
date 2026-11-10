@@ -41,6 +41,10 @@ func indexOptions(interval uint64) store.Options {
 	opts.ChunkSize = 1024
 	opts.CheckpointInterval = interval
 	opts.GCGraceSecs = 0
+	// Trust/corruption tests use full segments so the forged-subset mutation and
+	// header offsets are exact. Delta chains are covered by
+	// `TestIncrementalIndexChainLoadsAndAnswers` and the handoff test.
+	opts.NoIncrementalIndex = true
 	fixed := int64(1_700_000_000_000_000_000)
 	opts.FixedTimestampNS = &fixed
 	return opts
@@ -282,7 +286,7 @@ func TestPersistedIndexLoadsOnReopenWithoutRebuild(t *testing.T) {
 		t.Fatalf("a commit must write its advisory segment; have %v", sortedKeys(segments))
 	}
 	body, trailer := splitIndexBody(t, segments[headRel])
-	if string(body[0:4]) != weftindex.MagicV2 {
+	if string(body[0:4]) != weftindex.MagicV3 {
 		t.Fatalf("segment magic = %q", body[0:4])
 	}
 	if len(trailer) != weftindex.DigestBytes {
@@ -745,14 +749,18 @@ func TestForgedSubsetIndexIsRejectedByCommitAttestation(t *testing.T) {
 	}
 	reader.Close()
 
-	// Forge: remove one id from one tag set and re-encode.
+	// Forge: remove one id from one tag set and re-encode a valid full segment.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read segment: %v", err)
 	}
-	decoded, err := weftindex.DecodeFile(data)
+	segment, err := weftindex.DecodeSegment(data)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
+	}
+	decoded, err := weftindex.ResolveSegment(data, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
 	}
 	forged := false
 	for _, ids := range decoded.Tags {
@@ -770,7 +778,10 @@ func TestForgedSubsetIndexIsRejectedByCommitAttestation(t *testing.T) {
 	if !forged {
 		t.Fatal("fixture has no tag set with at least two members")
 	}
-	mutated, err := decoded.EncodeFile()
+	if segment.Header.Kind != weftindex.SegmentFull {
+		t.Fatalf("forged test needs a full segment, got %s", segment.Header.Kind)
+	}
+	mutated, err := weftindex.EncodeFull(decoded)
 	if err != nil {
 		t.Fatalf("re-encode forged segment: %v", err)
 	}

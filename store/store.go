@@ -113,6 +113,15 @@ type Options struct {
 	// and no index segment: a segment without an attestation is never trusted,
 	// so this exists only to reproduce the frozen v1 fixture bytes.
 	AttestIndexes bool
+	// IndexChainMaxDeltas forces a full segment after this many deltas. Zero
+	// selects index.DefaultMaxChainDeltas (32); the hard reader bound is 256.
+	IndexChainMaxDeltas uint32
+	// IndexBytesBudget caps the total bytes held in `indexes/`. Nil means no
+	// policy; a configured cap skips a write that would exceed it.
+	IndexBytesBudget *uint64
+	// NoIncrementalIndex writes a full WFX3 segment for every attested commit.
+	// The zero value keeps incremental segments, which is the default.
+	NoIncrementalIndex bool
 	// BlobBackend selects the immutable blob plane (`local`, `object`, or
 	// `posix`). The empty value is `local` (and `object` when the commit plane
 	// is `object`, so a single `--backend object` store stays unchanged).
@@ -162,6 +171,7 @@ func DefaultOptions() Options {
 		CommitBackend:           PlaneLocal,
 		PackOptions:             DefaultPackOptions(),
 		AttestIndexes:           true,
+		IndexChainMaxDeltas:     32,
 	}
 }
 
@@ -249,6 +259,9 @@ type Store struct {
 	// Advisory selector index cache and diagnostics (indexes/<ab>/<commit>.idx).
 	// Derived data only: never part of a commit or a format.
 	indexes indexState
+	// forceFullIndex is set by CompactIndex so the next commit writes a full
+	// WFX3 segment.
+	forceFullIndex bool
 }
 
 // ResetWriteChunkReads resets the Merkle range-write chunk-read counter.

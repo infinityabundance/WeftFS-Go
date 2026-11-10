@@ -19,30 +19,59 @@ type IndexAttestation struct {
 	EntryCount     uint64
 	StateRoot      Hash32
 	CandidatesRoot Hash32
+	// SegmentKind, SegmentBase, SegmentDepth and SegmentRoot are present in a
+	// `weftfs.commit.v3` attestation and name the advisory index chain.
+	SegmentKind  string
+	SegmentBase  *Hash32
+	SegmentDepth uint64
+	SegmentRoot  Hash32
 }
 
-var attestationKeys = []string{
+var attestationKeysV2 = []string{
 	"candidates_root", "entry_count", "object_count", "relation_count", "state_root",
 }
 
+var attestationKeysV3 = []string{
+	"candidates_root", "entry_count", "object_count", "relation_count",
+	"segment_base", "segment_depth", "segment_kind", "segment_root", "state_root",
+}
+
+// IsV3 reports whether this attestation names a segment chain.
+func (a IndexAttestation) IsV3() bool { return a.SegmentKind != "" }
+
 // ToWCB returns the canonical attestation map.
 func (a IndexAttestation) ToWCB() wcb.Value {
-	return Map(map[string]wcb.Value{
+	m := map[string]wcb.Value{
 		"object_count":    wcb.U64Value(a.ObjectCount),
 		"relation_count":  wcb.U64Value(a.RelationCount),
 		"entry_count":     wcb.U64Value(a.EntryCount),
 		"state_root":      HashValue(a.StateRoot),
 		"candidates_root": HashValue(a.CandidatesRoot),
-	})
+	}
+	if a.IsV3() {
+		m["segment_kind"] = wcb.TextValue(a.SegmentKind)
+		m["segment_base"] = OptHashValue(a.SegmentBase)
+		m["segment_depth"] = wcb.U64Value(a.SegmentDepth)
+		m["segment_root"] = HashValue(a.SegmentRoot)
+	}
+	return Map(m)
 }
 
 // AttestationFromWCB parses an attestation map.
 func AttestationFromWCB(v wcb.Value) (IndexAttestation, error) {
+	return attestationFromWCB(v, false)
+}
+
+func attestationFromWCB(v wcb.Value, v3 bool) (IndexAttestation, error) {
 	m, err := AsMap(v)
 	if err != nil {
 		return IndexAttestation{}, err
 	}
-	if err := CheckKeys(m, attestationKeys...); err != nil {
+	keys := attestationKeysV2
+	if v3 {
+		keys = attestationKeysV3
+	}
+	if err := CheckKeys(m, keys...); err != nil {
 		return IndexAttestation{}, err
 	}
 	objectCount, err := GetU64(m, "object_count")
@@ -65,10 +94,37 @@ func AttestationFromWCB(v wcb.Value) (IndexAttestation, error) {
 	if err != nil {
 		return IndexAttestation{}, err
 	}
-	return IndexAttestation{
+	a := IndexAttestation{
 		ObjectCount: objectCount, RelationCount: relationCount, EntryCount: entryCount,
 		StateRoot: stateRoot, CandidatesRoot: candidatesRoot,
-	}, nil
+	}
+	if v3 {
+		kind, err := GetText(m, "segment_kind")
+		if err != nil {
+			return IndexAttestation{}, err
+		}
+		if kind != "full" && kind != "delta" {
+			return IndexAttestation{}, werr.Newf(werr.Malformed,
+				"index segment kind `%s` is neither `full` nor `delta`", kind)
+		}
+		a.SegmentKind = kind
+		a.SegmentBase, err = GetOptHash(m, "segment_base")
+		if err != nil {
+			return IndexAttestation{}, err
+		}
+		a.SegmentDepth, err = GetU64(m, "segment_depth")
+		if err != nil {
+			return IndexAttestation{}, err
+		}
+		a.SegmentRoot, err = GetHash(m, "segment_root")
+		if err != nil {
+			return IndexAttestation{}, err
+		}
+	} else {
+		// A v2 commit carries no chain.
+		a.SegmentKind = ""
+	}
+	return a, nil
 }
 
 // Commit is a commit record (WEFT-MODEL.md §2.2).
@@ -83,6 +139,7 @@ type Commit struct {
 
 var commitKeysV1 = []string{"schema", "generation", "parent", "timestamp_ns", "ops", "checkpoint"}
 var commitKeysV2 = []string{"schema", "generation", "parent", "timestamp_ns", "ops", "checkpoint", "index_attestation"}
+var commitKeysV3 = commitKeysV2
 
 func (c Commit) fields() map[string]wcb.Value {
 	ops := make([]wcb.Value, 0, len(c.Ops))
@@ -112,7 +169,11 @@ func (c Commit) FieldsWCB() ([]byte, error) {
 func (c Commit) ToWCB() wcb.Value {
 	m := c.fields()
 	if c.IndexAttestation != nil {
-		m["schema"] = wcb.TextValue(CommitSchemaV2)
+		if c.IndexAttestation.IsV3() {
+			m["schema"] = wcb.TextValue(CommitSchemaV3)
+		} else {
+			m["schema"] = wcb.TextValue(CommitSchemaV2)
+		}
 		m["index_attestation"] = c.IndexAttestation.ToWCB()
 	} else {
 		m["schema"] = wcb.TextValue(CommitSchema)
@@ -154,15 +215,29 @@ func CommitFromWCB(v wcb.Value) (Commit, error) {
 		}
 		if raw, ok := m["index_attestation"]; ok {
 			if raw.Kind != wcb.Null {
-				parsed, err := AttestationFromWCB(raw)
+				parsed, err := attestationFromWCB(raw, false)
 				if err != nil {
 					return Commit{}, err
 				}
 				attestation = &parsed
 			}
 		}
+	case CommitSchemaV3:
+		if err := CheckKeys(m, commitKeysV3...); err != nil {
+			return Commit{}, err
+		}
+		raw, ok := m["index_attestation"]
+		if !ok || raw.Kind == wcb.Null {
+			return Commit{}, werr.Newf(werr.Corrupt,
+				"a weftfs.commit.v3 record must carry an index attestation")
+		}
+		parsed, err := attestationFromWCB(raw, true)
+		if err != nil {
+			return Commit{}, err
+		}
+		attestation = &parsed
 	default:
-		return Commit{}, werr.Newf(werr.UnknownSchema, "commit schema `%s` is neither `%s` nor `%s`", schema, CommitSchema, CommitSchemaV2)
+		return Commit{}, werr.Newf(werr.UnknownSchema, "commit schema `%s` is neither `%s`, `%s`, nor `%s`", schema, CommitSchema, CommitSchemaV2, CommitSchemaV3)
 	}
 	generation, err := GetU64(m, "generation")
 	if err != nil {

@@ -39,6 +39,9 @@ const (
 	// CommitSchemaV2 may carry an `index_attestation` map; the key set is v1's
 	// plus that one field.
 	CommitSchemaV2 = "weftfs.commit.v2"
+	// CommitSchemaV3 has the same commit-level key set as v2; the attestation
+	// also names the advisory index segment chain.
+	CommitSchemaV3 = "weftfs.commit.v3"
 )
 
 // Format and schema constants (WEFT-MODEL.md §2).
