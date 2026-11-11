@@ -21,8 +21,11 @@ import (
 // RebaseTool is the environment tool name recorded in rebase provenance.
 const RebaseTool = "weftfs"
 
-// storeVersion mirrors the module version recorded by the Rust crate.
-const storeVersion = "1.1.0"
+// storeVersion is the tool version recorded in a provenance record. It must
+// track the released crate version (Rust records `env!("CARGO_PKG_VERSION")` at
+// compile time), so a Go record and a Rust record name the same tool. It was
+// stale at "1.1.0" through the v1.2.0 release; R14 aligns it.
+const storeVersion = "1.2.0"
 
 // ProvenanceSchema is the canonical receipt schema.
 const ProvenanceSchema = "weft.provenance.v1"
