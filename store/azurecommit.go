@@ -226,6 +226,65 @@ func (c *azureControl) PublishFencedHead(generation uint64, commit model.Hash32,
 	return true, nil
 }
 
+// SupportsConditionalHeadPublication: Azure Blob has a real compare-and-swap
+// (`If-Match: <ETag>`), so MW2 publishes the head with one conditional write
+// instead of the POSIX publication lock. No writer lease is used on this path.
+func (c *azureControl) SupportsConditionalHeadPublication() bool { return true }
+
+// PublishHeadConditional advances the two-slot superblock in one `Put Blob`
+// whose `If-Match` is the ETag the head check was made against.
+//
+// The comparison and the write deliberately share one request pair rather than
+// going through PublishSuperblockSlot: that method retries from a fresh read
+// and re-fences the writer lock, which would let a stale committer re-apply its
+// slot to a head somebody else already moved. Here a lost ETag is `Busy` and is
+// never retried. No lease is taken or renewed on this path; MW2 does not use the
+// writer lock at all.
+func (c *azureControl) PublishHeadConditional(expectedGeneration uint64, expectedCommit model.Hash32, slot SuperblockSlot) (bool, error) {
+	response, err := c.client.get(azureSuperblockKey, 0, 0)
+	if err != nil {
+		return true, err
+	}
+	switch response.Status {
+	case http.StatusOK:
+	case http.StatusNotFound:
+		return true, werr.New(werr.NotFound, "superblock does not exist")
+	case http.StatusForbidden:
+		return true, werr.Newf(werr.Unauthorized, "Azure denied GET azure://%s/superblock", c.client.config.Container)
+	default:
+		return true, werr.Newf(werr.Io, "Azure GET superblock returned HTTP %d", response.Status)
+	}
+	if len(response.Body) != model.SuperblockBytes {
+		return true, werr.Newf(werr.Corrupt, "superblock is %d bytes, expected %d", len(response.Body), model.SuperblockBytes)
+	}
+	if response.ETag == "" {
+		return true, werr.Newf(werr.Unsupported,
+			"Azure endpoint did not return an ETag for the superblock; refusing a head write without a compare-and-swap token")
+	}
+	view, err := decodeSuperblockView(response.Body)
+	if err != nil {
+		return true, err
+	}
+	observedGeneration, observedCommit, ok := highestSlot(view)
+	if !ok || observedGeneration != expectedGeneration || observedCommit != expectedCommit {
+		return true, werr.Newf(werr.Busy,
+			"head publication refused: expected generation %d commit %s, observed generation %d commit %s",
+			expectedGeneration, expectedCommit.Hex(), observedGeneration, observedCommit.Hex())
+	}
+	updated := append([]byte(nil), response.Body...)
+	offset := int(slot.Generation%2) * model.SlotBytes
+	copy(updated[offset:offset+model.SlotBytes], slot.Encode())
+	etag := response.ETag
+	if _, published, err := c.client.putConditional(azureSuperblockKey, updated, &etag, true); err != nil {
+		return true, err
+	} else if !published {
+		return true, werr.New(werr.Busy,
+			"head publication lost the conditional write race; the move is not retried")
+	}
+	c.client.stats.headPublications.Add(1)
+	return true, nil
+}
+
 // AttestedHead returns the head the published LOCK record names.
 func (c *azureControl) AttestedHead() (uint64, model.Hash32, uint64, bool, error) {
 	response, err := c.client.get("LOCK", 0, 0)
