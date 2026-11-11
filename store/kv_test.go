@@ -961,16 +961,15 @@ func TestKvPageHandoffRustThenGo(t *testing.T) {
 	t.Logf("COURT rust_written_page_bytes=%d descriptor_and_frame_match=true", elements)
 }
 
-// TestKvProvHandoffRustThenGo makes Rust the writer of a mode-19 page: Rust's
-// codec supplies the frame and Rust's CLI writes the object and its reserved
-// attributes into a second store. The attribute *values* are the ones Rust
-// itself printed with `stat --json` for the Go-written page in the first store,
-// so Rust produces every byte of the second object. Go then reads it back.
+// TestKvProvHandoffRustThenGo makes Rust the writer of a mode-19 page through the
+// shipped CLI verb `kv prov-write`.
 //
-// This is the strongest Rust->Go mode-19 evidence available without adding a
-// Rust verb: the shipped Rust CLI has no page-level KV write verb (only the
-// prefix tier, which is mode 12), and the shipped examples that do write
-// mode-19 pages delete their store on exit.
+// Both languages encode the same page geometry and provenance inputs from the
+// same element bytes. Because every identity is content-derived, Rust's own
+// descriptor derivation must land on the same descriptor id, provenance root and
+// frame bytes as Go's. Go then reads the Rust-written page back. This exercises
+// Rust's writer rather than copying attribute values it printed from a
+// Go-written object.
 func TestKvProvHandoffRustThenGo(t *testing.T) {
 	bin := rustBinary(t)
 	first := t.TempDir()
@@ -990,46 +989,59 @@ func TestKvProvHandoffRustThenGo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	goFrame, err := s.ReadObject(written.ObjectID)
+	if err != nil {
+		t.Fatalf("read the Go-written frame: %v", err)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	// Rust reads the frame and the attributes it needs, then writes the page
-	// into the second store.
-	frame := runRustBytes(t, bin, "--store", first, "cat", "/prov-page.kv")
-	stat := rustJSON(t, bin, first, "stat", "/prov-page.kv")
-	attrs, ok := stat["attrs"].(map[string]any)
-	if !ok {
-		t.Fatalf("rust stat returned no attrs: %+v", stat)
+	// Rust writes the same page through the shipped CLI verb. Every identity is
+	// content-derived, so agreeing on the descriptor id and provenance root is
+	// the real cross-language claim.
+	payloadPath := writePayload(t, t.TempDir(), "elements.bin", elements)
+	hexRoot := func(value byte) string {
+		return strings.Repeat(fmt.Sprintf("%02x", value), 32)
 	}
-	if value, _ := attrs[store.AttrKvMode].(float64); value != 19 {
-		t.Fatalf("rust stat weft.kv.mode = %v, want 19", attrs[store.AttrKvMode])
-	}
-	if value, _ := attrs[store.AttrKvDescriptorID].(string); value != written.DescriptorID.Hex() {
-		t.Fatalf("rust stat descriptor id = %v, Go = %s", attrs[store.AttrKvDescriptorID], written.DescriptorID.Hex())
-	}
-
-	framePath := writePayload(t, t.TempDir(), "frame.bin", frame)
 	runRust(t, bin, "--store", second, "init")
-	createArgs := []string{
-		"--store", second, "create", "/rewritten.kv",
-		"--file", framePath, "--mode", "0644", "--uid", "1000", "--gid", "1000",
+	prov := rustJSON(t, bin, second, "kv", "prov-write",
+		"--name", "rewritten.kv",
+		"--tenant", kvTenant,
+		"--model", "qwen2.5-0.5b@060db649",
+		"--layer", "3",
+		"--session", "session-42",
+		"--page-index", "0",
+		"--page-count", "1",
+		"--seq-start", "0",
+		"--seq-end", "8",
+		"--dtype", "bf16",
+		"--heads", "4",
+		"--head-dim", "64",
+		"--payload", payloadPath,
+		"--model-root", hexRoot(0x11),
+		"--adapter-root", hexRoot(0x21),
+		"--tokenizer-scheme", "qwen-bpe",
+		"--vocab-size", "151936",
+		"--sliding-window", "0",
+		"--rope-theta", "10000",
+		"--rope-scale", "1",
+		"--positional", "rope",
+		"--page-rows", "8",
+		"--layer-count", "24",
+		"--salt", hexRoot(0xA0),
+		"--uid", "1000",
+		"--gid", "1000",
+	)
+	if got, _ := prov["descriptor_id"].(string); got != written.DescriptorID.Hex() {
+		t.Fatalf("rust prov-write descriptor id = %v, Go = %s", prov["descriptor_id"], written.DescriptorID.Hex())
 	}
-	for _, key := range store.ReservedKvAttributeNames() {
-		value, present := attrs[key]
-		if !present {
-			continue
-		}
-		switch typed := value.(type) {
-		case string:
-			createArgs = append(createArgs, "--attr", key+"="+typed)
-		case float64:
-			createArgs = append(createArgs, "--attr-int", fmt.Sprintf("%s=%d", key, int64(typed)))
-		default:
-			t.Fatalf("attribute %s has an unexpected JSON type %T", key, value)
-		}
+	if got, _ := prov["provenance_root"].(string); got != written.ProvenanceRoot.Hex() {
+		t.Fatalf("rust prov-write provenance root = %v, Go = %s", prov["provenance_root"], written.ProvenanceRoot.Hex())
 	}
-	runRust(t, bin, createArgs...)
+	if got, _ := prov["page_bytes"].(float64); got != float64(len(elements)) {
+		t.Fatalf("rust prov-write page_bytes = %v, want %d", prov["page_bytes"], len(elements))
+	}
 
 	// Go reads the Rust-written page back.
 	readOnly, err := store.Open(second, store.ReadOnly)
@@ -1070,11 +1082,11 @@ func TestKvProvHandoffRustThenGo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read rewritten frame: %v", err)
 	}
-	if !bytes.Equal(storedFrame, frame) {
-		t.Fatalf("rust-written frame (%d bytes) != rust-read frame (%d bytes)",
-			len(storedFrame), len(frame))
+	if !bytes.Equal(storedFrame, goFrame) {
+		t.Fatalf("rust-written frame (%d bytes) != Go-written frame (%d bytes)",
+			len(storedFrame), len(goFrame))
 	}
-	t.Logf("COURT rust_rewritten descriptor_id=%s root=%s frame_bytes=%d exact=true",
+	t.Logf("COURT rust_verb_written descriptor_id=%s root=%s frame_bytes=%d exact=true",
 		descriptorID.Hex(), descriptor.ProvenanceRoot.Hex(), len(storedFrame))
 	report, err := readOnly.Verify(true)
 	if err != nil || !report.OK {
