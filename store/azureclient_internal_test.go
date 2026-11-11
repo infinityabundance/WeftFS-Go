@@ -132,8 +132,20 @@ func TestDecodeBase64AnyIsStrict(t *testing.T) {
 }
 
 // TestAzureResolveRejectsAmbiguousCredentials proves the client refuses to
-// guess which credential the endpoint should see.
+// guess which credential the endpoint should see. The environment is pinned
+// first: the court exports WEFT_AZURE_KEY, and an inherited key is a legitimate
+// credential source, so an unpinned test would not describe a bare caller.
 func TestAzureResolveRejectsAmbiguousCredentials(t *testing.T) {
+	for _, name := range []string{
+		"WEFT_AZURE_ENDPOINT", "AZURE_STORAGE_BLOB_ENDPOINT",
+		"WEFT_AZURE_CONTAINER", "AZURE_STORAGE_CONTAINER",
+		"WEFT_AZURE_ACCOUNT", "AZURE_STORAGE_ACCOUNT",
+		"WEFT_AZURE_KEY", "AZURE_STORAGE_KEY",
+		"WEFT_AZURE_SAS", "AZURE_STORAGE_SAS_TOKEN",
+		"WEFT_AZURE_ANONYMOUS",
+	} {
+		t.Setenv(name, "")
+	}
 	anonymous := true
 	cases := []struct {
 		name string
