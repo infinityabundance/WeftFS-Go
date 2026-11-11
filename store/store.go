@@ -138,6 +138,11 @@ type Options struct {
 	// PackOptions is the physical packing policy; zero fields take the
 	// DefaultPackOptions values before validation.
 	PackOptions PackOptions
+	// ReadPoolIdle bounds the idle read-handle cache for the local and object
+	// blob planes (subphase R14). 0 selects DefaultReadPoolIdle, a negative
+	// value disables pooling (the plain open/read/close path), and a positive
+	// value is the bound. Remote planes are never pooled.
+	ReadPoolIdle int
 	// WriterMode selects the control-state publication contract. The empty
 	// value is `single` (MW1). `optimistic` is MW2 and is implemented for the
 	// local and object commit planes; it applies to the explicit transaction
@@ -173,6 +178,7 @@ func DefaultOptions() Options {
 		BlobBackend:             PlaneLocal,
 		CommitBackend:           PlaneLocal,
 		PackOptions:             DefaultPackOptions(),
+		ReadPoolIdle:            DefaultReadPoolIdle,
 		AttestIndexes:           true,
 		IndexChainMaxDeltas:     32,
 	}
@@ -857,6 +863,12 @@ func (s *Store) buildPlanes() error {
 
 	var access BlobAccess
 	var prober blobProber
+	readPoolIdle := s.options.ReadPoolIdle
+	if readPoolIdle == 0 {
+		readPoolIdle = DefaultReadPoolIdle
+	} else if readPoolIdle < 0 {
+		readPoolIdle = 0
+	}
 	switch blobKind {
 	case PlaneS3:
 		plane := newS3BlobPlane(client)
@@ -877,7 +889,7 @@ func (s *Store) buildPlanes() error {
 		blobRoot = plane.Root()
 		s.remoteBlob = true
 	default:
-		blobs, err := newFlatBlobPlane(blobRoot, blobKind)
+		blobs, err := newFlatBlobPlaneWithPool(blobRoot, blobKind, readPoolIdle)
 		if err != nil {
 			return err
 		}
@@ -991,8 +1003,21 @@ func (s *Store) Close() error {
 		// publishes, so on a packed plane it is exactly this case.
 		_ = s.blobs.Flush()
 	}
+	if flat, ok := s.probeFlat.(*flatBlobPlane); ok && flat != nil && flat.pool != nil {
+		flat.pool.closeAll()
+	}
 	s.writerLockHeld = false
 	return s.commits.Close()
+}
+
+// ReadPoolStats reports the read-handle pool counters for a local or object
+// blob plane. It is diagnostic evidence, never a correctness input.
+func (s *Store) ReadPoolStats() (ReadPoolStats, bool) {
+	flat, ok := s.probeFlat.(*flatBlobPlane)
+	if !ok || flat == nil || flat.pool == nil {
+		return ReadPoolStats{}, false
+	}
+	return flat.pool.snapshot(), true
 }
 
 func (s *Store) ensureBlobPlaneLayout() error {

@@ -288,34 +288,46 @@ type flatBlobPlane struct {
 	root string
 	kind PlaneKind
 	caps BlobCapabilities
+	// pool is the bounded read-handle cache for immutable blobs; nil when
+	// pooling is disabled or the plane is declared POSIX-only.
+	pool *readHandlePool
 }
 
 func newFlatBlobPlane(root string, kind PlaneKind) (*flatBlobPlane, error) {
+	return newFlatBlobPlaneWithPool(root, kind, 0)
+}
+
+// newFlatBlobPlaneWithPool builds a plane whose reads reuse up to `idle` file
+// handles. `idle <= 0` keeps the unpooled open/read/close path.
+func newFlatBlobPlaneWithPool(root string, kind PlaneKind, idle int) (*flatBlobPlane, error) {
+	var plane *flatBlobPlane
 	switch kind {
 	case PlaneLocal:
-		return &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
+		plane = &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
 			Backend: string(PlaneLocal), AtomicPublish: true, DurableFSync: true,
 			TrueRangeReads: true, MaxObjectBytes: maxObjectBytes,
 			Consistency: "single POSIX filesystem; one writer under LOCK",
 			Publication: "fsynced temporary file published with rename(2), then directory fsync",
-		}}, nil
+		}}
 	case PlaneObject:
-		return &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
+		plane = &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
 			Backend: string(PlaneObject), AtomicPublish: true, DurableFSync: true,
 			TrueRangeReads: true, MaxObjectBytes: maxObjectBytes,
 			Consistency: "immutable object namespace on one POSIX filesystem",
 			Publication: "fsynced temporary file published with link(2), then directory fsync",
-		}}, nil
+		}}
 	case PlanePosix:
-		return &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
+		plane = &flatBlobPlane{root: root, kind: kind, caps: BlobCapabilities{
 			Backend: string(PlanePosix), AtomicPublish: false, DurableFSync: false,
 			TrueRangeReads: true, MaxObjectBytes: maxObjectBytes,
 			Consistency: "declared unmeasured POSIX mount; no guarantee is claimed",
 			Publication: "declared: no atomic publication path",
-		}}, nil
+		}}
 	default:
 		return nil, werr.Newf(werr.InvalidArgument, "unknown blob plane `%s`", kind)
 	}
+	plane.pool = newReadHandlePool(kind, idle)
+	return plane, nil
 }
 
 func (p *flatBlobPlane) Label() string                  { return string(p.kind) }
@@ -334,6 +346,9 @@ func (p *flatBlobPlane) path(kind BlobKind, id model.Hash32) string {
 
 func (p *flatBlobPlane) Get(kind BlobKind, id model.Hash32) ([]byte, error) {
 	path := p.path(kind, id)
+	if p.pool != nil {
+		return p.pool.readAll(path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -346,6 +361,9 @@ func (p *flatBlobPlane) Get(kind BlobKind, id model.Hash32) ([]byte, error) {
 
 func (p *flatBlobPlane) GetRange(kind BlobKind, id model.Hash32, offset, length uint64) ([]byte, error) {
 	path := p.path(kind, id)
+	if p.pool != nil {
+		return p.pool.readRange(path, offset, length)
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -380,6 +398,9 @@ func (p *flatBlobPlane) GetRange(kind BlobKind, id model.Hash32, offset, length 
 
 func (p *flatBlobPlane) Put(kind BlobKind, id model.Hash32, data []byte) error {
 	path := p.path(kind, id)
+	if p.pool != nil {
+		p.pool.invalidate()
+	}
 	if existing, err := os.ReadFile(path); err == nil {
 		if !overlayBytesSame(existing, data) {
 			return werr.Newf(werr.Exists, "blob %s already exists with different bytes", path)
@@ -452,6 +473,9 @@ func (p *flatBlobPlane) Put(kind BlobKind, id model.Hash32, data []byte) error {
 
 func (p *flatBlobPlane) DeleteEntry(entry BlobEntry) error {
 	path := filepath.Join(p.root, filepath.FromSlash(entry.Rel))
+	if p.pool != nil {
+		p.pool.invalidate()
+	}
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return werr.Wrap(werr.NotFound, err, "blob %s does not exist", path)
@@ -463,6 +487,9 @@ func (p *flatBlobPlane) DeleteEntry(entry BlobEntry) error {
 
 func (p *flatBlobPlane) Delete(kind BlobKind, id model.Hash32) error {
 	path := p.path(kind, id)
+	if p.pool != nil {
+		p.pool.invalidate()
+	}
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return werr.Wrap(werr.NotFound, err, "blob %s does not exist", path)
