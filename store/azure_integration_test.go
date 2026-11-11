@@ -282,6 +282,16 @@ func TestAzureWrongKeyIsUnauthorized(t *testing.T) {
 	expectClass(t, err, werr.Unauthorized, "writable open with the wrong account key")
 }
 
+// TestAzureOptimisticWriterModeIsRefused records the Go scope boundary: MW2
+// uses the POSIX publication lock and is implemented for the local and object
+// commit planes only. Refusing here is explicit, never a silent downgrade.
+func TestAzureOptimisticWriterModeIsRefused(t *testing.T) {
+	options := azureFakeOptions(t, newAzureFake())
+	options.WriterMode = WriterModeOptimistic
+	_, err := Init("", options)
+	expectClass(t, err, werr.Unsupported, "azure commit plane with --writer-mode optimistic")
+}
+
 // ---- live Azurite court --------------------------------------------------
 
 func requireAzureEndpoint(t *testing.T) string {
