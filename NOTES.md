@@ -18,6 +18,10 @@ Revisions recorded for this work:
 | Frozen fixture copy digest (all files except `PROVENANCE.md`) | `ac73419fb4070c442fec14a960997c10821cd0cea0d92d9180cbf52040a0013e` |
 | v1.1.0 tag | `dc7cfdb7d9bd66ea7a39f38f3b198eb124d20a3d` (`staging == main`) |
 | v1.1.0 GCS and FUSE-over-object evidence | `bench/receipts/go-gcs-20261107T115759Z.json`, `bench/receipts/go-s3-20261107T120121Z.json` |
+| v1.2.0 tag | `6d58137` (`staging == main`) |
+| v1.2.0 evidence | `bench/receipts/verify-20261109T112958Z.json` (37/37 courts, program home) |
+| v1.3.0 release candidate | `staging` (tag and aggregate recorded by the release verification pass) |
+| v1.3.0 Go evidence | `bench/RESULTS-azure-go.md`, `bench/RESULTS-go-read-pool.md`, `bench/RESULTS-kv-go-parity.md` |
 
 ---
 
@@ -1197,8 +1201,11 @@ was edited.
   proof uses a test-only client page-size knob.
 - `durable_fsync` means "the provider acknowledged the upload"; GCS has no
   fsync, and the court's data is memory/tmpfs.
-- Go still has **no Azure backend**. The `--backend azure` spelling remains
-  Rust-only; choosing it in Go is `InvalidArgument`.
+- Azure was out of scope at R26. The **R14** subphase adds a real Go Azure
+  Blob backend (`store/azureclient.go`, `azureblob.go`, `azurecommit.go`) with
+  the same v3 fenced `LOCK`, SharedKey/SAS authentication, and the measured
+  `If-Match` form; see the R14 section below and `bench/RESULTS-azure-go.md`.
+  MW2 on Go `azure` remains refused `Unsupported`.
 
 ---
 
@@ -1427,3 +1434,62 @@ Honest losses and limits:
   unless `--gc-grace-secs 0` is configured; the tests set 0.
 - Single host, one synthetic fixture, warm caches. No device, power-loss,
   fleet, or production claim. No performance claim beyond the numbers above.
+
+## R14/R15 — Go Azure Blob, read-handle pool, and KV store parity (2026-11-11)
+
+- **Azure Blob backend (R14).** `store/azureclient.go`, `azureblob.go`, and
+  `azurecommit.go` implement the Azure REST surface from the same contract as
+  the Rust `src/azure.rs`: `Put Blob` with `x-ms-blob-type: BlockBlob` and
+  `If-None-Match: *`, `If-Match`-based CAS and the v3 fenced `LOCK`, ranged
+  `Get Blob`, `HEAD`, `Delete Blob`, and marker-paged `List Blobs`. SharedKey is
+  HMAC-SHA256 over the documented string-to-sign with the standard library only;
+  SAS is appended verbatim; exactly one credential form is accepted and secrets
+  never reach diagnostics. The `If-Match` spelling is measured at a writable
+  open, and an endpoint that ignores either conditional form is refused
+  `Unsupported`. Court (`bench/scripts/azure_court.sh`, pinned Azurite 3.35.0):
+  Rust `azure_backend` 19 passed / 0 failed, Rust `azure_fencing` 9 passed / 0
+  failed, Go `go test -run 'TestAzure|TestDecodeBase64' ./store` 18 passed / 0
+  failed. One container proves the handoff both ways: Go writes → Rust
+  `verify --full`/`cat` exact; Rust writes → Go reads and verifies; Go reclaims
+  the Rust tombstone and Rust verifies again. Evidence
+  `bench/receipts/azure-court-20261111T144613Z.json`,
+  `bench/receipts/azure-20261111T144613Z.json`,
+  `bench/receipts/azure-go-20261111T144613Z.log`; analysis
+  `bench/RESULTS-azure-go.md`. Not claimed: no live Azure, no Go SAS- or
+  anonymous-acceptance court, multi-page listing and packing over Azure
+  unexercised, single node / tmpfs / loopback. MW2 on Go `azure` is refused
+  `Unsupported` and asserted by test.
+- **Read-handle pool (R14).** `store/read_pool.go` mirrors the Rust
+  `src/read_pool.rs`: at most `Options.ReadPoolIdle` idle handles (default 64,
+  negative disables), oldest closed first, the mutex covers only the idle map,
+  reads use `ReadAt`, and the hash is computed after the handle is released. An
+  idle handle is validated with one `stat` before reuse — the first version was
+  not, and the full suite caught two real regressions
+  (`TestOverlayRangeReadsOnlyIntersectingChunks`,
+  `TestTensorMissingDependencyFailsClosedAndGC`); `TestReadPoolVanishedBlobFailsClosed`
+  asserts the fix. `store/read_pool_test.go` 9/9 under `-race`. Measured
+  descriptor cost only (73,728-byte file, 300 iterations x 3): unpooled
+  6,939/7,240/8,420 ns/op against pooled 6,321/5,156/5,334 ns/op; the spread is
+  wide and no restore-throughput, p50/p99, Rust-comparison, or fleet claim is
+  made. Analysis `bench/RESULTS-go-read-pool.md`.
+- **KV store parity (R15).** `store/kv.go` writes and reads mode 12 and mode 19
+  pages, the two canonical descriptors and strict parsers, the reserved
+  attribute set, the one denial text, and the normative authorization order.
+  `KvPrincipal{Principal, Capability}` is the documented API difference: Go has
+  no envelope type and verifies no signature on this path. Measured costs (go
+  court, tmpfs, warm cache, 200 iterations, one commit per write, benchmem):
+  4 KiB page write 10.56 ms/op / 4.08 MB alloc, 4 KiB read 0.697 ms / 238 KB,
+  64 KiB read 2.46 ms / 406 KB. Every page write is its own commit and there is
+  no decoded-object cache or single-flight; these are published as costs, not a
+  competitive result. The Rust CLI gained `weftfs kv prov-write` in the same
+  subphase, so `TestKvProvHandoffRustThenGo` is a genuine writer-to-reader proof
+  in both directions. Logs
+  `bench/receipts/kv-go-parity-fuse-20261111T154406Z.log`,
+  `bench/receipts/kv-go-bench-20261111T154406Z.log`; analysis
+  `bench/RESULTS-kv-go-parity.md`. Still absent: Go KV prefix tier, Go
+  envelope verification, and a Go CLI KV page writer.
+- **Full suite.** `go test -race ./...` in the fuse court at `225eb0d`:
+  cmd/weftfs 44.544 s, fusefs 7.273 s, index 1.004 s, model 1.009 s, store
+  215.102 s, 0 failures; gofmt, vet, and the CGO-disabled build clean. The `go`
+  court lacks `/bin/fusermount`, so the FUSE package is only meaningful in the
+  fuse court.
