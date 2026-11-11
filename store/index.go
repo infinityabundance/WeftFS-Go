@@ -635,41 +635,74 @@ func (s *Store) gcIndexSegments(retained map[model.Hash32]struct{}, now time.Tim
 }
 
 // expandRetainedChains adds every ancestor segment named by a retained commit.
+//
+// The depth bound is **per retained root**, not cumulative across the retained
+// set: each root's own walk must reach a full segment within
+// weftindex.HardMaxChainDeltas hops. The distance from a commit to its full
+// ancestor is memoised, so a commit shared by several roots is read once and
+// each root is still measured against its own depth. A root that violates the
+// bound (too deep, or a cycle) fails the whole pass closed: nothing is deleted.
 func (s *Store) expandRetainedChains(retained map[model.Hash32]struct{}) error {
-	queue := make([]model.Hash32, 0, len(retained))
+	roots := make([]model.Hash32, 0, len(retained))
 	for commit := range retained {
-		queue = append(queue, commit)
+		roots = append(roots, commit)
 	}
-	visited := map[model.Hash32]struct{}{}
-	for len(queue) > 0 {
-		commit := queue[0]
-		queue = queue[1:]
-		if _, ok := visited[commit]; ok {
-			continue
-		}
-		visited[commit] = struct{}{}
-		data, err := s.blobs.Get(BlobIndex, commit)
-		if err != nil {
-			if werr.Is(err, werr.NotFound) {
-				continue
+	// Deterministic order, so a refusal names the same root on every run.
+	sort.Slice(roots, func(i, j int) bool { return roots[i].Less(roots[j]) })
+	// Delta hops still to walk from a commit before its full ancestor: 0 when
+	// the commit's segment is full, is not WFX3, or does not exist.
+	distance := make(map[model.Hash32]uint64, len(roots))
+	for _, root := range roots {
+		path := make([]model.Hash32, 0, weftindex.HardMaxChainDeltas)
+		onPath := make(map[model.Hash32]struct{}, weftindex.HardMaxChainDeltas)
+		current := root
+		for {
+			if rest, ok := distance[current]; ok {
+				// Resolved by an earlier root. This root's own cumulative
+				// depth still has to fit the same per-chain bound.
+				if uint64(len(path))+rest > uint64(weftindex.HardMaxChainDeltas) {
+					return werr.Newf(werr.LimitExceeded, "index segment chain exceeds the hard depth bound")
+				}
+				break
 			}
-			return err
+			if _, ok := onPath[current]; ok {
+				return werr.Newf(werr.LimitExceeded, "index segment chain contains a cycle")
+			}
+			onPath[current] = struct{}{}
+			data, err := s.blobs.Get(BlobIndex, current)
+			if err != nil {
+				if werr.Is(err, werr.NotFound) {
+					// No segment: there is nothing left to retain.
+					distance[current] = 0
+					break
+				}
+				return err
+			}
+			if len(data) < 4 || string(data[0:4]) != weftindex.MagicV3 {
+				distance[current] = 0
+				break
+			}
+			segment, err := weftindex.DecodeSegment(data)
+			if err != nil {
+				return err
+			}
+			if segment.Header.Kind == weftindex.SegmentFull {
+				distance[current] = 0
+				break
+			}
+			if uint64(len(path)) >= uint64(weftindex.HardMaxChainDeltas) {
+				return werr.Newf(werr.LimitExceeded, "index segment chain exceeds the hard depth bound")
+			}
+			path = append(path, current)
+			retained[segment.Header.BaseCommit] = struct{}{}
+			current = segment.Header.BaseCommit
 		}
-		if len(data) < 4 || string(data[0:4]) != weftindex.MagicV3 {
-			continue
+		// Fill in this walk's distances backwards from the terminal commit.
+		rest := distance[current]
+		for i := len(path) - 1; i >= 0; i-- {
+			rest++
+			distance[path[i]] = rest
 		}
-		segment, err := weftindex.DecodeSegment(data)
-		if err != nil {
-			return err
-		}
-		if segment.Header.Kind == weftindex.SegmentFull {
-			continue
-		}
-		if len(visited) > int(weftindex.HardMaxChainDeltas) {
-			return werr.Newf(werr.LimitExceeded, "index segment chain exceeds the hard depth bound")
-		}
-		retained[segment.Header.BaseCommit] = struct{}{}
-		queue = append(queue, segment.Header.BaseCommit)
 	}
 	return nil
 }
