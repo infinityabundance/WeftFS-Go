@@ -60,16 +60,20 @@ const (
 	// PlaneGCS is a GCS-compatible JSON API endpoint. Compare-and-swap uses
 	// object generations (`ifGenerationMatch`), not ETags.
 	PlaneGCS PlaneKind = "gcs"
+	// PlaneAzure is an Azure Blob-compatible endpoint. Compare-and-swap uses
+	// the service ETag (`If-Match`), whose accepted spelling is measured at a
+	// writable open.
+	PlaneAzure PlaneKind = "azure"
 )
 
-// ParsePlaneKind parses `local|object|posix|s3|gcs`.
+// ParsePlaneKind parses `local|object|posix|s3|gcs|azure`.
 func ParsePlaneKind(text string) (PlaneKind, error) {
 	switch PlaneKind(text) {
-	case PlaneLocal, PlaneObject, PlanePosix, PlaneS3, PlaneGCS:
+	case PlaneLocal, PlaneObject, PlanePosix, PlaneS3, PlaneGCS, PlaneAzure:
 		return PlaneKind(text), nil
 	default:
 		return "", werr.Newf(werr.InvalidArgument,
-			"backend must be `local`, `object`, `posix`, `s3`, or `gcs` (got `%s`)", text)
+			"backend must be `local`, `object`, `posix`, `s3`, `gcs`, or `azure` (got `%s`)", text)
 	}
 }
 

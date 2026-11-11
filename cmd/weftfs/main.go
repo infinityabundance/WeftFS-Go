@@ -53,13 +53,15 @@ func usage() {
 	fmt.Fprint(os.Stderr, `usage: weftfs [--store DIR] [--json] [--representation raw|codec-auto|overlay]
               [--content-identity whole-file|merkle] [--codec-min-bytes N]
               [--quota SPEC] [--quota-file FILE]
-              [--backend local|object|posix|s3|gcs]
+              [--backend local|object|posix|s3|gcs|azure]
               [--blob-backend KIND] [--commit-backend KIND] [--blob-root DIR]
               [--s3-endpoint URL] [--s3-bucket NAME] [--s3-region REGION]
               [--s3-access-key KEY] [--s3-secret-key SECRET] [--s3-session-token TOKEN]
               [--gcs-endpoint URL] [--gcs-bucket NAME] [--gcs-token TOKEN]
               [--gcs-credentials FILE] [--gcs-project PROJECT] [--gcs-scope SCOPE]
               [--gcs-anonymous]
+              [--azure-endpoint URL] [--azure-container NAME] [--azure-account NAME]
+              [--azure-key KEY] [--azure-sas TOKEN] [--azure-anonymous]
               <command> [args]
 
 commands:
@@ -67,13 +69,17 @@ commands:
   readlink setattr xattr relation query snapshot verify gc checkpoint pin mount
   context causal uri tensor quota merge rebase compact calibrate
 
---store is optional when either plane is s3 or gcs; the store is then
-addressed by bucket. A gcs plane accepts exactly one credential form: a
-bearer token (--gcs-token or WEFT_GCS_ACCESS_TOKEN/GOOGLE_OAUTH_ACCESS_TOKEN),
-a service-account key (--gcs-credentials or WEFT_GCS_CREDENTIALS/
-GOOGLE_APPLICATION_CREDENTIALS), or --gcs-anonymous for an emulator. A
-writable open probes the endpoint's generation preconditions and refuses one
-that cannot prove create-once and compare-and-swap.
+--store is optional when either plane is s3, gcs, or azure; the store is then
+addressed by bucket or container. A gcs plane accepts exactly one credential
+form: a bearer token (--gcs-token or WEFT_GCS_ACCESS_TOKEN/
+GOOGLE_OAUTH_ACCESS_TOKEN), a service-account key (--gcs-credentials or
+WEFT_GCS_CREDENTIALS/GOOGLE_APPLICATION_CREDENTIALS), or --gcs-anonymous for
+an emulator. An azure plane accepts exactly one credential form: an account
+key (--azure-key or WEFT_AZURE_KEY/AZURE_STORAGE_KEY), a SAS token
+(--azure-sas or WEFT_AZURE_SAS/AZURE_STORAGE_SAS_TOKEN), or
+--azure-anonymous for an emulator. A writable open probes the endpoint's
+conditional writes and refuses one that cannot prove create-once and
+compare-and-swap.
 `)
 }
 
@@ -130,6 +136,14 @@ var (
 	gcsAnonymous   bool
 	gcsCredentials string
 	gcsScope       string
+	// Azure endpoint, container, account, and credential form. Exactly one of
+	// key, SAS token, or anonymous may resolve.
+	azureEndpoint  string
+	azureContainer string
+	azureAccount   string
+	azureKey       string
+	azureSAS       string
+	azureAnonymous bool
 	// Pack-plane policy. `--pack` enables it; the bounds default to the Rust
 	// values and are always validated.
 	packing      bool
@@ -185,7 +199,8 @@ func applyPlanePolicy(opts *store.Options) {
 func remotePlaneConfigured() bool {
 	blob, commit := effectivePlanes()
 	return blob == store.PlaneS3 || commit == store.PlaneS3 ||
-		blob == store.PlaneGCS || commit == store.PlaneGCS
+		blob == store.PlaneGCS || commit == store.PlaneGCS ||
+		blob == store.PlaneAzure || commit == store.PlaneAzure
 }
 
 // applyS3Policy resolves the S3 configuration when either plane is S3. A
@@ -194,6 +209,7 @@ func applyS3Policy(opts *store.Options) error {
 	if !remotePlaneConfigured() {
 		opts.S3 = nil
 		opts.GCS = nil
+		opts.Azure = nil
 		return nil
 	}
 	blob, commit := effectivePlanes()
@@ -219,6 +235,20 @@ func applyS3Policy(opts *store.Options) error {
 		opts.GCS = &config
 	} else {
 		opts.GCS = nil
+	}
+	if blob == store.PlaneAzure || commit == store.PlaneAzure {
+		var anonymous *bool
+		if azureAnonymous {
+			value := true
+			anonymous = &value
+		}
+		config, err := store.ResolveAzure(azureEndpoint, azureContainer, azureAccount, azureKey, azureSAS, anonymous, 0)
+		if err != nil {
+			return err
+		}
+		opts.Azure = &config
+	} else {
+		opts.Azure = nil
 	}
 	return nil
 }
@@ -494,6 +524,49 @@ func globals(args []string) (rest []string, storeDir string, jsonOut bool, err e
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--gcs-anonymous must be true or false")
 			}
 			gcsAnonymous = value
+		case args[i] == "--azure-endpoint" || strings.HasPrefix(args[i], "--azure-endpoint="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--azure-endpoint")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			azureEndpoint = value
+			i += consumed
+		case args[i] == "--azure-container" || strings.HasPrefix(args[i], "--azure-container="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--azure-container")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			azureContainer = value
+			i += consumed
+		case args[i] == "--azure-account" || strings.HasPrefix(args[i], "--azure-account="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--azure-account")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			azureAccount = value
+			i += consumed
+		case args[i] == "--azure-key" || strings.HasPrefix(args[i], "--azure-key="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--azure-key")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			azureKey = value
+			i += consumed
+		case args[i] == "--azure-sas" || strings.HasPrefix(args[i], "--azure-sas="):
+			value, consumed, parseErr := s3FlagValue(args, i, "--azure-sas")
+			if parseErr != nil {
+				return nil, "", false, parseErr
+			}
+			azureSAS = value
+			i += consumed
+		case args[i] == "--azure-anonymous":
+			azureAnonymous = true
+		case strings.HasPrefix(args[i], "--azure-anonymous="):
+			value, parseErr := strconv.ParseBool(strings.TrimPrefix(args[i], "--azure-anonymous="))
+			if parseErr != nil {
+				return nil, "", false, werr.Newf(werr.InvalidArgument, "--azure-anonymous must be true or false")
+			}
+			azureAnonymous = value
 		case args[i] == "--planner-cost-model" || args[i] == "-planner-cost-model":
 			if i+1 >= len(args) {
 				return nil, "", false, werr.Newf(werr.InvalidArgument, "--planner-cost-model requires a value")

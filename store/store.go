@@ -149,6 +149,9 @@ type Options struct {
 	// GCS configures a GCS-compatible endpoint. It is required when either
 	// BlobBackend or CommitBackend is `gcs` and ignored otherwise.
 	GCS *GCSConfig
+	// Azure configures an Azure Blob-compatible endpoint. It is required when
+	// either BlobBackend or CommitBackend is `azure` and ignored otherwise.
+	Azure *AzureConfig
 }
 
 // DefaultOptions returns the normative v1 defaults.
@@ -356,6 +359,15 @@ func validateOptions(opts Options) error {
 			return err
 		}
 	}
+	if opts.BlobBackend == PlaneAzure || opts.CommitBackend == PlaneAzure {
+		if opts.Azure == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `azure` plane needs endpoint, container, account, and exactly one credential form")
+		}
+		if err := opts.Azure.Validate(); err != nil {
+			return err
+		}
+	}
 	if opts.BlobRoot != "" && opts.BlobBackend == PlanePosix {
 		return werr.Newf(werr.InvalidArgument, "a `posix` blob plane cannot be given an explicit root")
 	}
@@ -493,13 +505,13 @@ func Init(path string, opts Options) (*Store, error) {
 			blobKind = PlaneLocal
 		}
 	}
-	if commitKind != PlaneS3 && commitKind != PlaneGCS && path == "" {
+	if commitKind != PlaneS3 && commitKind != PlaneGCS && commitKind != PlaneAzure && path == "" {
 		return nil, werr.Newf(werr.InvalidArgument, "a local commit plane needs a store directory")
 	}
-	if blobKind != PlaneS3 && blobKind != PlaneGCS && opts.BlobRoot == "" && path == "" {
+	if blobKind != PlaneS3 && blobKind != PlaneGCS && blobKind != PlaneAzure && opts.BlobRoot == "" && path == "" {
 		return nil, werr.Newf(werr.InvalidArgument, "a local blob plane needs a store directory or --blob-root")
 	}
-	if commitKind != PlaneS3 && commitKind != PlaneGCS {
+	if commitKind != PlaneS3 && commitKind != PlaneGCS && commitKind != PlaneAzure {
 		info, err := os.Stat(path)
 		if err == nil {
 			if !info.IsDir() {
@@ -760,6 +772,15 @@ func (s *Store) GCSStats() (GCSStatsSnapshot, bool) {
 	return GCSStatsSnapshot{}, false
 }
 
+// AzureStats reports the shared Azure client's HTTP counters when either plane
+// is Azure. It is host-local diagnostic evidence, not a performance claim.
+func (s *Store) AzureStats() (AzureStatsSnapshot, bool) {
+	if provider, ok := s.commits.(interface{ AzureStats() AzureStatsSnapshot }); ok {
+		return provider.AzureStats(), true
+	}
+	return AzureStatsSnapshot{}, false
+}
+
 // PackStats reports this handle's pack-plane counters when packing is enabled.
 func (s *Store) PackStats() (PackStats, bool) {
 	if s.packed == nil {
@@ -821,6 +842,18 @@ func (s *Store) buildPlanes() error {
 		}
 		gcs = created
 	}
+	var azure *azureClient
+	if blobKind == PlaneAzure || commitKind == PlaneAzure {
+		if s.options.Azure == nil {
+			return werr.Newf(werr.InvalidArgument,
+				"the `azure` plane needs an endpoint, container, account, and exactly one credential form (--azure-endpoint/--azure-container/--azure-account/--azure-key/--azure-sas/--azure-anonymous or WEFT_AZURE_*/AZURE_STORAGE_*)")
+		}
+		created, err := newAzureClient(*s.options.Azure)
+		if err != nil {
+			return err
+		}
+		azure = created
+	}
 
 	var access BlobAccess
 	var prober blobProber
@@ -833,6 +866,12 @@ func (s *Store) buildPlanes() error {
 		s.remoteBlob = true
 	case PlaneGCS:
 		plane := newGCSBlobPlane(gcs)
+		access = plane
+		prober = plane
+		blobRoot = plane.Root()
+		s.remoteBlob = true
+	case PlaneAzure:
+		plane := newAzureBlobPlane(azure)
 		access = plane
 		prober = plane
 		blobRoot = plane.Root()
@@ -855,6 +894,10 @@ func (s *Store) buildPlanes() error {
 		control = plane
 	case PlaneGCS:
 		plane := newGCSControl(gcs)
+		commits = plane
+		control = plane
+	case PlaneAzure:
+		plane := newAzureControl(azure)
 		commits = plane
 		control = plane
 	default:
