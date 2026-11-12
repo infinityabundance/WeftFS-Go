@@ -244,6 +244,15 @@ func (c *s3Control) PublishFencedHead(generation uint64, commit model.Hash32, co
 	return true, nil
 }
 
+// MW2 is not claimed for the Go S3 commit plane: `validateOptions` refuses
+// `--writer-mode optimistic` before a plane is built, so these are unreachable
+// and must never pretend to have published a head.
+func (c *s3Control) SupportsConditionalHeadPublication() bool { return false }
+
+func (c *s3Control) PublishHeadConditional(uint64, model.Hash32, SuperblockSlot) (bool, error) {
+	return false, nil
+}
+
 // AttestedHead returns the head the published LOCK record names.
 func (c *s3Control) AttestedHead() (uint64, model.Hash32, uint64, bool, error) {
 	response, err := c.client.get("LOCK", 0, 0)

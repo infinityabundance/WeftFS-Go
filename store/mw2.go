@@ -794,8 +794,10 @@ func (s *Store) writeTxRecord(tx *Transaction, state TxRecordState, commit *mode
 	}
 	name := "txs/" + tx.ID
 	if state == TxPrepared {
-		if err := os.MkdirAll(filepath.Join(s.commits.Root(), "txs"), 0o755); err != nil {
-			return werr.Wrap(werr.Io, err, "cannot create txs directory")
+		if rootIsFilesystem(s.commits.Root()) {
+			if err := os.MkdirAll(filepath.Join(s.commits.Root(), "txs"), 0o755); err != nil {
+				return werr.Wrap(werr.Io, err, "cannot create txs directory")
+			}
 		}
 		if err := s.commits.WriteRecordNew(name, data); err != nil {
 			if werr.ClassOf(err) == werr.Exists {
@@ -876,7 +878,7 @@ func (s *Store) commitInChain(record TxRecord, commit model.Hash32, window uint6
 }
 
 func (s *Store) reloadFromPlane() error {
-	recovery, err := recoverForWrite(headAttestHider{s.commits}, s.blobs)
+	recovery, err := recoverForWrite(s.commits, s.blobs)
 	if err != nil {
 		return err
 	}
@@ -898,11 +900,6 @@ func (s *Store) reloadFromPlane() error {
 	s.loadQuotaRecord()
 	return nil
 }
-
-// headAttestHider deliberately does not implement AttestedHead: an optimistic
-// store's superblock is authoritative and a stale writer-lock record from an
-// earlier single-writer life must not override it.
-type headAttestHider struct{ commitSource }
 
 // ensureWriterPolicy confirms or creates the policy record.
 func (s *Store) ensureWriterPolicy(mode WriterMode) error {
@@ -955,7 +952,12 @@ func (s *Store) ensureWriterPolicy(mode WriterMode) error {
 }
 
 // publishCommitOptimistic is the MW2 publication: create-once commit record
-// plus one superblock slot write under a short cross-process publication lock.
+// plus one head publication.
+//
+// A plane with a real compare-and-swap publishes the head with one conditional
+// write (`SupportsConditionalHeadPublication`) and needs no publication lock; a
+// POSIX plane keeps LOCK.publish plus the superblock slot write in the same
+// critical section.
 func (s *Store) publishCommitOptimistic(commit model.Commit) (model.Hash32, error) {
 	if err := s.blobs.Flush(); err != nil {
 		return model.Hash32{}, err
@@ -966,6 +968,10 @@ func (s *Store) publishCommitOptimistic(commit model.Commit) (model.Hash32, erro
 	}
 	hashID := model.CommitIDBytes(wcbBytes)
 	fileBytes := EncodeCommitFile(wcbBytes)
+
+	if s.commits.SupportsConditionalHeadPublication() {
+		return s.publishCommitOptimisticConditional(commit, hashID, wcbBytes, fileBytes)
+	}
 
 	lock, err := s.acquirePublicationLock()
 	if err != nil {
@@ -1007,6 +1013,98 @@ func (s *Store) publishCommitOptimistic(commit model.Commit) (model.Hash32, erro
 		return model.Hash32{}, err
 	}
 	return hashID, nil
+}
+
+// publishCommitOptimisticConditional is the MW2 publication against a plane
+// whose head write is a real compare-and-swap (currently `azure`).
+//
+// Order and error handling mirror the Rust `publish_commit_optimistic`: the
+// commit record is created once, then the head is advanced by a single
+// conditional write. A definitive `Busy` may leave an unreferenced record, and
+// only a head that cannot name it proves that. Any other error is ambiguous —
+// the write may have landed — so the record is left in place and
+// recovery/verify resolve it rather than risk destroying an acknowledged
+// commit.
+func (s *Store) publishCommitOptimisticConditional(commit model.Commit, hashID model.Hash32, wcbBytes, fileBytes []byte) (model.Hash32, error) {
+	crashPoint("mw2_before_head")
+	if exists, err := s.commits.HasCommit(commit.Generation); err != nil {
+		return model.Hash32{}, err
+	} else if exists {
+		return model.Hash32{}, werr.Newf(werr.Busy,
+			"commit generation %d already exists; retry against the new head", commit.Generation)
+	}
+	if err := s.commits.CreateCommit(commit.Generation, fileBytes); err != nil {
+		if werr.ClassOf(err) == werr.Exists {
+			// Another committer used this generation first (create-once), or a
+			// twin wrote identical bytes and is about to publish. Either way the
+			// loop must reload the head and choose the next generation; it is
+			// not a fatal error.
+			return model.Hash32{}, werr.Newf(werr.Busy,
+				"commit generation %d was created concurrently; retry against the new head", commit.Generation)
+		}
+		return model.Hash32{}, err
+	}
+	crashPoint("after_commit_file")
+	slot := SuperblockSlot{
+		Generation: commit.Generation, Commit: hashID,
+		CommitLen: uint64(len(wcbBytes)), TimestampNS: commit.TimestampNS,
+	}
+	supported, err := s.commits.PublishHeadConditional(s.generation, s.head, slot)
+	if err != nil {
+		if supported && werr.ClassOf(err) == werr.Busy {
+			if s.commitRecordIsPublished(commit.Generation, hashID) {
+				// An identical commit was published by a twin committer. The
+				// effect this transaction asked for is exactly the published
+				// state, so report this attempt's outcome instead of retrying.
+				crashPoint("mw2_after_head")
+				crashPoint("after_superblock_write")
+				if syncErr := s.commits.Sync(); syncErr != nil {
+					return model.Hash32{}, syncErr
+				}
+				return hashID, nil
+			}
+			s.deleteUnreferencedCommit(commit.Generation)
+		}
+		return model.Hash32{}, err
+	}
+	if !supported {
+		return model.Hash32{}, werr.New(werr.Unsupported,
+			"commit plane reported no conditional head publication after the commit record was written")
+	}
+	crashPoint("mw2_after_head")
+	crashPoint("after_superblock_write")
+	if err := s.commits.Sync(); err != nil {
+		return model.Hash32{}, err
+	}
+	return hashID, nil
+}
+
+// publishedHead returns the highest valid superblock slot.
+func (s *Store) publishedHead() (uint64, model.Hash32, bool) {
+	view, err := s.commits.ReadSuperblock()
+	if err != nil {
+		return 0, model.ZeroHash, false
+	}
+	return highestSlot(view)
+}
+
+// commitRecordIsPublished reports whether the current head names exactly
+// (generation, commit).
+func (s *Store) commitRecordIsPublished(generation uint64, commit model.Hash32) bool {
+	headGeneration, headCommit, ok := s.publishedHead()
+	return ok && headGeneration == generation && headCommit == commit
+}
+
+// deleteUnreferencedCommit removes a commit record this attempt created only
+// when the published head proves no chain can name it. Create-once publication
+// accepts identical bytes, so a twin committer can create the same record and
+// publish it; deleting that record would destroy an acknowledged commit.
+func (s *Store) deleteUnreferencedCommit(generation uint64) {
+	headGeneration, _, ok := s.publishedHead()
+	if ok && headGeneration >= generation {
+		return
+	}
+	_ = s.commits.DeleteRecord("commits/" + itoa(generation) + ".commit")
 }
 
 func (s *Store) acquirePublicationLock() (*os.File, error) {

@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/infinityabundance/WeftCodec-Go/wcb"
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
 )
@@ -282,14 +283,278 @@ func TestAzureWrongKeyIsUnauthorized(t *testing.T) {
 	expectClass(t, err, werr.Unauthorized, "writable open with the wrong account key")
 }
 
-// TestAzureOptimisticWriterModeIsRefused records the Go scope boundary: MW2
-// uses the POSIX publication lock and is implemented for the local and object
-// commit planes only. Refusing here is explicit, never a silent downgrade.
-func TestAzureOptimisticWriterModeIsRefused(t *testing.T) {
-	options := azureFakeOptions(t, newAzureFake())
-	options.WriterMode = WriterModeOptimistic
-	_, err := Init("", options)
-	expectClass(t, err, werr.Unsupported, "azure commit plane with --writer-mode optimistic")
+// ---- MW2 over the Azure commit plane (subphase R14d) --------------------
+//
+// Azure Blob has a real compare-and-swap, so the head is published with one
+// conditional `Put Blob` whose `If-Match` is the ETag read with the head
+// check. These tests use the shipped transaction API: two independent handles
+// publishing disjoint files, then a fresh open that must see both.
+
+func azureMW2Options(t *testing.T, fake *azureFake) Options {
+	t.Helper()
+	options := azureFakeOptions(t, fake)
+	now := int64(1_700_000_000_000_000_000)
+	options.FixedTimestampNS = &now
+	options.CheckpointInterval = 4
+	options.GCGraceSecs = 0
+	return options
+}
+
+type azureMW2FilePlan struct {
+	record model.ObjectRecord
+	entry  model.EntryRecord
+}
+
+func azureMW2PlanFile(t *testing.T, s *Store, name, data, seed []byte) azureMW2FilePlan {
+	t.Helper()
+	manifest, _, size, err := s.PrepareContent(data)
+	if err != nil {
+		t.Fatalf("prepare content: %v", err)
+	}
+	now := int64(1_700_000_000_000_000_000)
+	id := model.ObjectIDFromSeed(seed)
+	version, err := model.DeriveVersionID(id, manifest, size, now, nil)
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+	record := model.ObjectRecord{
+		ID: id, Kind: model.KindFile, Mode: 0o644, UID: 0, GID: 0,
+		MtimeNS: now, Version: version, Content: manifest, Size: size,
+		Attrs: map[string]wcb.Value{},
+	}
+	entryID, err := model.DeriveEntryID(model.RootID, name)
+	if err != nil {
+		t.Fatalf("entry id: %v", err)
+	}
+	entry := model.EntryRecord{ID: entryID, Parent: model.RootID, Name: append([]byte(nil), name...), Target: id}
+	return azureMW2FilePlan{record: record, entry: entry}
+}
+
+func azureMW2Stage(t *testing.T, s *Store, id string, plan azureMW2FilePlan) *Transaction {
+	t.Helper()
+	tx, err := s.BeginTransaction(id)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.PutObject(s.CurrentState(), plan.record); err != nil {
+		t.Fatalf("put object: %v", err)
+	}
+	if err := tx.PutEntry(s.CurrentState(), plan.entry); err != nil {
+		t.Fatalf("put entry: %v", err)
+	}
+	if err := tx.SetTip(s.CurrentState(), plan.record.ID, plan.record.Version); err != nil {
+		t.Fatalf("set tip: %v", err)
+	}
+	return tx
+}
+
+func TestAzureOptimisticTwoDisjointCommitters(t *testing.T) {
+	fake := newAzureFake()
+	single := azureMW2Options(t, fake)
+	single.WriterMode = WriterModeSingle
+	init, err := Init("", single)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatalf("close init: %v", err)
+	}
+
+	optimistic := single
+	optimistic.WriterMode = WriterModeOptimistic
+	a, err := OpenWithOptions("", ReadWrite, optimistic)
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	defer a.Close()
+	b, err := OpenWithOptions("", ReadWrite, optimistic)
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+	defer b.Close()
+
+	planA := azureMW2PlanFile(t, a, []byte("azure-a.txt"), []byte("alpha-azure"), []byte("mw2-az-a"))
+	planB := azureMW2PlanFile(t, a, []byte("azure-b.txt"), []byte("beta-azure"), []byte("mw2-az-b"))
+	txA := azureMW2Stage(t, a, "000000000000000000000000000000a1", planA)
+	txB := azureMW2Stage(t, b, "000000000000000000000000000000b1", planB)
+
+	outA, err := a.ExecuteTransaction(txA, DefaultTransactionOptions())
+	if err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	outB, err := b.ExecuteTransaction(txB, DefaultTransactionOptions())
+	if err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	if outA.Commit == outB.Commit || outA.Idempotent || outB.Idempotent {
+		t.Fatalf("outcomes: %+v %+v", outA, outB)
+	}
+	if outB.Attempts < 1 {
+		t.Fatalf("B did not retry onto A's head: attempts=%d", outB.Attempts)
+	}
+	if outB.Generation != outA.Generation+1 {
+		t.Fatalf("generations A=%d B=%d", outA.Generation, outB.Generation)
+	}
+
+	check, err := OpenWithOptions("", ReadWrite, optimistic)
+	if err != nil {
+		t.Fatalf("fresh open: %v", err)
+	}
+	defer check.Close()
+	report, err := check.Verify(true)
+	if err != nil || !report.OK {
+		t.Fatalf("verify: ok=%v err=%v problems=%v", report.OK, err, report.Problems)
+	}
+	entries, err := check.ListDir(model.RootID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		seen[string(entry.Name)] = true
+	}
+	if !seen["azure-a.txt"] || !seen["azure-b.txt"] {
+		t.Fatalf("entries: %v", seen)
+	}
+	for _, plan := range []azureMW2FilePlan{planA, planB} {
+		if _, err := check.ReadObject(plan.record.ID); err != nil {
+			t.Fatalf("read %s: %v", string(plan.entry.Name), err)
+		}
+	}
+	if body, err := check.ReadObject(planA.record.ID); err != nil || !bytes.Equal(body, []byte("alpha-azure")) {
+		t.Fatalf("A body: %q %v", body, err)
+	}
+	if body, err := check.ReadObject(planB.record.ID); err != nil || !bytes.Equal(body, []byte("beta-azure")) {
+		t.Fatalf("B body: %q %v", body, err)
+	}
+	if check.Generation() != outB.Generation {
+		t.Fatalf("reopened generation %d, want %d", check.Generation(), outB.Generation)
+	}
+
+	// A read-only open never probes and never writes, but it must resolve the
+	// same head authority from the on-disk `writers` policy record: the LOCK
+	// record left behind by the single-writer init attests generation 1 and must
+	// not override the superblock here either.
+	reader, err := OpenWithOptions("", ReadOnly, optimistic)
+	if err != nil {
+		t.Fatalf("read-only open: %v", err)
+	}
+	defer reader.Close()
+	if reader.Generation() != outB.Generation {
+		t.Fatalf("read-only generation %d, want %d", reader.Generation(), outB.Generation)
+	}
+	if report, err := reader.Verify(true); err != nil || !report.OK {
+		t.Fatalf("read-only verify: ok=%v err=%v problems=%v", report.OK, err, report.Problems)
+	}
+}
+
+// TestAzureSingleWriterRefusesAnOptimisticStore keeps the writer-mode policy
+// honest: mixing an exclusive writer with optimistic committers is refused, on
+// Azure exactly as on the local plane.
+func TestAzureSingleWriterRefusesAnOptimisticStore(t *testing.T) {
+	fake := newAzureFake()
+	single := azureMW2Options(t, fake)
+	single.WriterMode = WriterModeSingle
+	init, err := Init("", single)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatalf("close init: %v", err)
+	}
+
+	optimistic := single
+	optimistic.WriterMode = WriterModeOptimistic
+	s, err := OpenWithOptions("", ReadWrite, optimistic)
+	if err != nil {
+		t.Fatalf("optimistic open: %v", err)
+	}
+	plan := azureMW2PlanFile(t, s, []byte("mw2.txt"), []byte("mw2"), []byte("mw2-refusal"))
+	tx := azureMW2Stage(t, s, "000000000000000000000000000000c1", plan)
+	if _, err := s.ExecuteTransaction(tx, DefaultTransactionOptions()); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	_, err = OpenWithOptions("", ReadWrite, single)
+	expectClass(t, err, werr.Unsupported, "single writer opening an optimistic azure store")
+}
+
+// TestAzurePlaneStaleHeadIsBusyAndChangesNothing exercises the plane contract
+// directly, without a store: a conditional head publication whose expectation
+// is stale must be refused `Busy` and must leave every superblock byte as it
+// was. This is the property a lost-update-free MW2 head depends on, and it is
+// checked on the same control volume a real committer uses.
+func TestAzurePlaneStaleHeadIsBusyAndChangesNothing(t *testing.T) {
+	fake := newAzureFake()
+	options := azureMW2Options(t, fake)
+	options.WriterMode = WriterModeSingle
+	init, err := Init("", options)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := init.Close(); err != nil {
+		t.Fatalf("close init: %v", err)
+	}
+
+	control := newAzureControl(azureFakeClient(t, fake))
+	view, err := control.ReadSuperblock()
+	if err != nil {
+		t.Fatalf("read superblock: %v", err)
+	}
+	headGeneration, headCommit, ok := highestSlot(view)
+	if !ok {
+		t.Fatalf("no published head after init")
+	}
+	before, present, err := control.ReadRecord(azureSuperblockKey)
+	if err != nil || !present {
+		t.Fatalf("read superblock bytes: present=%v err=%v", present, err)
+	}
+
+	next := func(generation uint64, marker byte) SuperblockSlot {
+		var commit model.Hash32
+		for index := range commit {
+			commit[index] = marker
+		}
+		return SuperblockSlot{
+			Generation: generation, Commit: commit, CommitLen: 64, TimestampNS: 1_700_000_000_000_000_000,
+		}
+	}
+	// A matching expectation publishes.
+	if _, err := control.PublishHeadConditional(headGeneration, headCommit, next(headGeneration+1, 0x42)); err != nil {
+		t.Fatalf("matching head publication: %v", err)
+	}
+	advanced, advancedPresent, err := control.ReadRecord(azureSuperblockKey)
+	if err != nil || !advancedPresent {
+		t.Fatalf("read advanced superblock: present=%v err=%v", advancedPresent, err)
+	}
+	if bytes.Equal(before, advanced) {
+		t.Fatalf("a matching head publication did not change the superblock")
+	}
+
+	// The old expectation is now stale: Busy, and not one byte changes.
+	_, err = control.PublishHeadConditional(headGeneration, headCommit, next(headGeneration+2, 0x43))
+	expectClass(t, err, werr.Busy, "stale conditional head publication")
+	after, afterPresent, err := control.ReadRecord(azureSuperblockKey)
+	if err != nil || !afterPresent {
+		t.Fatalf("read superblock after refusal: present=%v err=%v", afterPresent, err)
+	}
+	if !bytes.Equal(advanced, after) {
+		t.Fatalf("a refused head publication changed the superblock bytes")
+	}
+	freshView, err := control.ReadSuperblock()
+	if err != nil {
+		t.Fatalf("read superblock after refusal: %v", err)
+	}
+	freshGeneration, freshCommit, ok := highestSlot(freshView)
+	if !ok || freshGeneration != headGeneration+1 {
+		t.Fatalf("head generation after refusal = %d (ok=%v), want %d", freshGeneration, ok, headGeneration+1)
+	}
+	if freshCommit != next(headGeneration+1, 0x42).Commit {
+		t.Fatalf("head commit after refusal moved")
+	}
 }
 
 // ---- live Azurite court --------------------------------------------------

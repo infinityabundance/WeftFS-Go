@@ -13,6 +13,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/infinityabundance/WeftFS-Go/model"
 	"github.com/infinityabundance/WeftFS-Go/werr"
@@ -59,6 +60,19 @@ type ControlVolume interface {
 	// conditional write (fence + head). Returns true when the plane did it; a
 	// POSIX plane returns false and the store writes the superblock slot.
 	PublishFencedHead(generation uint64, commit model.Hash32, commitLen uint64) (bool, error)
+	// SupportsConditionalHeadPublication reports whether the plane advances the
+	// two-slot head with one conditional write whose If-Match is the ETag read
+	// with the head check (the MW2 object-store path). A POSIX plane returns
+	// false and keeps LOCK.publish plus PublishSuperblockSlot. This is a fixed
+	// property of the implementation; the conditional-write contract itself is
+	// measured by the plane probe on every writable open.
+	SupportsConditionalHeadPublication() bool
+	// PublishHeadConditional advances the head from (expectedGeneration,
+	// expectedCommit) to `slot` iff the plane still reports that head. The
+	// compare and the write share one ETag: a stale token is Busy and is never
+	// retried onto the moved head. Returns (false, nil) when the plane does not
+	// implement the write (a POSIX plane).
+	PublishHeadConditional(expectedGeneration uint64, expectedCommit model.Hash32, slot SuperblockSlot) (bool, error)
 	// AttestedHead returns the head the writer lock record names, when the plane
 	// uses its lock record as the publication point.
 	AttestedHead() (uint64, model.Hash32, uint64, bool, error)
@@ -68,6 +82,18 @@ type ControlVolume interface {
 	ReleaseWriterLock() error
 
 	probe() (CommitProbe, error)
+}
+
+// rootIsFilesystem reports whether a control volume's Root() names a directory
+// whose records are files. An object-store root is a URI: record keys are
+// implicit, so no directory has to exist before a record is written.
+func rootIsFilesystem(root string) bool {
+	for _, prefix := range []string{"s3://", "gcs://", "azure://"} {
+		if strings.HasPrefix(root, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- local filesystem volume --------------------------------------------
@@ -300,6 +326,15 @@ func (c *localControl) VerifyWriteLease() error { return nil }
 func (c *localControl) CheckLeaseDeadline() error { return nil }
 
 func (c *localControl) PublishFencedHead(uint64, model.Hash32, uint64) (bool, error) {
+	return false, nil
+}
+
+// A POSIX plane has no single conditional head write: the store holds
+// LOCK.publish across the create-once check and the slot write, which is the
+// same critical section within one host.
+func (c *localControl) SupportsConditionalHeadPublication() bool { return false }
+
+func (c *localControl) PublishHeadConditional(uint64, model.Hash32, SuperblockSlot) (bool, error) {
 	return false, nil
 }
 

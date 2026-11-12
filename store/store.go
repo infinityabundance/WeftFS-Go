@@ -334,11 +334,14 @@ func validateOptions(opts Options) error {
 		return err
 	}
 	if opts.WriterMode == WriterModeOptimistic {
-		// Go MW2 uses the POSIX publication lock; a remote commit plane's
-		// conditional write is a different protocol and is not claimed here.
-		if opts.CommitBackend != PlaneLocal && opts.CommitBackend != PlaneObject {
+		// A plane with a real compare-and-swap (azure) publishes the head with
+		// one conditional write. The POSIX planes use the publication lock.
+		// The remaining remote planes are refused explicitly, never downgraded.
+		switch opts.CommitBackend {
+		case PlaneLocal, PlaneObject, PlaneAzure:
+		default:
 			return werr.Newf(werr.Unsupported,
-				"optimistic writer mode is implemented for the local and object commit planes in Go, not %q", opts.CommitBackend)
+				"optimistic writer mode is implemented for the local, object, and azure commit planes in Go, not %q", opts.CommitBackend)
 		}
 	}
 	if _, err := ParsePlaneKind(string(opts.BlobBackend)); err != nil {
@@ -667,11 +670,10 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	switch {
 	case fullScan:
 		recovery, err = recoverFullScan(store.commits, store.blobs)
-	case optimistic:
-		// The superblock is authoritative in MW2; a stale writer-lock record
-		// from an earlier single-writer life must not override it.
-		recovery, err = recoverForWrite(headAttestHider{store.commits}, store.blobs)
 	case mode == ReadWrite:
+		// Recovery itself picks the head authority from the on-disk `writers`
+		// policy record, so a single-writer and an optimistic open share one
+		// decision point instead of each wrapping the commit source.
 		recovery, err = recoverForWrite(store.commits, store.blobs)
 	default:
 		recovery, err = recoverWithStrategy(store.commits, store.blobs, replayBounded, true)
