@@ -430,6 +430,22 @@ func TestAzureOptimisticTwoDisjointCommitters(t *testing.T) {
 	if check.Generation() != outB.Generation {
 		t.Fatalf("reopened generation %d, want %d", check.Generation(), outB.Generation)
 	}
+
+	// A read-only open never probes and never writes, but it must resolve the
+	// same head authority from the on-disk `writers` policy record: the LOCK
+	// record left behind by the single-writer init attests generation 1 and must
+	// not override the superblock here either.
+	reader, err := OpenWithOptions("", ReadOnly, optimistic)
+	if err != nil {
+		t.Fatalf("read-only open: %v", err)
+	}
+	defer reader.Close()
+	if reader.Generation() != outB.Generation {
+		t.Fatalf("read-only generation %d, want %d", reader.Generation(), outB.Generation)
+	}
+	if report, err := reader.Verify(true); err != nil || !report.OK {
+		t.Fatalf("read-only verify: ok=%v err=%v problems=%v", report.OK, err, report.Problems)
+	}
 }
 
 // TestAzureSingleWriterRefusesAnOptimisticStore keeps the writer-mode policy

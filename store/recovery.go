@@ -175,6 +175,25 @@ type headAttester interface {
 	AttestedHead() (uint64, model.Hash32, uint64, bool, error)
 }
 
+// optimisticWriterMode reports whether the on-disk `writers` policy record makes
+// this store an optimistic (MW2) store. An absent record means single. A record
+// that exists but cannot be decoded is an error, never a default: the caller
+// must not guess which object is the head authority.
+func optimisticWriterMode(ctl commitSource) (bool, error) {
+	data, ok, err := ctl.ReadRecord("writers")
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	mode, err := DecodeWritersMode(data)
+	if err != nil {
+		return false, err
+	}
+	return mode == WriterModeOptimistic, nil
+}
+
 // commitSource is the read side of a control plane: the superblock and the
 // commit records. Both the local filesystem and S3 implement it, so recovery
 // never depends on a local path when the plane is remote.
@@ -183,6 +202,7 @@ type commitSource interface {
 	HasCommit(generation uint64) (bool, error)
 	ReadCommit(generation uint64) (LoadedCommit, error)
 	ListCommitGenerations() ([]uint64, error)
+	ReadRecord(name string) ([]byte, bool, error)
 }
 
 // commitIndexFrom parses every commit up to maxGeneration (inclusive),
@@ -428,7 +448,19 @@ func recoverWithStrategy(ctl commitSource, src blobSource, strategy replayStrate
 	// authority: a head ahead of the cache was published before a crash. A cache
 	// ahead of the record means a pre-v3 writer published after the upgrade;
 	// refusing is the only honest answer.
-	if attester, ok := ctl.(headAttester); ok {
+	//
+	// An optimistic (MW2) store never uses the exclusive lease: its superblock is
+	// the authoritative publication point, and a LOCK record left over from an
+	// earlier single-writer life must not override it. The `writers` policy
+	// record says which contract applies, so the decision is made here, once, for
+	// every caller (open, reload, verify) instead of at each call site. A record
+	// that cannot be decoded fails closed: recovering from the wrong authority is
+	// how a lost update is accepted.
+	optimistic, err := optimisticWriterMode(ctl)
+	if err != nil {
+		return nil, err
+	}
+	if attester, ok := ctl.(headAttester); ok && !optimistic {
 		generation, commit, commitLen, attested, err := attester.AttestedHead()
 		if err != nil {
 			return nil, err

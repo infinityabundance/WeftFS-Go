@@ -670,11 +670,10 @@ func openWithStrategy(path string, mode OpenMode, fullScan bool, opts Options) (
 	switch {
 	case fullScan:
 		recovery, err = recoverFullScan(store.commits, store.blobs)
-	case optimistic:
-		// The superblock is authoritative in MW2; a stale writer-lock record
-		// from an earlier single-writer life must not override it.
-		recovery, err = recoverForWrite(headAttestHider{store.commits}, store.blobs)
 	case mode == ReadWrite:
+		// Recovery itself picks the head authority from the on-disk `writers`
+		// policy record, so a single-writer and an optimistic open share one
+		// decision point instead of each wrapping the commit source.
 		recovery, err = recoverForWrite(store.commits, store.blobs)
 	default:
 		recovery, err = recoverWithStrategy(store.commits, store.blobs, replayBounded, true)

@@ -113,6 +113,24 @@ func TestMW2OptimisticPolicyAndSingleRefusal(t *testing.T) {
 	}
 }
 
+// TestMalformedWritersPolicyFailsClosed pins the authority decision. Recovery
+// must not guess which object is the head authority when a `writers` policy
+// record exists but cannot be decoded: defaulting to `single` is exactly the
+// assumption that let a stale LOCK record override an optimistic store's
+// superblock and broke the Go Azure MW2 suite.
+func TestMalformedWritersPolicyFailsClosed(t *testing.T) {
+	dir, _ := newMW2Store(t)
+	if err := os.WriteFile(filepath.Join(dir, "writers"), []byte("not a canonical writers record"), 0o644); err != nil {
+		t.Fatalf("write policy record: %v", err)
+	}
+	if _, err := store.OpenWithOptions(dir, store.ReadWrite, mw2Options(store.WriterModeOptimistic)); err == nil {
+		t.Fatal("a writable open accepted a malformed writers record")
+	}
+	if _, err := store.OpenWithOptions(dir, store.ReadOnly, store.DefaultOptions()); err == nil {
+		t.Fatal("a read-only open accepted a malformed writers record")
+	}
+}
+
 func TestMW2DisjointTransactionsBothCommit(t *testing.T) {
 	dir, _ := newMW2Store(t)
 	a := openMW2(t, dir)

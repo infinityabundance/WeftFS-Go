@@ -878,7 +878,7 @@ func (s *Store) commitInChain(record TxRecord, commit model.Hash32, window uint6
 }
 
 func (s *Store) reloadFromPlane() error {
-	recovery, err := recoverForWrite(headAttestHider{s.commits}, s.blobs)
+	recovery, err := recoverForWrite(s.commits, s.blobs)
 	if err != nil {
 		return err
 	}
@@ -900,11 +900,6 @@ func (s *Store) reloadFromPlane() error {
 	s.loadQuotaRecord()
 	return nil
 }
-
-// headAttestHider deliberately does not implement AttestedHead: an optimistic
-// store's superblock is authoritative and a stale writer-lock record from an
-// earlier single-writer life must not override it.
-type headAttestHider struct{ commitSource }
 
 // ensureWriterPolicy confirms or creates the policy record.
 func (s *Store) ensureWriterPolicy(mode WriterMode) error {
