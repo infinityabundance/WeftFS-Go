@@ -84,14 +84,30 @@ func (c *azureControl) AzureStats() AzureStatsSnapshot {
 
 func (c *azureControl) EnsureLayout() error { return c.client.ensureContainer() }
 
-// CleanTmp removes leftover probe blobs. The writer lock is held here, so no
-// other writer can be using them.
+// CleanTmp removes leftover probe blobs older than the grace window.
+//
+// Every upload is atomic under its final key, so the only `tmp/` blobs are
+// capability-probe keys. That does not make them disposable: an optimistic
+// (MW2) open runs concurrently with other writers, and a live writer's probe
+// lives under `tmp/` for the duration of its open. Deleting it made the second
+// create-once probe succeed and a healthy endpoint look as though it ignored
+// `If-None-Match: *` (X13/N14, caught by four concurrent Rust writers against
+// Azurite). Only an entry older than `graceSecs` is swept; an entry whose age
+// cannot be established is kept.
 func (c *azureControl) CleanTmp(graceSecs uint64) error {
 	blobs, err := c.client.listBlobs("tmp/")
 	if err != nil {
 		return err
 	}
+	now := time.Now()
 	for _, blob := range blobs {
+		modified, err := http.ParseTime(blob.Properties.LastModified)
+		if err != nil {
+			continue
+		}
+		if graceSecs > 0 && now.Sub(modified) < time.Duration(graceSecs)*time.Second {
+			continue
+		}
 		if _, err := c.client.delete(blob.Name); err != nil {
 			return err
 		}
