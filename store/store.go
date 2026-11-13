@@ -143,6 +143,11 @@ type Options struct {
 	// value disables pooling (the plain open/read/close path), and a positive
 	// value is the bound. Remote planes are never pooled.
 	ReadPoolIdle int
+	// ReadPoolActive bounds the number of *active* read handles (X07). 0
+	// selects DefaultReadPoolActive; a negative value disables the cap and
+	// restores the pre-X07 unbounded fanout (the control arm). Remote planes
+	// are never pooled.
+	ReadPoolActive int
 	// WriterMode selects the control-state publication contract. The empty
 	// value is `single` (MW1). `optimistic` is MW2 and is implemented for the
 	// local and object commit planes; it applies to the explicit transaction
@@ -179,6 +184,7 @@ func DefaultOptions() Options {
 		CommitBackend:           PlaneLocal,
 		PackOptions:             DefaultPackOptions(),
 		ReadPoolIdle:            DefaultReadPoolIdle,
+		ReadPoolActive:          DefaultReadPoolActive,
 		AttestIndexes:           true,
 		IndexChainMaxDeltas:     32,
 	}
@@ -895,6 +901,15 @@ func (s *Store) buildPlanes() error {
 		if err != nil {
 			return err
 		}
+		readPoolActive := s.options.ReadPoolActive
+		if readPoolActive == 0 {
+			readPoolActive = DefaultReadPoolActive
+		} else if readPoolActive < 0 {
+			readPoolActive = 0
+		}
+		if blobs.pool != nil {
+			blobs.pool.setActiveCap(readPoolActive)
+		}
 		access = blobs
 		prober = blobs
 	}
@@ -1010,6 +1025,18 @@ func (s *Store) Close() error {
 	}
 	s.writerLockHeld = false
 	return s.commits.Close()
+}
+
+// SetReadPoolActiveCap changes the cap on simultaneously active read handles
+// (X07). 0 disables the cap and restores the pre-X07 unbounded behaviour (the
+// control arm). It applies to reads that start after the call.
+func (s *Store) SetReadPoolActiveCap(cap int) bool {
+	flat, ok := s.probeFlat.(*flatBlobPlane)
+	if !ok || flat == nil || flat.pool == nil {
+		return false
+	}
+	flat.pool.setActiveCap(cap)
+	return true
 }
 
 // ReadPoolStats reports the read-handle pool counters for a local or object

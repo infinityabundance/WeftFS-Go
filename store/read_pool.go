@@ -41,6 +41,17 @@ import (
 // `MAX_IDLE_HANDLES`.
 const DefaultReadPoolIdle = 64
 
+// DefaultReadPoolActive is the default cap on simultaneously *active* handles
+// (X07), matching the Rust `MAX_ACTIVE_HANDLES`.
+//
+// The idle bound and the active bound are different resources: idle bounds
+// cached descriptors, active bounds what the backend is asked to open at once.
+// Before X07 only the idle set was bounded, so a fanout of readers each finding
+// an empty idle set opened an unbounded number of concurrent descriptors. The
+// control arm (`SetActiveCap(0)`, i.e. `ReadPoolActive < 0`) still shows the
+// unbounded behaviour and is recorded as such.
+const DefaultReadPoolActive = 64
+
 // ReadPoolStats is diagnostic evidence about the pool, never a correctness
 // input.
 type ReadPoolStats struct {
@@ -65,6 +76,16 @@ type ReadPoolStats struct {
 	Reads uint64 `json:"reads"`
 	// BytesRead is the number of bytes those reads returned.
 	BytesRead uint64 `json:"bytes_read"`
+	// MaxActive is the configured cap on simultaneously active handles
+	// (0 = unbounded, the pre-X07 control arm).
+	MaxActive int `json:"max_active"`
+	// Active is the number of handles active at this instant.
+	Active int `json:"active"`
+	// ObservedMaxActive is the high-water mark; it never exceeds MaxActive while
+	// the cap is enabled.
+	ObservedMaxActive int `json:"observed_max_active"`
+	// CapWaits counts reads that had to wait for an active-handle slot.
+	CapWaits uint64 `json:"cap_waits"`
 }
 
 // pooledHandle is one open descriptor plus the identity of the file it was
@@ -82,6 +103,13 @@ func (h *pooledHandle) matches(info os.FileInfo) bool {
 type readHandlePool struct {
 	kind    PlaneKind
 	maxIdle int
+
+	// X07 active-handle cap. `activeCap == 0` is the unbounded control arm.
+	activeCap   int
+	active      int
+	observedMax int
+	capWaits    uint64
+	activeCv    *sync.Cond
 
 	mu            sync.Mutex
 	idle          map[string]*pooledHandle
@@ -105,7 +133,66 @@ func newReadHandlePool(kind PlaneKind, maxIdle int) *readHandlePool {
 	if kind != PlaneLocal && kind != PlaneObject {
 		return nil
 	}
-	return &readHandlePool{kind: kind, maxIdle: maxIdle, idle: make(map[string]*pooledHandle, maxIdle)}
+	pool := &readHandlePool{
+		kind:      kind,
+		maxIdle:   maxIdle,
+		activeCap: DefaultReadPoolActive,
+		idle:      make(map[string]*pooledHandle, maxIdle),
+	}
+	pool.activeCv = sync.NewCond(&pool.mu)
+	return pool
+}
+
+// activeSlot is the RAII-equivalent lease on one active-handle slot. Go has no
+// destructors, so every path that acquires must call release; the helpers below
+// are the only callers.
+type activeSlot struct {
+	pool *readHandlePool
+}
+
+func (slot *activeSlot) release() {
+	if slot == nil || slot.pool == nil {
+		return
+	}
+	p := slot.pool
+	p.mu.Lock()
+	p.active--
+	p.mu.Unlock()
+	p.activeCv.Signal()
+}
+
+// setActiveCap changes the active-handle cap. 0 disables it and restores the
+// pre-X07 unbounded behaviour (the control arm). In-flight leases finish under
+// the cap they acquired.
+func (p *readHandlePool) setActiveCap(cap int) {
+	p.mu.Lock()
+	p.activeCap = cap
+	p.mu.Unlock()
+	p.activeCv.Broadcast()
+}
+
+// acquireSlot waits for an active-handle slot under the current cap. It
+// returns nil when the cap is disabled.
+func (p *readHandlePool) acquireSlot() *activeSlot {
+	p.mu.Lock()
+	if p.activeCap <= 0 {
+		p.mu.Unlock()
+		return nil
+	}
+	waited := false
+	for p.active >= p.activeCap {
+		if !waited {
+			p.capWaits++
+			waited = true
+		}
+		p.activeCv.Wait()
+	}
+	p.active++
+	if p.active > p.observedMax {
+		p.observedMax = p.active
+	}
+	p.mu.Unlock()
+	return &activeSlot{pool: p}
 }
 
 // acquire returns a handle for `path` whose recorded size is current. A path
@@ -230,6 +317,8 @@ func (p *readHandlePool) closeAll() {
 // readAll reads a whole blob through the pool. The bytes are copied out of the
 // file, so the handle can be released (and reused) before the caller hashes.
 func (p *readHandlePool) readAll(path string) ([]byte, error) {
+	slot := p.acquireSlot()
+	defer slot.release()
 	handle, err := p.acquire(path)
 	if err != nil {
 		return nil, err
@@ -262,6 +351,8 @@ func (p *readHandlePool) readAll(path string) ([]byte, error) {
 // readRange reads `length` bytes at `offset` through the pool, clamping to EOF
 // exactly like the unpooled plane.
 func (p *readHandlePool) readRange(path string, offset, length uint64) ([]byte, error) {
+	slot := p.acquireSlot()
+	defer slot.release()
 	handle, err := p.acquire(path)
 	if err != nil {
 		return nil, err
@@ -301,15 +392,19 @@ func (p *readHandlePool) snapshot() ReadPoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return ReadPoolStats{
-		Backend:       string(p.kind),
-		MaxIdle:       p.maxIdle,
-		Idle:          len(p.idle),
-		Opens:         p.opens,
-		Reuses:        p.reuses,
-		Refreshes:     p.refreshes,
-		Evictions:     p.evictions,
-		Invalidations: p.invalidations,
-		Reads:         p.reads,
-		BytesRead:     p.bytesRead,
+		Backend:           string(p.kind),
+		MaxIdle:           p.maxIdle,
+		Idle:              len(p.idle),
+		Opens:             p.opens,
+		Reuses:            p.reuses,
+		Refreshes:         p.refreshes,
+		Evictions:         p.evictions,
+		Invalidations:     p.invalidations,
+		Reads:             p.reads,
+		BytesRead:         p.bytesRead,
+		MaxActive:         p.activeCap,
+		Active:            p.active,
+		ObservedMaxActive: p.observedMax,
+		CapWaits:          p.capWaits,
 	}
 }
