@@ -63,6 +63,12 @@ func (s *State) Clone() *State {
 }
 
 // ApplyOps applies a list atomically: all or nothing.
+//
+// Atomicity comes from a journal of the slots each op writes, not from
+// cloning the whole state. `Clone()` made every commit O(state): a
+// 100,000-object store copied 100,000 rows per replayed commit. The journal is
+// O(ops) and restores exactly the touched slots on failure, so a successful
+// commit and every error code are unchanged.
 func (s *State) ApplyOps(ops []Op) error {
 	// `set_quota_usage` describes the state after the other ops, so it must be
 	// last; a reset must stand alone.
@@ -83,17 +89,131 @@ func (s *State) ApplyOps(ops []Op) error {
 			return werr.Newf(werr.Malformed, "a quota usage reset must be the only op in its commit")
 		}
 	}
-	next := s.Clone()
+	// A zero-value State previously worked because Clone() created the maps.
+	if s.Objects == nil {
+		s.Objects = make(map[Hash32]ObjectRecord)
+	}
+	if s.Entries == nil {
+		s.Entries = make(map[Hash32]EntryRecord)
+	}
+	if s.Relations == nil {
+		s.Relations = make(map[Hash32]RelationRecord)
+	}
+	if s.Snapshots == nil {
+		s.Snapshots = make(map[string]Hash32)
+	}
+	if s.Tips == nil {
+		s.Tips = make(map[Hash32]Hash32)
+	}
+	undo := make([]func(), 0, len(ops))
+	rollback := func() {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+	}
 	for _, op := range ops {
 		if op == nil {
+			rollback()
 			return werr.Newf(werr.Malformed, "nil commit op")
 		}
-		if err := op.apply(next); err != nil {
+		undo = append(undo, s.undoFor(op))
+		if err := op.apply(s); err != nil {
+			rollback()
 			return err
 		}
 	}
-	*s = *next
 	return nil
+}
+
+// undoFor captures the pre-commit value of every slot this op writes.
+func (s *State) undoFor(op Op) func() {
+	switch o := op.(type) {
+	case PutObjectOp:
+		id := o.Record.ID
+		prev, ok := s.Objects[id]
+		return func() {
+			if ok {
+				s.Objects[id] = prev
+			} else {
+				delete(s.Objects, id)
+			}
+		}
+	case DeleteObjectOp:
+		prev, ok := s.Objects[o.ID]
+		tip, hadTip := s.Tips[o.ID]
+		return func() {
+			if ok {
+				s.Objects[o.ID] = prev
+			} else {
+				delete(s.Objects, o.ID)
+			}
+			if hadTip {
+				s.Tips[o.ID] = tip
+			} else {
+				delete(s.Tips, o.ID)
+			}
+		}
+	case PutEntryOp:
+		id := o.Record.ID
+		prev, ok := s.Entries[id]
+		return func() {
+			if ok {
+				s.Entries[id] = prev
+			} else {
+				delete(s.Entries, id)
+			}
+		}
+	case DelEntryOp:
+		prev, ok := s.Entries[o.ID]
+		return func() {
+			if ok {
+				s.Entries[o.ID] = prev
+			} else {
+				delete(s.Entries, o.ID)
+			}
+		}
+	case PutRelationOp:
+		id := o.Record.ID
+		prev, ok := s.Relations[id]
+		return func() {
+			if ok {
+				s.Relations[id] = prev
+			} else {
+				delete(s.Relations, id)
+			}
+		}
+	case DelRelationOp:
+		prev, ok := s.Relations[o.ID]
+		return func() {
+			if ok {
+				s.Relations[o.ID] = prev
+			} else {
+				delete(s.Relations, o.ID)
+			}
+		}
+	case SetSnapshotOp:
+		name := o.SnapshotName
+		prev, ok := s.Snapshots[name]
+		return func() {
+			if ok {
+				s.Snapshots[name] = prev
+			} else {
+				delete(s.Snapshots, name)
+			}
+		}
+	case SetTipOp:
+		prev, ok := s.Tips[o.Object]
+		return func() {
+			if ok {
+				s.Tips[o.Object] = prev
+			} else {
+				delete(s.Tips, o.Object)
+			}
+		}
+	default:
+		// SetQuotaUsageOp mutates no namespace state (its shape is validated).
+		return func() {}
+	}
 }
 
 func (o PutObjectOp) apply(s *State) error {

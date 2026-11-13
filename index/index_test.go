@@ -211,3 +211,38 @@ func hashDomain(body []byte) []byte {
 	digest := hash.Domain(DomainV2, body)
 	return digest[:]
 }
+
+// TestFullSegmentWithValueTargetTailResolves is the WFX3 regression for the
+// reader bound: a relation edge carrying a value target is one kind byte plus
+// its payload, so a full segment whose last relation row is such an edge has
+// fewer than `edgeCount * 32` bytes after the count. The reader used to refuse
+// that valid segment as corrupt; every reopen then rebuilt the index.
+func TestFullSegmentWithValueTargetTailResolves(t *testing.T) {
+	state := model.NewState()
+	state.Generation = 3
+	subject := model.Hash32{0x11}
+	state.Objects[subject] = model.ObjectRecord{ID: subject, Kind: model.KindFile}
+	state.Relations[model.Hash32{0x12}] = model.RelationRecord{
+		ID: model.Hash32{0x12}, Subject: subject, Predicate: "tagged_as",
+		Kind: model.RelationValue, Target: model.ValueTarget(wcb.TextValue("alpha")),
+	}
+	built := Build(state)
+	data, err := EncodeFull(built)
+	if err != nil {
+		t.Fatalf("encode full: %v", err)
+	}
+	segment, err := DecodeSegment(data)
+	if err != nil {
+		t.Fatalf("decode segment: %v", err)
+	}
+	resolved, err := ResolveChainSegment(segment, func(_, _ model.Hash32) ([]byte, error) {
+		t.Fatal("a full segment must not ask for a base")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("resolve full segment with a value-target tail: %v", err)
+	}
+	if resolved.Index.Generation() != 3 || resolved.Index.RelationCount() != 1 {
+		t.Fatalf("resolved generation=%d relations=%d", resolved.Index.Generation(), resolved.Index.RelationCount())
+	}
+}

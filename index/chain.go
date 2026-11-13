@@ -966,11 +966,20 @@ func resolveParsedSegment(segment *Segment, base *StateIndex) (*StateIndex, erro
 		}
 		switch flag {
 		case presentFlag:
-			edgeCount, err := reader.boundedCount(32)
+			// One encoded edge is at least one byte (`kind` + payload; a null
+			// target is the kind byte alone). A 32-byte bound assumed object
+			// targets and rejected a segment whose last relation row carried a
+			// short value-target edge. The count stays bounded by the remaining
+			// bytes, and the initial capacity is capped.
+			edgeCount, err := reader.boundedCount(1)
 			if err != nil {
 				return nil, err
 			}
-			edges := make([]IndexedRelation, 0, edgeCount)
+			capacity := edgeCount
+			if capacity > 1024 {
+				capacity = 1024
+			}
+			edges := make([]IndexedRelation, 0, capacity)
 			var lastTarget []byte
 			for j := 0; j < edgeCount; j++ {
 				edge, encoded, err := readTarget(reader)
