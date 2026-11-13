@@ -25,7 +25,7 @@ const RebaseTool = "weftfs"
 // track the released crate version (Rust records `env!("CARGO_PKG_VERSION")` at
 // compile time), so a Go record and a Rust record name the same tool. It was
 // stale at "1.1.0" through the v1.2.0 release; R14 aligns it.
-const storeVersion = "1.4.1"
+const storeVersion = "1.4.2"
 
 // ProvenanceSchema is the canonical receipt schema.
 const ProvenanceSchema = "weft.provenance.v1"
