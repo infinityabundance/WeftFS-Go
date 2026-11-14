@@ -10,9 +10,11 @@ package store_test
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -491,10 +493,13 @@ func TestKvGoCost(t *testing.T) {
 	}
 	const reps = 200
 	readStart := testingNow()
+	readSamples := make([]float64, 0, reps)
 	for index := 0; index < reps; index++ {
+		oneStart := testingNow()
 		if _, err := st.KvPrefixGetVerified(items[0].Name, envelopeName, nil, kvNow); err != nil {
 			t.Fatalf("read: %v", err)
 		}
+		readSamples = append(readSamples, testingSince(oneStart).Seconds()*1000)
 	}
 	readElapsed := testingSince(readStart)
 	perRead := readElapsed.Seconds() * 1000 / float64(reps)
@@ -518,11 +523,14 @@ func TestKvGoCost(t *testing.T) {
 		})
 	}
 	_, singleStore := newKvStore(t)
+	singleSamples := make([]float64, 0, compare)
 	singleStart := testingNow()
 	for _, item := range singleItems {
+		oneStart := testingNow()
 		if _, err := singleStore.KvPrefixPut(item.Name, item.Spec, item.Tokens, item.ParentName, item.NewPageBytes, 0, 0); err != nil {
 			t.Fatalf("single write %s: %v", item.Name, err)
 		}
+		singleSamples = append(singleSamples, testingSince(oneStart).Seconds()*1e6)
 	}
 	singleElapsed := testingSince(singleStart)
 	freshBatch := []store.KvPrefixBatchItem{{
@@ -539,6 +547,8 @@ func TestKvGoCost(t *testing.T) {
 
 	receipt := map[string]any{
 		"single_write_per_prefix_us":   round3(singleElapsed.Seconds() * 1e6 / float64(compare)),
+		"single_write_p50_us":          round3(percentile(singleSamples, 50)),
+		"single_write_p99_us":          round3(percentile(singleSamples, 99)),
 		"single_write_wall_ms":         round3(singleElapsed.Seconds() * 1000),
 		"one_batch_write_ms":           round3(batchElapsed.Seconds() * 1000),
 		"schema":                       "weft.kv.go.cost.v1",
@@ -551,6 +561,8 @@ func TestKvGoCost(t *testing.T) {
 		"read_page_bytes":              pageBytes,
 		"read_reps":                    reps,
 		"read_per_prefix_ms":           round3(perRead),
+		"read_p50_ms":                  round3(percentile(readSamples, 50)),
+		"read_p99_ms":                  round3(percentile(readSamples, 99)),
 		"alloc_bytes_per_write_prefix": round3(float64(allocWrite)),
 		"alloc_bytes_per_read_prefix":  round3(float64(allocRead)),
 		"generation":                   st.Generation(),
@@ -584,6 +596,25 @@ func testingAllocs(f func()) uint64 {
 
 func round3(value float64) float64 {
 	return float64(int64(value*1000+0.5)) / 1000
+}
+
+// percentile returns the nearest-rank percentile of a sorted copy. Nearest rank
+// is used deliberately: with a few hundred samples an interpolated percentile
+// would imply precision the measurement does not have.
+func percentile(samples []float64, pct float64) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	sorted := append([]float64(nil), samples...)
+	sort.Float64s(sorted)
+	index := int(math.Ceil(pct/100*float64(len(sorted)))) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(sorted) {
+		index = len(sorted) - 1
+	}
+	return sorted[index]
 }
 
 var _ = auth.Root
